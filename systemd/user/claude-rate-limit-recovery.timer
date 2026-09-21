@@ -1,0 +1,10 @@
+[Unit]
+Description=Claude Rate-Limit Recovery Monitor Timer (5분마다)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

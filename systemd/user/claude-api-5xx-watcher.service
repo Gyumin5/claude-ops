@@ -1,0 +1,7 @@
+[Unit]
+Description=Watch claude session jsonls for API 5xx errors and alert via telegram
+
+[Service]
+Type=oneshot
+ExecStart=%h/dotfiles/bin/claude-api-5xx-watcher
+Nice=10

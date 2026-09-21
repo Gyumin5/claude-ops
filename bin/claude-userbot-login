@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Telethon user-mode 최초 로그인 — userbot.session 생성.
+
+반드시 termius 등 인터랙티브 터미널에서 1회 실행.
+전화번호 + SMS 코드 (+ 2FA 비번) 입력이 필요해 systemd/비대화형에서는 불가.
+
+자격증명: ~/.claude/userbot/.env 의 API_ID / API_HASH.
+세션파일: ~/.claude/userbot/userbot.session (생성됨, 절대 git/채팅 유출 금지).
+"""
+import os
+import sys
+
+USERBOT_DIR = os.path.expanduser("~/.claude/userbot")
+ENV_PATH = os.path.join(USERBOT_DIR, ".env")
+SESSION_PATH = os.path.join(USERBOT_DIR, "userbot")  # telethon이 .session 확장자 붙임
+
+
+def load_env(path):
+    env = {}
+    if not os.path.exists(path):
+        sys.exit(f"[login] {path} 없음. 먼저 termius 에서 API_ID/API_HASH 작성 (chmod 600).")
+    for line in open(path):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        env[k.strip()] = v.strip()
+    return env
+
+
+def main():
+    from telethon.sync import TelegramClient
+
+    env = load_env(ENV_PATH)
+    api_id = env.get("API_ID")
+    api_hash = env.get("API_HASH")
+    if not api_id or not api_hash:
+        sys.exit("[login] .env 에 API_ID / API_HASH 둘 다 필요.")
+    try:
+        api_id = int(api_id)
+    except ValueError:
+        sys.exit("[login] API_ID 는 정수여야 함.")
+
+    os.makedirs(USERBOT_DIR, exist_ok=True)
+    with TelegramClient(SESSION_PATH, api_id, api_hash) as client:
+        me = client.get_me()
+        name = getattr(me, "username", None) or getattr(me, "first_name", "?")
+        print(f"[login] 로그인 성공: {name} (id={me.id})")
+        print(f"[login] 세션 저장: {SESSION_PATH}.session")
+        # 보안: 세션파일 권한 600
+        try:
+            os.chmod(f"{SESSION_PATH}.session", 0o600)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    main()

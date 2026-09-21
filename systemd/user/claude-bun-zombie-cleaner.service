@@ -1,0 +1,7 @@
+[Unit]
+Description=Clean up orphan plugin:telegram bun processes with deleted cwd
+
+[Service]
+Type=oneshot
+ExecStart=%h/dotfiles/bin/claude-bun-zombie-cleaner
+Nice=10

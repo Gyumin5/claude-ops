@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""claude-session-probe — 한 세션이 "살아 있는가" 를 판정에 쓸 수 있는 형태로 내놓는다.
+
+`claude-session-probe <세션이름>` → JSON 한 줄.
+
+왜 필요한가: 넛지·가드가 세션 상태를 각자 다르게 추정해 왔고, 그때마다 같은 실수를
+반복했다(2026-08-03 session-b 건 — "조용하니 죽었다"→"커밋 있으니 살았다"→
+"커밋이 남의 것이니 죽었다"). 판정에 쓸 사실을 한 곳에서 같은 규칙으로 내놓는다.
+
+내놓는 것(판정은 호출자가 한다 — 여기서는 하지 않는다):
+  unit_active   유닛이 active 인가
+  quota_pct     5h 사용률(%). -1 이면 모름. 한도 중이면 무응답은 정상이다.
+  transcript    그 세션의 대화형 transcript 경로(entrypoint=cli). 없으면 null
+  last_assistant  마지막 assistant 레코드 epoch. 0 이면 없음
+  pending_tool  마지막 tool_use 에 대응하는 tool_result 가 없다 = 도구 실행 중
+  pending_tool_since  그 tool_use 가 기록된 epoch. 0 이면 없음
+  pending_tool_name   그 도구 이름. 없으면 ""
+  reason        위 값을 못 채운 이유
+
+pending_tool 이 핵심 구분이다. 도구가 도는 동안은 레코드가 안 늘어나므로 "무응답"
+으로 보이지만 살아 있다. 반대로 fusion 은 tool_result 를 정상으로 받은 뒤 멈췄다 —
+pending_tool=false 인 무응답이었다.
+
+pending_tool 만으로는 "도구가 돈다" 와 "권한 승인을 기다린다" 가 구분되지 않는다.
+권한 요청은 transcript 에 남지 않고 텔레그램 플러그인 프로세스 안에만 있어서
+직접 읽을 방법이 없다 — 그래서 `pending_tool_since` 를 함께 낸다. 호출자가
+경과시간으로 판단한다(정상 도구는 분 단위, 승인 대기는 시간 단위로 열려 있다).
+"""
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import claude_session_lib as csl   # noqa: E402  (transcript 선택 규칙 단일 출처)
+
+PROJECTS = csl.PROJECTS
+TAIL_BYTES = 4 * 1024 * 1024
+
+utc_epoch = csl.utc_epoch
+recorded_cwd = csl.recorded_cwd
+transcript_kind = csl.transcript_kind
+quota_5h = csl.quota_5h
+
+
+def project_dir(cwd):
+    return csl.project_dir(cwd, PROJECTS)
+
+
+def session_transcript(pdir):
+    return csl.session_transcript(pdir)
+
+
+def _show(unit):
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", unit, "-p", "LoadState",
+             "-p", "WorkingDirectory", "-p", "ActiveState", "-p", "Transient"],
+            capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return None
+    d = {}
+    for ln in out.splitlines():
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            d[k] = v
+    return d
+
+
+def unit_candidates(session):
+    """유저봇 이름은 로컬 유닛 이름과 다를 수 있다.
+
+    옆 기계의 dotfiles 세션은 유닛이 claude-dotfiles.service 인데 유저봇 등록명은
+    peer-dotfiles 다(호스트를 구분하려고 붙인 이름). 이름을 그대로 유닛으로 만들면
+    살아 있는 세션을 "유닛 없음" 으로 오보한다(2026-08-23 실측). relay-alias.json 이
+    로컬이름→유저봇이름 을 들고 있으니 그걸 뒤집어 후보로 쓴다.
+    """
+    cands = [session]
+    try:
+        with open(os.path.join(
+                os.path.expanduser("~"), ".claude", "userbot",
+                "relay-alias.json")) as f:
+            alias = json.load(f)
+    except Exception:
+        return cands
+    for local, sent_as in alias.items():
+        if sent_as == session and local not in cands:
+            cands.append(local)
+    return cands
+
+
+def unit_props(session):
+    """(WorkingDirectory, active, transient, 유닛이름, 존재여부)."""
+    first = None
+    for name in unit_candidates(session):
+        unit = "claude-%s.service" % name
+        d = _show(unit)
+        if d is None:
+            return "", False, False, unit, False
+        if first is None:
+            first = unit
+        if d.get("LoadState") == "not-found":
+            continue
+        return (d.get("WorkingDirectory", "").lstrip("!"),
+                d.get("ActiveState") == "active",
+                d.get("Transient") == "yes", unit, True)
+    return "", False, False, first or ("claude-%s.service" % session), False
+
+
+
+def scan(path):
+    """(마지막 assistant epoch, 열린 도구 [epoch, 이름] 또는 None).
+
+    열린 게 여럿이면 가장 나중에 연 것을 낸다 — 지금 실제로 기다리는 도구다.
+    (앞선 턴이 중단돼 결과 없이 남은 id 가 있으면 그건 오래된 쪽에 남는다.)
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, errors="replace") as fh:
+            if size > TAIL_BYTES:
+                fh.seek(size - TAIL_BYTES)
+                fh.readline()
+            lines = fh.readlines()
+    except OSError:
+        return 0, None
+
+    last_assistant = 0
+    open_tools = {}             # tool_use id → (epoch, 이름). 아직 결과가 안 온 것
+    for line in lines:
+        if '"type"' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        t = o.get("type")
+        if t == "assistant":
+            e = utc_epoch(o.get("timestamp"))
+            if e:
+                last_assistant = max(last_assistant, e)
+            for b in (o.get("message") or {}).get("content") or []:
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id"):
+                    open_tools[b["id"]] = (e, b.get("name") or "")
+        elif t == "user":
+            for b in (o.get("message") or {}).get("content") or []:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    open_tools.pop(b.get("tool_use_id"), None)
+    if not open_tools:
+        return last_assistant, None
+    return last_assistant, max(open_tools.values())
+
+
+def probe(session):
+    limited, why = csl.rate_limited(session)
+    out = {"session": session, "unit": "", "unit_active": False,
+           "quota_pct": quota_5h(),
+           "rate_limited": limited, "rate_limit_why": why,
+           "transcript": None, "last_assistant": 0, "pending_tool": False,
+           "pending_tool_since": 0, "pending_tool_name": "", "reason": ""}
+    cwd, active, transient, unit, found = unit_props(session)
+    out["unit"] = unit
+    out["unit_active"] = active and not transient
+    if not out["unit_active"]:
+        # 없는 것과 꺼진 것을 구분한다 — 이름이 어긋나 못 찾은 것을 "꺼졌다" 로
+        # 내보내면 추적이 헛돌고 아무도 모른다.
+        out["reason"] = "unit-not-found" if not found else "unit-not-active"
+        return out
+    if not cwd:
+        out["reason"] = "no-workingdir"
+        return out
+    pdir = project_dir(cwd)
+    if not pdir:
+        out["reason"] = "no-project-dir"
+        return out
+    path = session_transcript(pdir)
+    if not path:
+        out["reason"] = "no-transcript"
+        return out
+    out["transcript"] = path
+    out["last_assistant"], pending = scan(path)
+    if pending:
+        out["pending_tool"] = True
+        out["pending_tool_since"], out["pending_tool_name"] = pending
+    if not out["last_assistant"]:
+        out["reason"] = "no-assistant-record"
+    return out
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: claude-session-probe <세션이름>", file=sys.stderr)
+        return 2
+    print(json.dumps(probe(sys.argv[1]), ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

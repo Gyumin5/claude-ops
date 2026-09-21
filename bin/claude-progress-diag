@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""progress.md 자동 갱신의 검증 실패를 다음 세션에 전달한다.
+
+왜 있나. progress.md 는 세션이 쓰고 다음 세션이 사실로 물려받는다. 자동 갱신기는
+근거를 못 대는 제안을 버리지만, 버렸다는 사실은 로그에만 남고 아무도 안 본다
+(실측: "근거가 입력에 없다" 거절이 이틀에 두 건). 그래서 거절의 종류와 횟수만
+세션 시작 때 먼저 보여준다.
+
+무엇을 안 하나. 사실 판정과 자동 정정은 안 한다. 거절된 제안 본문과 정정 명령은
+저장하지 않는다 — 틀렸을지 모르는 글을 다음 세션 머리에 심는 것이 더 나쁘다.
+이 기록이 말하는 것은 "그 문장을 고치려던 제안이 근거를 못 댔다" 까지다.
+
+  record  거절 종류를 상태 파일에 합친다. 실패해도 부르는 쪽을 막지 않는다.
+  render  세션 시작 주입에 넣을 글을 찍는다. 넣을 게 없으면 아무것도 안 찍는다.
+"""
+import argparse
+import hashlib
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+TTL_SEC = 21 * 86400      # 3주 실험과 같은 기간. 지난 것은 유효한 경고가 아니다.
+MAX_KINDS = 12            # 종류는 가드 개수만큼이라 이보다 늘 적다. 부풀면 자른다.
+DEFAULT_CAP = 1024        # 주입 예산. 이 글이 쓴 만큼 본문 예산에서 뺀다.
+
+
+def state_path(project):
+    key = hashlib.sha256(project.encode("utf-8")).hexdigest()[:16]
+    # basename 으로 가르면 이름이 같은 다른 트리가 한 파일을 나눠 쓴다.
+    return (Path.home() / ".claude" / "state" / "progress-updater"
+            / "diagnostics" / f"{key}.json")
+
+
+def kst(ts):
+    return time.strftime("%Y-%m-%d %H:%M KST", time.localtime(ts))
+
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def live_events(doc, now):
+    out = []
+    for e in doc.get("events") or []:
+        if not isinstance(e, dict) or not isinstance(e.get("kind"), str):
+            continue
+        ts = e.get("last_ts")
+        if not isinstance(ts, (int, float)) or now - ts > TTL_SEC:
+            continue
+        out.append(e)
+    return out
+
+
+def fingerprint(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def do_record(a):
+    kinds = [k for k in (a.kind or []) if k.strip()]
+    if not kinds:
+        return 0
+    path = state_path(a.project)
+    now = time.time()
+    doc = load(path) or {}
+    events = live_events(doc, now)
+    by_kind = {e["kind"]: e for e in events}
+    for kind in kinds:
+        e = by_kind.get(kind)
+        if e is None:
+            e = {"kind": kind, "count": 0, "first": kst(now)}
+            events.append(e)
+            by_kind[kind] = e
+        e["count"] = int(e.get("count") or 0) + 1
+        e["last"] = kst(now)
+        e["last_ts"] = now
+        e["mode"] = a.mode
+        e["transcript"] = a.transcript
+    events.sort(key=lambda e: e.get("last_ts") or 0, reverse=True)
+    out = {"schema": 1,
+           "host": socket.gethostname(),
+           "project": a.project,
+           "fingerprint": a.fingerprint,
+           "updated": kst(now),
+           "events": events[:MAX_KINDS]}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+    return 0
+
+
+def do_render(a):
+    path = state_path(a.project)
+    doc = load(path)
+    if not doc:
+        return 0
+    # 호스트·프로젝트가 다르거나 만료된 자료는 경고로 쓰지 않는다. 자료가 없는 것도
+    # 정상이라는 뜻이 아니다 — 그냥 아무 말도 안 한다.
+    if doc.get("host") != socket.gethostname() or doc.get("project") != a.project:
+        return 0
+    events = live_events(doc, time.time())
+    if not events:
+        return 0
+    lines = ["## [자동 알림] 기록 검증 실패가 관측됐다", "",
+             "자동 갱신기가 progress.md 를 고치려다 근거를 못 댄 제안을 버렸다. "
+             "어느 문장이 틀렸다는 판정이 아니다 — 사실 여부는 미판정이다. "
+             "지금 판단에 걸리면 아래 원자료를 직접 봐라.", ""]
+    for e in events:
+        lines.append(f"- {e['kind']} {int(e.get('count') or 0)}회 (마지막 {e.get('last', '')})")
+    same = doc.get("fingerprint") and doc["fingerprint"] == fingerprint(a.progress)
+    lines.append("")
+    lines.append("progress.md 가 그때와 같은 내용이다." if same
+                 else "progress.md 가 그때와 다른 내용이다 — 반영 여부는 미확인이다.")
+    lines.append(f"원자료: {Path.home()}/.claude/logs/progress-updater.log · 상태 {path}")
+    text = "\n".join(lines) + "\n\n"
+    blob = text.encode("utf-8")
+    if len(blob) > a.cap:
+        # 바이트로 자르고 깨진 글자는 버린다. 한글은 한 자 3바이트라 경계에 잘 걸린다.
+        cut = "(이하 잘림)\n\n".encode("utf-8")
+        text = blob[:max(0, a.cap - len(cut))].decode("utf-8", "ignore") + "(이하 잘림)\n\n"
+    sys.stdout.write(text)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("record", help="거절 종류를 합쳐 기록한다")
+    r.add_argument("--project", required=True)
+    r.add_argument("--kind", action="append", default=[])
+    r.add_argument("--mode", default="")
+    r.add_argument("--transcript", default="")
+    r.add_argument("--fingerprint", default="")
+
+    v = sub.add_parser("render", help="세션 시작에 넣을 글을 찍는다")
+    v.add_argument("--project", required=True)
+    v.add_argument("--progress", required=True)
+    v.add_argument("--cap", type=int, default=DEFAULT_CAP)
+
+    a = ap.parse_args()
+    return do_record(a) if a.cmd == "record" else do_render(a)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as e:
+        # 기록·전달이 실패해도 부르는 쪽(갱신기의 거절 가드, 세션 시작 주입)은 산다.
+        print(f"[progress-diag] {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(0)

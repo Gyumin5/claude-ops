@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""claude-telegram-healthcheck — 프로젝트 봇 inbound 좀비 감시.
+
+원리(2026-06-05 개정):
+정상 세션은 텔레그램 채널을 in-process 로 long-poll 해서 큐(pending)를 즉시
+비운다. 봇 채널이 죽으면(좀비) pending 이 계속 안 빠진다.
+
+오발 방지가 핵심이다 — 세션이 긴 작업/깊은 사고(单 턴 16분+ 관측)로 잠깐 폴링을
+멈추면 pending 이 일시적으로 쌓였다가 폴링 재개 시 빠진다. 이건 좀비가 아니다.
+그래서 "오래된 메시지 1건"(구버전 60s)만으로 판정하지 않고, pending 이 STUCK_SEC
+동안 한 번도 0 으로 안 빠진 '지속 적체'일 때만 좀비로 본다.
+
+비침습: 큐 확인은 getWebhookInfo(pending_update_count) 로 한다. 구버전은 getUpdates
+를 썼는데, 그건 세션 자신의 long-poll 과 충돌(409)해서 정상 세션 폴링을 방해했다.
+getWebhookInfo 는 getUpdates 를 건드리지 않는다.
+
+2026-06-17 보강(Phase 1, child-missing 직접감지):
+backlog(pending) 신호는 메시지가 쌓여야 떠서 지연이 있다. 그래서 "유닛은 active 인데
+텔레그램 MCP 플러그인(bun) 자식 프로세스가 없음"을 독립 신호로 직접 감지한다.
+- 시작 후 CHILD_GRACE_SEC 는 startup grace(핸드오프/재기동 창 오발 방지).
+- child 0 개가 CHILD_MISSING_CONFIRM 회 연속 관측될 때만 확정(디바운스).
+- backlog 감시는 그대로 유지(child 살아있어도 논리적 먹통은 backlog 로 잡음).
+두 신호 병행. 알림만(자동 kill/재기동 안 함). ai-collaborate 토론 권고안.
+
+자동 restart 안 함 — 진행 중 컨텍스트 보호. 알림만. 쿨다운: 세션별 *_COOLDOWN_SEC.
+"""
+
+import json
+import os
+import subprocess
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+# pending 이 이 시간동안 한 번도 0 으로 안 빠지면 좀비. 세션의 최장 단일 턴
+# (deep thinking/long tool, 관측상 ~16-20분)보다 넉넉히 길게 잡아 오발 방지.
+STUCK_SEC = 1800            # 30분
+ALERT_COOLDOWN_SEC = 3600
+HTTP_TIMEOUT = 8
+
+# child-missing 직접감지 파라미터
+CHILD_GRACE_SEC = 120       # 서비스 active 진입 후 이 시간은 child 판정 보류(핸드오프 창)
+CHILD_MISSING_CONFIRM = 3   # child 0개 연속 관측 횟수(약 1분 주기 → 약 3분)
+CHILD_ALERT_COOLDOWN_SEC = 3600
+
+CONTROL_BOT_ENV = Path.home() / ".claude" / "control-bot" / ".env"
+CONTROL_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+STATE_DIR = Path.home() / ".claude" / "state" / "telegram-healthcheck"
+
+
+def load_env_file(path):
+    out = {}
+    try:
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return out
+
+
+def load_control_token():
+    return load_env_file(CONTROL_BOT_ENV).get("CONTROL_BOT_TOKEN")
+
+
+def telegram_post(token, chat_id, text):
+    if not token:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = urllib.parse.urlencode(
+            {"chat_id": chat_id, "text": text, "disable_web_page_preview": "true"}
+        ).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read()
+        return True
+    except Exception:
+        return False
+
+
+def list_claude_services():
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "list-units", "--type=service",
+             "--all", "--no-legend", "--plain"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception:
+        return []
+    services = []
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        unit = parts[0]
+        if not unit.startswith("claude-") or not unit.endswith(".service"):
+            continue
+        if unit == "claude-control-bot.service":
+            continue
+        # claude-job-* 는 systemd-run --collect 로 띄운 detach 백그라운드 잡(2계층 실행모델의
+        # 예외 계층, 2026-07-03 도입)이다. 순수 셸스크립트 실행이라 텔레그램 MCP 자식이 원래
+        # 없으므로 이 검사 대상이 아니다 — 포함시키면 "텔레그램 플러그인 사망 의심" 오탐이 뜬다.
+        if unit.startswith("claude-job-"):
+            continue
+        # only loaded units
+        if "loaded" not in line and "active" not in line:
+            continue
+        services.append(unit)
+    return services
+
+
+def svc_telegram_state_dir(unit):
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "Environment", "--value", unit],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return None
+    for tok in out.split():
+        if tok.startswith("TELEGRAM_STATE_DIR="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def svc_props(unit):
+    """ActiveState/SubState/MainPID/ControlGroup/ActiveEnterTimestampMonotonic 읽기."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", unit,
+             "-p", "ActiveState", "-p", "SubState", "-p", "MainPID",
+             "-p", "ControlGroup", "-p", "ActiveEnterTimestampMonotonic"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return {}
+    d = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k] = v
+    return d
+
+
+def cgroup_pids(control_group):
+    """유닛 cgroup 의 모든 pid. 못 읽으면 [] (=unknown)."""
+    if not control_group:
+        return []
+    path = Path("/sys/fs/cgroup") / control_group.lstrip("/") / "cgroup.procs"
+    try:
+        return [int(x) for x in path.read_text().split()]
+    except Exception:
+        return []
+
+
+def has_telegram_child(pids):
+    """pid 들 중 텔레그램 MCP 플러그인(bun) 프로세스가 있는지."""
+    for pid in pids:
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except Exception:
+            continue
+        cmd = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+        if "bun" in cmd and (
+            "plugin:telegram" in cmd or "claude-plugins-official/telegram" in cmd
+        ):
+            return True
+    return False
+
+
+def has_claude_process(pids):
+    """pid 들 중 실제 claude CLI 세션 프로세스가 있는지(--remote-control 플래그로 식별).
+
+    2026-07-08 peer 신고: claude-fox-bridge.service/claude-fox-live.service 는
+    peer VIO 세션이 systemd-run 으로 detach 한 헬퍼 데몬(C++/python, claude CLI
+    아님)인데, 유닛명이 claude- 접두를 써서 list_claude_services() 의 이름 기반
+    필터를 그대로 통과해 "텔레그램 플러그인 사망 의심" 이 매 틱 오탐났다.
+    유닛명이 아니라 그 유닛의 실제 cgroup 안에 claude CLI 프로세스가 있는지로
+    판정한다 — 단순 'claude' 문자열 매칭은 헬퍼 데몬 경로에 우연히 그 문자열이
+    섞여도 오탐할 수 있어, Claude Code CLI 세션에만 있는 --remote-control 플래그로
+    식별한다.
+    """
+    for pid in pids:
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except Exception:
+            continue
+        cmd = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+        if "--remote-control" in cmd:
+            return True
+    return False
+
+
+def _nonzero_file(unit):
+    return STATE_DIR / f"{unit}.nonzero_since"
+
+
+def stuck_since(unit, pending):
+    """pending 이 연속으로 ≥1 인 streak 의 시작 시각을 추적.
+    pending==0 이면 streak 리셋. 반환=streak 시작 ts(없으면 now)."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    f = _nonzero_file(unit)
+    now = time.time()
+    if pending <= 0:
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+        return None
+    # pending >= 1
+    try:
+        return float(f.read_text().strip())
+    except Exception:
+        f.write_text(str(now))
+        return now
+
+
+def child_missing_streak(unit, missing):
+    """child 0개 연속 관측 횟수. present(=missing False)면 0 으로 리셋."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    f = STATE_DIR / f"{unit}.child_missing"
+    if not missing:
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+        return 0
+    try:
+        c = int(f.read_text().strip())
+    except Exception:
+        c = 0
+    c += 1
+    f.write_text(str(c))
+    return c
+
+
+def cooldown_ok(unit, kind="backlog"):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    f = STATE_DIR / f"{unit}.{kind}.alerted"
+    if not f.is_file():
+        return True
+    age = time.time() - f.stat().st_mtime
+    limit = CHILD_ALERT_COOLDOWN_SEC if kind == "child" else ALERT_COOLDOWN_SEC
+    return age >= limit
+
+
+def mark_alerted(unit, kind="backlog"):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / f"{unit}.{kind}.alerted").touch()
+
+
+def check_child(unit, control_token):
+    """active 인데 텔레그램 child 없음 직접감지. 반환=상태 문자열(요약용)."""
+    props = svc_props(unit)
+    if props.get("ActiveState") != "active" or props.get("SubState") != "running":
+        child_missing_streak(unit, False)  # 비활성/전이 중엔 streak 리셋
+        return "inactive"
+    main_pid = props.get("MainPID", "0")
+    if main_pid in ("", "0"):
+        child_missing_streak(unit, False)
+        return "nopid"
+    # startup grace
+    active_for = None
+    try:
+        mono_usec = int(props.get("ActiveEnterTimestampMonotonic", "0"))
+        if mono_usec > 0:
+            active_for = time.monotonic() - mono_usec / 1e6
+    except Exception:
+        active_for = None
+    if active_for is None:
+        return "unknown"
+    if active_for < CHILD_GRACE_SEC:
+        child_missing_streak(unit, False)  # grace 중엔 판정 보류·리셋
+        return "grace"
+    pids = cgroup_pids(props.get("ControlGroup", ""))
+    if not pids:
+        return "cg_unknown"  # cgroup 못 읽음 → 판정 보류(streak 미변경)
+    if not has_claude_process(pids):
+        # 유닛명이 claude- 접두라도 실제 claude CLI 세션이 아니면(예: fox-bridge/
+        # fox-live 같은 detach 헬퍼 데몬) 이 검사 대상이 아니다 — streak 도 안 건드림.
+        child_missing_streak(unit, False)
+        return "not_a_session"
+    present = has_telegram_child(pids)
+    streak = child_missing_streak(unit, not present)
+    if present:
+        return "child_ok"
+    if streak >= CHILD_MISSING_CONFIRM and cooldown_ok(unit, "child"):
+        session = unit.replace("claude-", "").replace(".service", "")
+        msg = (
+            f"⚠ telegram-healthcheck: {session} 텔레그램 플러그인 사망 의심\n"
+            f"서비스는 active 인데 텔레그램 MCP(bun) child 가 {streak}회 연속 없음.\n"
+            f"systemctl 은 정상으로 보이지만 봇 응답이 안 될 수 있음(409 등으로 플러그인만 죽음).\n"
+            f"복구(컨텍스트·cron 손실 주의): systemctl --user restart {unit}\n"
+            f"또는 세션 내 /mcp 로 telegram reconnect."
+        )
+        if telegram_post(control_token, CONTROL_CHAT_ID, msg):
+            mark_alerted(unit, "child")
+    return f"child_missing(s{streak})"
+
+
+def main():
+    control_token = load_control_token()
+    results = []
+    now = time.time()
+    for unit in list_claude_services():
+        # child-missing 직접감지(토큰 유무와 무관하게 active 세션이면 점검)
+        child_state = check_child(unit, control_token)
+
+        # 정지된 세션은 적체 판정 대상이 아니다. 유닛 목록이 --all 이라 dead 유닛까지
+        # 들어오는데, 큐를 비울 주체가 없으니 pending 이 영원히 안 빠져서 30분 임계를
+        # 반드시 넘는다 — 감지가 아니라 구조적 오탐이다(2026-09-15 옆 기계: 운영자가
+        # 일부러 정지시킨 네 세션이 한 시간마다 같이 울렸다). child 쪽은 이미 같은
+        # 관문을 갖고 있었고 적체 쪽만 빠져 있었다. streak 파일도 지운다 — 남겨두면
+        # 세션이 다시 살아난 순간 정지 기간까지 합산돼 첫 회차에 바로 울린다.
+        if child_state in ("inactive", "nopid"):
+            stuck_since(unit, 0)
+            results.append((unit, f"skip_backlog|{child_state}", 0, 0))
+            continue
+
+        state_dir = svc_telegram_state_dir(unit)
+        if not state_dir:
+            results.append((unit, f"no_state_dir|{child_state}", 0, 0))
+            continue
+        env_path = Path(state_dir) / ".env"
+        if not env_path.is_file():
+            results.append((unit, f"no_env|{child_state}", 0, 0))
+            continue
+        env = load_env_file(env_path)
+        token = env.get("TELEGRAM_BOT_TOKEN") or env.get("BOT_TOKEN")
+        if not token:
+            results.append((unit, f"no_token|{child_state}", 0, 0))
+            continue
+        n = pending_count(token)
+        if n is None:
+            results.append((unit, f"api_error|{child_state}", 0, 0))
+            continue
+        since = stuck_since(unit, n)
+        stuck_for = max(0, int(now - since)) if since else 0
+        zombie = n >= 1 and since is not None and stuck_for >= STUCK_SEC
+        results.append((unit, f"{'zombie' if zombie else 'ok'}|{child_state}", n, stuck_for))
+        if zombie and cooldown_ok(unit, "backlog"):
+            session = unit.replace("claude-", "").replace(".service", "")
+            mins = stuck_for // 60
+            msg = (
+                f"⚠ telegram-healthcheck: {session} 봇 inbound 적체 의심\n"
+                f"pending={n}, {mins}분째 안 빠짐 (임계 {STUCK_SEC // 60}분)\n"
+                f"세션이 멈췄거나 텔레그램 채널이 죽었을 수 있음.\n"
+                f"권고: cs restart {session}"
+            )
+            if telegram_post(control_token, CONTROL_CHAT_ID, msg):
+                mark_alerted(unit, "backlog")
+    # one-line summary to stdout (for journalctl)
+    summary = " | ".join(f"{u}:{s}:p{n}/s{a}" for u, s, n, a in results)
+    print(summary or "no-services")
+    return 0
+
+
+def pending_count(token):
+    """getWebhookInfo 의 pending_update_count. None=확인 불가(에러).
+    getUpdates 를 건드리지 않아 세션 long-poll 과 충돌하지 않음(비침습)."""
+    try:
+        url = f"https://api.telegram.org/bot{token}/getWebhookInfo"
+        with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as r:
+            data = json.loads(r.read())
+        if not data.get("ok"):
+            return None
+        return int(data.get("result", {}).get("pending_update_count", 0))
+    except Exception:
+        return None
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

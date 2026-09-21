@@ -1,0 +1,304 @@
+#!/bin/bash
+# claude-daily-research: Claude Code 생태계 변화 리서치 + AI 평가 + 텔레그램 브리핑.
+# 2026-05-12 재작성: claude --bare 호출 제거 (Max OAuth 실패로 abort 사고).
+# 구조: curl 기반 search → ai-debate (codex+gemini) 평가 → 텔레그램 전송.
+
+set -uo pipefail
+
+export NVM_DIR="$HOME/.nvm"
+set +u
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+set -u
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+
+# dedup 헬퍼는 같은 bin/ 에 동거 (symlink 실행 대비 realpath). 별도 install 불필요.
+SCRIPT_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+DEDUP="$SCRIPT_DIR/daily-research-dedup.py"
+
+TELEGRAM_ENV="$HOME/dotfiles/.claude/telegram/.env"
+CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+DATA_DIR="$HOME/.local/share/ai-briefing"
+TODAY="$(date +%Y-%m-%d)"
+SEVEN_DAYS_AGO="$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+RUN_ID="$(date +%Y%m%dT%H%M%SZ)"
+OUT_FILE="$DATA_DIR/claude-research_${TODAY}.md"
+LOG_FILE="$DATA_DIR/claude-research.log"
+BRIEFING_DIR="$HOME/.claude/state/briefings"
+BRIEFING_FILE="$BRIEFING_DIR/${TODAY}.md"
+STATUS_DIR="$HOME/.local/state/claude-daily-research"
+STATUS_FILE="$STATUS_DIR/status.jsonl"
+HISTORY_FILE="$STATUS_DIR/seen-history.jsonl"   # dedup 이력(런타임 상태, git 비추적)
+DEDUP_LOG="$DATA_DIR/dedup.log"
+LOCK_FILE="$STATUS_DIR/.run.lock"
+
+mkdir -p "$DATA_DIR" "$BRIEFING_DIR" "$STATUS_DIR"
+
+# cron 중복 실행 방지 lock — 병렬 run 시 history race 방지. 못 잡으면 조용히 종료.
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] another run holds lock; exit" >> "$LOG_FILE" 2>/dev/null
+    exit 0
+fi
+[ -f "$TELEGRAM_ENV" ] && source "$TELEGRAM_ENV"
+BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${BOT_TOKEN:-}}"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
+
+status() {
+    # phase, success(true/false), extra json fragment
+    local phase="$1" success="$2" extra="${3:-}"
+    local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    jq -nc \
+        --arg ts "$now" \
+        --arg rid "$RUN_ID" \
+        --arg ph "$phase" \
+        --argjson ok "$success" \
+        "{ts:\$ts, run_id:\$rid, phase:\$ph, success:\$ok ${extra:+, $extra}}" \
+        >> "$STATUS_FILE" 2>/dev/null
+}
+
+abort() {
+    local phase="$1" reason="$2"
+    log "ABORT phase=$phase reason=$reason"
+    status "$phase" false "error_kind:\"$reason\""
+    exit 1
+}
+
+log "start run_id=$RUN_ID since=$SEVEN_DAYS_AGO"
+status start true ""
+
+# ── 1. curl 기반 search: Claude Code 사용성 개선 자료 (skill/MCP/plugin/hook/agent SDK) ──
+# 2026-05-25 변경: 범위를 일반 기술/논문 전반에서 Claude Code 사용성 개선으로 좁힘.
+# 소스: HN 키워드 검색 (Claude/MCP/Anthropic agent) + GH 키워드 repo 검색.
+CANDIDATES_FILE="$(mktemp)"
+trap "rm -f $CANDIDATES_FILE" EXIT
+
+candidate_count=0
+
+# 1a) HackerNews — Algolia 키워드 검색 (Claude Code/Anthropic/MCP/agent), 지난 30일.
+HN_SINCE=$(date -d '30 days ago' +%s)
+hn_total=0
+for q in "Claude Code" "MCP server" "Anthropic agent" "AI coding agent"; do
+    hn_resp=$(curl -sS --max-time 25 -G \
+        --data-urlencode "query=$q" \
+        --data-urlencode "tags=story" \
+        --data-urlencode "numericFilters=created_at_i>${HN_SINCE}" \
+        --data-urlencode "hitsPerPage=5" \
+        "https://hn.algolia.com/api/v1/search" 2>/dev/null || echo "")
+    [ -z "$hn_resp" ] && continue
+    hn_items=$(echo "$hn_resp" | jq -c \
+        "[ .hits[]? | select(.url != null) | {source:\"hackernews:$q\", title:.title, url:.url, points:(.points // 0), published:.created_at, body:\"\"} ]" 2>/dev/null || echo "[]")
+    hn_cnt=$(echo "$hn_items" | jq 'length' 2>/dev/null || echo 0)
+    if [ "$hn_cnt" -gt 0 ]; then
+        echo "$hn_items" | jq -c '.[]' >> "$CANDIDATES_FILE"
+        hn_total=$((hn_total + hn_cnt))
+    fi
+done
+candidate_count=$((candidate_count + hn_total))
+log "  hackernews: $hn_total items (Claude/MCP/Anthropic 키워드)"
+
+# 1b) GitHub repo 검색 — Claude Code/MCP/skill 관련 키워드, 최근 30일 생성된 stars 상위.
+GH_SINCE=$(date -d '30 days ago' +%Y-%m-%d)
+gh_added_count=0
+for q in "claude-code" "mcp-server" "claude+plugin" "claude+skill" "agent+sdk+anthropic"; do
+    gh_json=$(curl -sS --max-time 20 -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/search/repositories?q=${q}+created:>${GH_SINCE}&sort=stars&order=desc&per_page=4" 2>/dev/null || echo "")
+    [ -z "$gh_json" ] && continue
+    parsed=$(echo "$gh_json" | jq -c \
+        "[ .items[]? | select(.html_url != null) | {source:\"github-search:$q\", title:.full_name + \" — \" + (.description // \"\"), url:.html_url, stars:(.stargazers_count // 0), published:.created_at, body:(.description // \"\")} ]" 2>/dev/null || echo "[]")
+    cnt=$(echo "$parsed" | jq 'length' 2>/dev/null || echo 0)
+    if [ "$cnt" -gt 0 ]; then
+        echo "$parsed" | jq -c '.[]' >> "$CANDIDATES_FILE"
+        gh_added_count=$((gh_added_count + cnt))
+    fi
+done
+candidate_count=$((candidate_count + gh_added_count))
+log "  github-search: $gh_added_count repos (Claude/MCP/skill 키워드)"
+
+# 1c) arXiv 제거 (2026-05-25): Claude Code 사용성 개선 범위와 무관.
+
+log "search done: $candidate_count candidates"
+status search true "candidate_count:$candidate_count"
+
+if [ "$candidate_count" -lt 1 ]; then
+    abort search "no_candidates"
+fi
+
+# ── 1.5 dedup: 최근 노출 후보 결정론적 제외 (이력 부재로 같은 evergreen 반복되던 문제) ──
+# 검색↔AI선택 사이에서 canonical URL 기준 롤링 제외(일반 60일/review_only 90일).
+# 실패해도 진행(필터 없이) — dedup 결함이 브리핑 자체를 막지 않게.
+if [ -f "$DEDUP" ]; then
+    FILTERED_FILE="$(mktemp)"
+    dd_counts=$(python3 "$DEDUP" filter "$CANDIDATES_FILE" "$HISTORY_FILE" "$FILTERED_FILE" --log "$DEDUP_LOG" 2>>"$LOG_FILE" || echo "")
+    if [ -n "$dd_counts" ]; then
+        kept=$(echo "$dd_counts" | awk '{print $1}')
+        excl=$(echo "$dd_counts" | awk '{print $2}')
+        mv "$FILTERED_FILE" "$CANDIDATES_FILE"
+        candidate_count="${kept:-$candidate_count}"
+        log "  dedup: kept=$kept excluded=$excl (rolling 60d / review_only 90d)"
+        status dedup true "kept:${kept:-0},excluded:${excl:-0}"
+    else
+        rm -f "$FILTERED_FILE"
+        log "  dedup: filter failed, proceeding without dedup"
+        status dedup false "error_kind:\"filter_failed\""
+    fi
+fi
+
+# ── 2. ai-debate 평가 호출 ──
+CANDIDATES_JSON=$(cat "$CANDIDATES_FILE")
+
+DEBATE_TASK="아래는 지난 30일 Claude Code/MCP/Anthropic 키워드로 수집한 HN 글과 GitHub repo 후보다. 운영자는 9개 Claude Code 세션을 systemd 로 운영, dotfiles 로 hook/skill/MCP 관리.
+
+범위 (엄격, 위반 시 항목 제외)
+- Claude Code 사용성 개선에 직접 쓰일 것만 추천: 새 skill, MCP server, plugin, hook 패턴, slash command, agent SDK, CLI 워크플로우 도구, statusline/observability 도구.
+- 아래는 무조건 제외: 일반 AI 뉴스·정치·LLM 모델 발표·논문(AV/SLAM 등)·보안 일반 이슈·코딩 에이전트 일반론(Cursor, Copilot 등 Claude Code 와 직접 결합 안 되는 것).
+
+목표
+- 토론·합의 끝에 도입/시도 가치 있는 추천 1~5건 선정. 범위 안에 없으면 '추천 없음'.
+- 후보 카탈로그 나열 금지. 평가 과정도 본문에 쓰지 말 것.
+
+출력 형식 (final_decision 필드에 아래를 통째로 넣는다)
+첫 줄: '이번 주 트렌드: <1문장>'
+빈 줄.
+이후 각 추천 항목을 다음 4줄로 반복:
+- '#N <제목>'
+- '왜: <한 줄 이유, 운영자 워크플로우와 연결>'
+- '실행: <bash 1줄 또는 구체 액션 1줄>' 또는 '실행: 검토만'
+- '출처: <URL 1개>'
+항목 사이 빈 줄 1개.
+
+규칙
+- 추천 없음이면 '추천 없음' 한 줄 + 이유 1문장만.
+- 각 항목 출처 URL 필수 (후보 JSON 의 url 그대로).
+- 후보 stars 5 미만, license 불명, 운영 무관이면 추천에서 제외.
+- 굵게·코드펜스·들여쓰기 금지.
+
+후보 (JSON lines):
+${CANDIDATES_JSON}"
+
+if [ "$candidate_count" -ge 1 ]; then
+log "ai-debate start"
+DEBATE_OUT=$(timeout 1200 ai-debate --no-cache --max-rounds 1 "$DEBATE_TASK" 2>> "$LOG_FILE") || true
+log "ai-debate exit. length=${#DEBATE_OUT}"
+
+if [ "${#DEBATE_OUT}" -lt 200 ]; then
+    abort ai_debate "short_output_len_${#DEBATE_OUT}"
+fi
+
+# arbiter final_decision 필드를 그대로 사용 (프롬프트가 추천 리스트 전체를 그 필드에 넣도록 강제).
+ARB_RUN_DIR=$(echo "$DEBATE_OUT" | awk '/^artifacts=/{sub("artifacts=",""); print; exit}')
+OUTPUT=""
+if [ -n "$ARB_RUN_DIR" ] && [ -f "$ARB_RUN_DIR/arbiter.normalized.json" ]; then
+    OUTPUT=$(jq -r '.final_decision // ""' "$ARB_RUN_DIR/arbiter.normalized.json" 2>/dev/null)
+fi
+# fallback: stdout 전체 (구버전 호환)
+if [ -z "$OUTPUT" ]; then
+    OUTPUT=$(echo "$DEBATE_OUT" | awk '/^--- ARBITER/{flag=1} flag{print}')
+fi
+[ -z "$OUTPUT" ] && OUTPUT="$DEBATE_OUT"
+else
+    # dedup 후 신규 후보 0건 → ai-debate 생략, 노이즈 없는 '추천 없음'.
+    OUTPUT="추천 없음 — 신규 후보 없음 (최근 노출 후보가 모두 이력으로 억제됨)."
+    DEBATE_OUT=""
+    log "all candidates deduped; ai-debate skipped"
+fi
+
+# URL 가드: 단일 결정 형식에서는 0건 허용 (변경 없음 결정이면 URL 없을 수 있음).
+url_count=$(echo "$OUTPUT" | grep -oE 'https?://[^ )"]+' | sort -u | wc -l)
+log "url_count=$url_count"
+
+status ai_debate true "candidate_count:$candidate_count,url_count:$url_count,output_bytes:${#OUTPUT}"
+
+# ── 3. 저장 ──
+{
+    echo "# Claude Code 개선 리서치 ${TODAY}"
+    echo "run_id: $RUN_ID"
+    echo "후보 수: $candidate_count"
+    echo "URL 수: $url_count"
+    echo
+    echo "$OUTPUT"
+} > "$OUT_FILE"
+cp "$OUT_FILE" "$BRIEFING_FILE"
+
+# ── 3.5 이력 기록: 이번에 노출된 후보를 history 에 기록(다음 런 dedup 대상) ──
+# 실패해도 진행 — 기록 실패가 텔레그램 전송을 막지 않게(경고만).
+if [ -f "$DEDUP" ]; then
+    rec=$(python3 "$DEDUP" record "$BRIEFING_FILE" "$HISTORY_FILE" --date "$TODAY" 2>>"$LOG_FILE" || echo "")
+    if [ -n "$rec" ]; then
+        log "  history recorded: $rec items"
+        status history true "recorded:${rec:-0}"
+    else
+        log "  WARN history record failed"
+        status history false "error_kind:\"record_failed\""
+    fi
+fi
+
+# ── 4. 텔레그램 전송 (3500자 chunk) ──
+if [ "${SMOKE:-0}" = "1" ]; then
+    log "SMOKE=1, telegram step skipped"
+    status smoke_done true "candidate_count:$candidate_count,url_count:$url_count,output_bytes:${#OUTPUT}"
+    exit 0
+fi
+if [ -z "$BOT_TOKEN" ]; then
+    abort telegram "no_token"
+fi
+
+HEADER="일일 리서치 ${TODAY} (후보 ${candidate_count}건 평가)
+
+"
+FULL_MSG="${HEADER}${OUTPUT}"
+
+# 3500자 단위 split (utf-8 안전: awk)
+TMP_SPLIT=$(mktemp -d)
+echo "$FULL_MSG" | awk -v size=3500 -v dir="$TMP_SPLIT" '
+{
+    buf = buf $0 "\n"
+    while (length(buf) >= size) {
+        cut = size
+        while (cut > 0 && substr(buf, cut, 1) != "\n" && substr(buf, cut, 1) != " ") cut--
+        if (cut <= 0) cut = size
+        chunk_num++
+        f = sprintf("%s/c%03d", dir, chunk_num)
+        print substr(buf, 1, cut) > f
+        close(f)
+        buf = substr(buf, cut + 1)
+    }
+}
+END {
+    if (length(buf) > 0) {
+        chunk_num++
+        f = sprintf("%s/c%03d", dir, chunk_num)
+        print buf > f
+        close(f)
+    }
+}'
+
+chunk_files=($(ls "$TMP_SPLIT"/c* 2>/dev/null | sort))
+total=${#chunk_files[@]}
+sent=0
+for i in "${!chunk_files[@]}"; do
+    n=$((i + 1))
+    label=""
+    [ "$total" -gt 1 ] && label="[${n}/${total}] "
+    body=$(cat "${chunk_files[$i]}")
+    curl -sS --max-time 30 -X POST \
+        "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${CHAT_ID}" \
+        --data-urlencode "text=${label}${body}" \
+        --data-urlencode "disable_web_page_preview=true" >> "$LOG_FILE" 2>&1
+    rc=$?
+    if [ $rc -eq 0 ]; then sent=$((sent + 1)); fi
+    sleep 1
+done
+rm -rf "$TMP_SPLIT"
+
+log "telegram sent=$sent/$total bytes=${#FULL_MSG}"
+status telegram true "messages:$sent,bytes:${#FULL_MSG}"
+
+if [ "$sent" -lt "$total" ]; then
+    abort telegram "partial_send_${sent}_of_${total}"
+fi
+
+status done true "candidate_count:$candidate_count,url_count:$url_count,messages:$total"
+log "complete"
+exit 0

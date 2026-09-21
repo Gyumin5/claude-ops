@@ -1,0 +1,6 @@
+[Unit]
+Description=Claude Code session watchdog (auto-recover stopped sessions)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-watchdog

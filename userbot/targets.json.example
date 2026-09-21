@@ -1,0 +1,5 @@
+{
+  "dotfiles": "@my_dotfiles_bot",
+  "session-a": "@my_session_a_bot",
+  "session-b": "@my_session_b_bot"
+}

@@ -1,0 +1,195 @@
+#!/bin/bash
+# claude-bun-ensure: 각 claude 세션 유닛이 telegram MCP (bun) 자식을 갖고 있는지 확인.
+# 없으면 해당 세션 systemctl restart. 부팅 직후 + 주기적 race/crash 자동 복구용.
+#
+# 호출: timer 가 boot+240s 첫 실행(grace 통과 시점), 이후 OnUnitActiveSec 주기로 반복.
+#
+# 대상 선정 (2026-07-26 개정, ai-debate run-20260726T050732Z / C안):
+#  claude-*.service 글롭 + 제외목록(blocklist) 방식은 폐기했다. 같은 이름공간에
+#  보조 유닛(워치독·클리너·리포트 디스패치·nudge 템플릿 등)이 계속 늘어나 제외목록이
+#  세 번 확장됐고, 그래도 claude-api-5xx-watcher 가 새어나가 5분마다 오재시작됐다.
+#  대신 positive gate: ExecStart 실행파일 경로가 정확히 $SESSION_EXEC 인 유닛만 세션으로
+#  본다(양쪽 머신 전수 확인 — 세션은 예외 없이 claude-service-exec, 보조 유닛은
+#  dotfiles/bin/<도구>, control-bot 도 별도 경로).
+#  positive gate 의 실패모드는 "조용히 아무것도 감시 안 함"이라 침묵 감지가 필수:
+#  후보 0개(ZERO) 뿐 아니라 직전 정상 집합 대비 부분 누락(GATE)도 탐지하고,
+#  MCP 를 우회한 Bot API 직접 호출로 알린다(중복 억제 + 복구 알림).
+#
+# 안전장치 (restart 루프/churn 방지):
+#  - GRACE: 서비스 업타임이 GRACE 보다 짧으면 아직 bun 스폰 중일 수 있으므로 재시작 안 함.
+#  - COOLDOWN: 같은 세션을 COOLDOWN 안에 두 번 재시작하지 않음(영구 실패 세션도 churn 상한).
+#  --dry-run / -n: 재시작하지 않고 선정 결과 + 판정만 출력(검증용).
+
+set -uo pipefail
+LOG="$HOME/.claude/logs/bun-ensure.log"
+STATE_DIR="$HOME/.claude/state/bun-ensure"
+GRACE=180       # 서비스 업타임이 이보다 짧으면 기동 중으로 보고 건너뜀(초)
+COOLDOWN=900    # 재부착 성공 후 같은 세션 재시작 최소 간격(초)
+SHORT_RETRY=120 # 재시작해도 bun 부착 실패 시 짧은 재시도 간격(부팅창 self-heal, 2026-07-20)
+
+SESSION_EXEC="$HOME/.local/bin/claude-service-exec"  # 세션 유닛 판별 기준(정확 일치)
+BASELINE="$STATE_DIR/session-baseline.txt"           # 마지막 정상 세션 집합
+ANOMALY="$STATE_DIR/anomaly.state"                   # 1행 fingerprint / 2행 최초 알림 epoch
+ALERT_COOLDOWN=21600                                 # 같은 이상 상태 재알림 간격(6h)
+TELEGRAM_ENV="$HOME/dotfiles/.claude/telegram/.env"
+CHAT_ID=${TELEGRAM_CHAT_ID:-}
+
+mkdir -p "$(dirname "$LOG")" "$STATE_DIR"
+ts() { date -Iseconds; }
+DRY=0
+case "${1:-}" in --dry-run|-n) DRY=1 ;; esac
+# --dry-run 은 공유 로그를 오염시키지 않는다(검증 실행이 실제 이력처럼 남던 문제).
+log() { [ "$DRY" -eq 1 ] && return 0; echo "[$(ts)] $1" >> "$LOG"; }
+
+# telegram MCP 를 거치지 않는 독립 채널(Bot API 직접). MCP 가 죽어 있어도 도착해야 함.
+alert_operator() {
+    [ "$DRY" -eq 1 ] && { echo "WOULD-ALERT   $1"; return 0; }
+    [ -f "$TELEGRAM_ENV" ] || { log "  WARN: telegram env 없음, 알림 생략"; return 0; }
+    # shellcheck disable=SC1090
+    ( . "$TELEGRAM_ENV"; tok="${TELEGRAM_BOT_TOKEN:-${BOT_TOKEN:-}}"
+      [ -n "$tok" ] || exit 0
+      curl -s -m 8 -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+        --data-urlencode "chat_id=${CHAT_ID}" \
+        --data-urlencode "text=$1" >/dev/null 2>&1 ) || true
+}
+
+# 현재 monotonic 초(부팅 후 경과). 서비스 ActiveEnterTimestampMonotonic 와 같은 기준.
+now_mono() { awk '{print int($1)}' /proc/uptime; }
+
+# 서비스가 active 로 들어온 뒤 경과 초. 못 구하면 큰 값(=grace 통과) 반환.
+svc_uptime() {
+    local svc="$1" aetm up
+    aetm=$(systemctl --user show -p ActiveEnterTimestampMonotonic --value "$svc" 2>/dev/null)
+    if [ -z "$aetm" ] || [ "$aetm" = "0" ]; then echo 999999; return; fi
+    up=$(now_mono)
+    echo $(( up - aetm / 1000000 ))
+}
+
+# ExecStart 의 실행파일 경로만 추출. 조회 실패/미정의면 빈 문자열.
+exec_path() {
+    systemctl --user show -p ExecStart --value "$1" 2>/dev/null \
+        | grep -o 'path=[^ ;]*' | head -1 | cut -d= -f2-
+}
+
+load_state() { systemctl --user show -p LoadState --value "$1" 2>/dev/null; }
+
+# ── 1) 대상 선정 (positive gate) ──────────────────────────────────────────
+# --plain: failed 유닛 앞의 ● 마커 제거. 없으면 마커가 유닛명으로 파싱됨(2026-07-26 수정).
+CANDIDATES=()
+while read -r svc; do
+    [ -z "$svc" ] && continue
+    ep=$(exec_path "$svc")
+    if [ -z "$ep" ]; then
+        # 목록에 뜬 유닛인데 ExecStart 를 못 읽음 = 조회 실패. gate 불일치와 구분해
+        # 재시작 판단을 보류한다(오재시작 방지).
+        log "WARN: ExecStart 조회 실패 — $svc (재시작 판단 보류)"
+        [ "$DRY" -eq 1 ] && echo "SKIP-UNKNOWN  $svc (ExecStart 조회 실패)"
+        continue
+    fi
+    [ "$ep" = "$SESSION_EXEC" ] || continue
+    CANDIDATES+=("$svc")
+done < <(systemctl --user list-units 'claude-*.service' --no-pager --no-legend --plain 2>/dev/null | awk '{print $1}')
+
+# ── 2) 침묵실패 감지 (후보 0개 + 직전 정상집합 대비 부분 누락) ────────────
+PREV=()
+[ -f "$BASELINE" ] && mapfile -t PREV < "$BASELINE"
+
+in_candidates() { local x="$1" c; for c in ${CANDIDATES+"${CANDIDATES[@]}"}; do [ "$c" = "$x" ] && return 0; done; return 1; }
+
+MISSING_GATE=()   # 유닛은 살아있는데 gate 를 벗어남 = 진짜 이상
+INACTIVE_OK=()    # gate 는 맞는데 지금 로드 목록에 없음(세션이 꺼져 있음) — 이상 아님
+for svc in ${PREV+"${PREV[@]}"}; do
+    [ -z "$svc" ] && continue
+    in_candidates "$svc" && continue
+    ls_state=$(load_state "$svc")
+    # 유닛 자체가 사라짐(세션 삭제/rotate) → 조용히 baseline 에서 제거
+    [ "$ls_state" = "not-found" ] || [ -z "$ls_state" ] && continue
+    ep=$(exec_path "$svc")
+    if [ "$ep" = "$SESSION_EXEC" ]; then INACTIVE_OK+=("$svc"); else MISSING_GATE+=("$svc"); fi
+done
+
+FP=""
+if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+    FP="ZERO"
+elif [ "${#MISSING_GATE[@]}" -gt 0 ]; then
+    FP="GATE:$(printf '%s,' "${MISSING_GATE[@]}")"
+fi
+
+PREV_FP=$(sed -n 1p "$ANOMALY" 2>/dev/null || true)
+PREV_AT=$(sed -n 2p "$ANOMALY" 2>/dev/null || true)
+[ -z "${PREV_AT:-}" ] && PREV_AT=0
+NOW=$(date +%s)
+
+if [ -n "$FP" ]; then
+    if [ "$FP" = "ZERO" ]; then
+        MSG="[bun-ensure] 감시 대상 세션 0개 — ExecStart 게이트($SESSION_EXEC)에 걸리는 유닛이 없음. MCP 자동복구가 무력화된 상태일 수 있음."
+    else
+        MSG="[bun-ensure] 세션 누락 감지 — $(printf '%s ' "${MISSING_GATE[@]}")가 ExecStart 게이트를 벗어남(기동 방식 변경?). 해당 세션은 MCP 자동복구 대상에서 빠짐."
+    fi
+    log "ANOMALY $FP"
+    if [ "$FP" != "${PREV_FP:-}" ] || [ $(( NOW - PREV_AT )) -ge "$ALERT_COOLDOWN" ]; then
+        alert_operator "$MSG"
+        [ "$DRY" -eq 0 ] && printf '%s\n%s\n' "$FP" "$NOW" > "$ANOMALY"
+    else
+        [ "$DRY" -eq 0 ] && printf '%s\n%s\n' "$FP" "$PREV_AT" > "$ANOMALY"
+    fi
+else
+    if [ -n "${PREV_FP:-}" ]; then
+        log "ANOMALY cleared (was $PREV_FP)"
+        alert_operator "[bun-ensure] 세션 감시 정상 복구 — 대상 ${#CANDIDATES[@]}개."
+        [ "$DRY" -eq 0 ] && rm -f "$ANOMALY"
+    fi
+    # 이상 없을 때만 baseline 갱신(이상 중에는 누락을 계속 탐지해야 하므로 고정).
+    [ "$DRY" -eq 0 ] && printf '%s\n' ${CANDIDATES+"${CANDIDATES[@]}"} ${INACTIVE_OK+"${INACTIVE_OK[@]}"} \
+        | sed '/^$/d' | sort -u > "$BASELINE"
+fi
+
+if [ "$DRY" -eq 1 ]; then
+    echo "SELECTED      ${#CANDIDATES[@]}개: $(printf '%s ' ${CANDIDATES+"${CANDIDATES[@]}"})"
+    [ "${#INACTIVE_OK[@]}" -gt 0 ] && echo "INACTIVE      $(printf '%s ' "${INACTIVE_OK[@]}") (게이트 정상, 유닛 비활성)"
+    [ -n "$FP" ] && echo "ANOMALY       $FP"
+fi
+
+# ── 3) bun 자식 검사 + 복구 재시작 ────────────────────────────────────────
+restarted=0
+for svc in ${CANDIDATES+"${CANDIDATES[@]}"}; do
+    has_bun=$(systemd-cgls --user-unit "$svc" --no-pager 2>/dev/null | grep -c bun || true)
+    [ "$has_bun" -ne 0 ] && continue
+
+    # bun 없음 → 안전 가드 확인.
+    upt=$(svc_uptime "$svc")
+    if [ "$upt" -lt "$GRACE" ]; then
+        [ "$DRY" -eq 1 ] && echo "SKIP-YOUNG    $svc (uptime ${upt}s < ${GRACE}s, 기동 중일 수 있음)"
+        continue
+    fi
+    cdfile="$STATE_DIR/${svc}.last"
+    last=$(cat "$cdfile" 2>/dev/null || echo 0)
+    nowepoch=$(date +%s)
+    if [ $(( nowepoch - last )) -lt "$COOLDOWN" ]; then
+        [ "$DRY" -eq 1 ] && echo "SKIP-COOLDOWN $svc (마지막 재시작 $(( nowepoch - last ))s 전 < ${COOLDOWN}s)"
+        continue
+    fi
+
+    if [ "$DRY" -eq 1 ]; then
+        echo "WOULD-RESTART $svc (bun 없음, uptime ${upt}s, 쿨다운 통과)"
+        continue
+    fi
+    log "restart $svc (bun child missing, uptime ${upt}s)"
+    if systemctl --user restart "$svc"; then
+        # 재부착 검증: 재시작 후 bun 자식이 실제로 붙는지 확인 (2026-07-20 하드닝).
+        # 성공 → 900s 쿨다운. 실패 → SHORT_RETRY 뒤 다음 틱 재시도(부팅창 회복).
+        sleep 8
+        recheck=$(systemd-cgls --user-unit "$svc" --no-pager 2>/dev/null | grep -c bun || true)
+        if [ "$recheck" -ne 0 ]; then
+            echo "$nowepoch" > "$cdfile"
+            log "  bun re-attached to $svc"
+            restarted=$((restarted + 1))
+        else
+            echo "$(( nowepoch - COOLDOWN + SHORT_RETRY ))" > "$cdfile"
+            log "  WARN: bun still missing on $svc after restart; short-retry in ${SHORT_RETRY}s"
+        fi
+    fi
+done
+
+[ "$DRY" -eq 0 ] && [ "$restarted" -gt 0 ] && log "done: $restarted sessions restarted"
+exit 0

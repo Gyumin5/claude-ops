@@ -1,0 +1,336 @@
+#!/bin/bash
+# codex-ask: Codex CLI wrapper with topic-based session management
+#
+# Usage:
+#   codex-ask "프롬프트"                       - 최근 세션 resume (현재 디렉토리 기준)
+#   codex-ask --topic "코드리뷰" "프롬프트"    - 주제별 세션 찾아서 resume
+#   codex-ask --new "프롬프트"                 - 새 세션 시작
+#   codex-ask --session <id> "프롬프트"        - 특정 세션 resume
+#   codex-ask --list                           - 세션 목록 (현재 디렉토리 기준)
+#   codex-ask --all --list                     - 전체 세션 목록
+#   echo "code" | codex-ask "리뷰해줘"         - stdin pipe 지원
+
+set -uo pipefail
+
+_AI_TELEM_START=$(date +%s%3N)
+_ai_telem_finalize() {
+    local ec=$?
+    local dur=$(( $(date +%s%3N) - _AI_TELEM_START ))
+    local mode="resume"
+    [ "${FORCE_NEW:-false}" = true ] && mode="new"
+    [ -n "${SESSION_ID:-}" ] && mode="session"
+    [ -n "${TOPIC:-}" ] && mode="topic"
+    [ "${LIST_ONLY:-false}" = true ] && mode="list"
+    # reasoning effort 는 ~/.codex/config.toml 이 정한다 — 여기서 종류를 나누지 않는다.
+    local kind=""
+    ai-telemetry-log codex "$ec" "$dur" "$mode" "$kind" 2>/dev/null || true
+}
+trap _ai_telem_finalize EXIT
+
+SESSIONS_DIR="$HOME/.codex/sessions"
+
+# codex 실행파일을 PATH 에만 의존해 찾지 않는다. codex 는 nvm 아래에 설치돼 있어서
+# (~/.nvm/versions/node/<ver>/bin/codex) 그 디렉토리가 PATH 에 없는 세션에서는
+# "timeout: failed to run command 'codex': No such file or directory" 로 3~4초 만에
+# 죽는다. 2026-08-18 조사에서 session-p 세션의 ai-debate 호출이 전부 이걸로 실패하고
+# 있었다 — 같은 날 dotfiles 세션은 전부 성공했다. 세션마다 PATH 가 달라서 생기는
+# 침묵 실패라 호출자를 고칠 게 아니라 여기서 절대경로로 못박는다.
+# 버전을 하드코딩하면 node 를 올릴 때 다시 깨지므로 최신 것을 고른다.
+# 설치형태는 호스트마다 다르다 — 홈은 nvm 아래 npm 전역, 옆 기계는 standalone
+# (~/.local/bin/codex → ~/.codex/packages/...). 대화형 셸에서는 둘 다 PATH 에 있지만
+# ssh 비대화 셸에서는 ~/.local/bin 이 빠져서 옆 기계만 조용히 127 로 죽었다
+# (2026-08-18 home-infra-watch 심박 로그가 remote=ssh실패(rc=127) 로 처음 드러냄).
+CODEX_BIN="$(command -v codex 2>/dev/null || true)"
+if [ -z "$CODEX_BIN" ] && [ -x "$HOME/.local/bin/codex" ]; then
+    CODEX_BIN="$HOME/.local/bin/codex"
+fi
+if [ -z "$CODEX_BIN" ]; then
+    CODEX_BIN=$(ls -1dt "$HOME"/.nvm/versions/node/*/bin/codex 2>/dev/null | head -1 || true)
+fi
+if [ -z "$CODEX_BIN" ]; then
+    echo "[codex-ask] codex 실행파일을 찾을 수 없다. PATH 에도 없고 ~/.local/bin/codex ~/.nvm/versions/node/*/bin/codex 에도 없다." >&2
+    exit 127
+fi
+# codex 는 `#!/usr/bin/env node` 스크립트라 경로만 찾아선 부족하다 — 그 옆의 node 를 같이
+# 써야 한다. 시스템 node(/usr/bin/node)는 버전이 낮아 부트스트랩에서 죽는다(실측).
+PATH="$(dirname "$CODEX_BIN"):$PATH"
+export PATH
+
+FORCE_NEW=false
+TOPIC=""
+SESSION_ID=""
+LIST_ONLY=false
+SHOW_ALL=false
+CD_DIR=""
+CUR_DIR="$(pwd)"
+
+# Parse flags
+while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+        --new)
+            FORCE_NEW=true
+            shift
+            ;;
+        --topic)
+            TOPIC="$2"
+            shift 2
+            ;;
+        --session)
+            SESSION_ID="$2"
+            shift 2
+            ;;
+        --list)
+            LIST_ONLY=true
+            shift
+            ;;
+        --all)
+            SHOW_ALL=true
+            shift
+            ;;
+        --cd)
+            # 이 호출을 어느 디렉토리에서 도는 것으로 취급할지 고정한다. 읽기 경계가
+            # 아니다 — codex 는 같은 uid 로 돌아 절대경로로 홈을 그대로 읽는다. 상대경로
+            # 탐색이 사본 밖으로 새는 것만 막는 최소조치다(2026-08-18 run-20260818T062913Z).
+            CD_DIR="$2"
+            case "$CD_DIR" in
+                /*) ;;
+                *) echo "[codex-ask] --cd 는 절대경로여야 한다: $CD_DIR" >&2; exit 2;;
+            esac
+            [ -d "$CD_DIR" ] || { echo "[codex-ask] --cd 디렉토리가 없다: $CD_DIR" >&2; exit 2; }
+            CUR_DIR="$CD_DIR"
+            shift 2
+            ;;
+        --which)
+            # 어떤 codex 를 쓰는지 한 줄로 알려준다. 2026-08-18 사고(세션마다 PATH 가 달라
+            # codex 를 못 찾음)를 다시 진단할 때 필요한 유일한 사실이다. 해석은 부르는 쪽이
+            # 하고 여기서는 해석 로직을 복제하지 않는다 — 결정 지점이 한 곳에 남는다.
+            printf 'bin=%s real=%s ver=%s\n' \
+                "$CODEX_BIN" \
+                "$(readlink -f "$CODEX_BIN" 2>/dev/null || echo '?')" \
+                "$(timeout 15 "$CODEX_BIN" --version 2>&1 | head -1 | tr -d '\n' || echo '?')"
+            exit 0
+            ;;
+        *)
+            echo "Unknown flag: $1" >&2
+            shift
+            ;;
+    esac
+done
+
+# Helper: 세션 첫 줄(session_meta)에서 cwd 와 thread_source 를 탭으로 뽑는다.
+# 한 파일에 python3 를 두 번 띄우지 않으려고 한 번에 둘 다 반환한다.
+# 첫 줄은 매우 길 수 있어 head -c 로 자르면 JSON 이 깨진다 — 반드시 한 줄 통째로 읽는다.
+get_session_meta() {
+    grep -m1 'session_meta\|"cwd"' "$1" 2>/dev/null | python3 -c "
+import sys,json
+try:
+    d=json.loads(sys.stdin.readline())
+    p=d.get('payload',d)
+    ts=p.get('thread_source')
+    print((p.get('cwd') or '')+'\t'+(ts if isinstance(ts,str) else ''))
+except: print('\t')
+" 2>/dev/null
+}
+
+# Helper: filter sessions by cwd (returns matching file paths)
+filter_sessions() {
+    while read -r f; do
+            IFS=$'\t' read -r scwd stsrc <<<"$(get_session_meta "$f")"
+            # 정확히 같은 cwd만 매치. prefix/빈 cwd 매치는 부모 세션이 하위 경로에 leak되어 오염 유발 → 제거
+            # --all(SHOW_ALL)은 cwd 제한만 푼다. 자식 스레드 배제는 안 푼다 — 예전에는
+            # --all 이면 필터 전체를 건너뛰어서 `codex-ask --all "..."` 이 subagent 스레드를
+            # resume 후보로 집을 수 있었다(2026-08-18 ai-debate run-20260818T040522Z 지적).
+            # --all 의 뜻은 "다른 디렉토리 것도 보여달라"지 "못 쓰는 것도 달라"가 아니다.
+            #
+            # thread_source 는 화이트리스트다 — user 만 통과시키고 subagent·미지값·필드부재·
+            # 파싱실패는 전부 배제한다. codex 0.147 부터 멀티에이전트 자식 스레드가 같은
+            # 디렉토리에 rollout-*.jsonl 로 섞이는데, 그걸 resume 하면 turn/start 에서
+            # JSON-RPC -32600 으로 즉사한다(2026-08-18). 실측: 세션 4333개 중 subagent 42개는
+            # 전부 이 필드를 갖고 있고, 필드가 없는 2851개는 전부 옛 codex 의 user 세션이라
+            # 배제해도 최근 50개 창에는 영향이 없다. 필드 이름이 미래에 바뀌면 후보가 0개가
+            # 되는데, 그건 아래에서 새 세션으로 떨어지므로 안전한 쪽으로 고장난다.
+            if [ "$stsrc" = "user" ] && { [ "$SHOW_ALL" = true ] || [ "$scwd" = "$CUR_DIR" ]; }; then
+                echo "$f"
+            fi
+    done
+}
+
+# --list: scan session files and show summary
+if [ "$LIST_ONLY" = true ]; then
+    if [ ! -d "$SESSIONS_DIR" ]; then
+        echo "No sessions found."
+        exit 0
+    fi
+    if [ "$SHOW_ALL" = true ]; then
+        echo "  [전체 세션]"
+    else
+        echo "  [$(basename "$CUR_DIR") 세션] (--all 로 전체 보기)"
+    fi
+    echo ""
+    find "$SESSIONS_DIR" -name '*.jsonl' -type f | sort -r | head -50 | filter_sessions | head -20 | while read -r f; do
+        sid=$(basename "$f" .jsonl | grep -oP '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+        date_part=$(basename "$f" .jsonl | grep -oP '\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}' | tr 'T' ' ' | tr '-' ':' | sed 's/\(.....\):\(..\):\(..\)/\1-\2-\3/')
+        scwd=$(get_session_meta "$f" | cut -f1)
+        summary=$(grep '"role":"user"' "$f" 2>/dev/null | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        d = json.loads(line.strip())
+        obj = d.get('payload', d)
+        for c in obj.get('content', []):
+            if c.get('type') == 'input_text':
+                t = c['text'].strip()
+                if t.startswith('<') or t.startswith('#') or 'permissions' in t[:50].lower():
+                    continue
+                t = t[:60].replace('\n', ' ')
+                print(t)
+                raise StopIteration
+    except StopIteration: break
+    except: pass
+" 2>/dev/null)
+        [ -z "$summary" ] && summary="(no summary)"
+        if [ "$SHOW_ALL" = true ] && [ -n "$scwd" ]; then
+            echo "  [$sid] $date_part | $(basename "$scwd")/ | $summary"
+        else
+            echo "  [$sid] $date_part | $summary"
+        fi
+    done
+    exit 0
+fi
+
+PROMPT="${1:-}"
+if [ -z "$PROMPT" ]; then
+    echo "Usage: codex-ask [--new|--topic TOPIC|--session ID|--all] \"프롬프트\"" >&2
+    exit 1
+fi
+
+# Read stdin if piped
+STDIN_DATA=""
+if [ ! -t 0 ]; then
+    STDIN_DATA=$(cat)
+fi
+
+# Prepend stdin to prompt if available
+if [ -n "$STDIN_DATA" ]; then
+    PROMPT="$STDIN_DATA
+
+---
+$PROMPT"
+fi
+
+# Run codex exec: output full response, fallback to awk extraction if needed
+run_codex() {
+    # reasoning effort 는 ~/.codex/config.toml 이 정한다(현재 양 호스트 xhigh). 예전에는 --deep 이
+    # 여기서 xhigh 를 강제했는데, config 기본이 그보다 높아지자 --deep 이 오히려 낮추는
+    # 플래그가 됐다. 한 값을 두 곳에서 정하면 어느 쪽이 이기는지 코드를 봐야 알게 된다.
+    # 프롬프트는 argv 가 아니라 stdin 으로 넘긴다. 리눅스는 인자 "하나"의 길이를
+    # MAX_ARG_STRLEN(128KB)로 제한해서, 큰 컨텍스트를 파이프로 받아 프롬프트에 붙이면
+    # exec 자체가 E2BIG 로 죽는다 — 2026-08-09 주간 리뷰에서 실제로 났다
+    # ("/usr/bin/timeout: Argument list too long"). codex exec 는 프롬프트 자리에 `-` 를
+    # 주면 stdin 에서 읽는다(resume 도 동일). 프롬프트는 항상 마지막 인자다.
+    local args=("$@")
+    local n=${#args[@]}
+    local prompt="${args[n-1]}"
+    unset "args[n-1]"
+    # 추론 강도는 config.toml 이 단일 출처다. 호출자가 이 호출에 한해 다르게 쓰고 싶으면
+    # CODEX_ASK_EFFORT 로 넘긴다(안 넘기면 config.toml 그대로). 값은 minimal·low·medium·
+    # high·xhigh·max·ultra 중 하나다. ai-debate 는 라운드도 arbiter 도 high 를 넘긴다 —
+    # 2026-08-18 실측에서 같은 브리프에 high 134초·xhigh 168초·ultra 734초인데 결론이
+    # 같았고, 라운드 벽시계는 어차피 제일 느린 콜(claude 165~263초)이 정하기 때문이다.
+    local effort_args=()
+    [ -n "${CODEX_ASK_EFFORT:-}" ] && effort_args=(-c "model_reasoning_effort=$CODEX_ASK_EFFORT")
+    local raw
+    # 기본 600초. 호출자가 더 오래 기다릴 수 있으면 CODEX_ASK_TIMEOUT 로 늘린다 —
+    # effort=ultra 에서 큰 브리프는 600초를 넘긴다(2026-08-18 실측 734초). 여기가 호출자보다
+    # 늦게 끊으면 호출자가 먼저 죽여서 여기 raw 출력이 통째로 사라진다.
+    local cd_args=()
+    [ -n "$CD_DIR" ] && cd_args=(-C "$CD_DIR")
+    raw=$(printf '%s' "$prompt" | timeout --kill-after=10s "${CODEX_ASK_TIMEOUT:-600}" "$CODEX_BIN" exec --skip-git-repo-check \
+            ${cd_args[@]+"${cd_args[@]}"} \
+            ${effort_args[@]+"${effort_args[@]}"} ${args[@]+"${args[@]}"} - 2>&1)
+    local exit_code=$?
+
+    # Try awk extraction first (between "codex" and "tokens used")
+    local extracted
+    extracted=$(echo "$raw" | awk '
+        /^codex$/ { capture=1; next }
+        /^tokens used$/ { capture=0; next }
+        capture { print }
+    ')
+
+    if [ -n "$extracted" ]; then
+        echo "$extracted"
+    elif [ -n "$raw" ]; then
+        # awk extraction failed, output raw (CLI format may have changed)
+        echo "$raw"
+    else
+        echo "[codex-ask] 빈 응답 (exit code: $exit_code)" >&2
+    fi
+    return $exit_code
+}
+
+# Determine session handling
+run_codex_filtered() {
+    if [ "${AI_OUT_RAW:-}" = "1" ]; then
+        run_codex "$@"
+    else
+        run_codex "$@" | ai-out-filter codex
+    fi
+}
+
+# 자동으로 고른 세션을 resume 하다가 죽었을 때만 새 세션으로 한 번 되돌린다.
+# 필터를 통과한 user 스레드라도 파일 꼬리 파손·CLI 버전차 등으로 -32600 이 날 수 있는데,
+# 그때 호출자에게 빈 답을 주는 것보다 새 세션이 낫다. 다만 조용히 넘어가지 않는다 —
+# 폴백했다는 사실을 stderr 에 남긴다(침묵 폴백은 원인을 영구히 숨긴다).
+# 사람이 --session 으로 지목한 세션에는 적용하지 않는다. 그건 "이 맥락에서 물어라"는
+# 지시라서, 다른 맥락의 새 세션 답으로 바꿔치기하면 지시를 어기는 것이다.
+run_resume_or_new() {
+    local id="$1" prompt="$2" out rc
+    out=$(run_codex_filtered resume "$id" "$prompt")
+    rc=$?
+    if [ $rc -ne 0 ] \
+       && printf '%s' "$out" | grep -q 'turn/start' \
+       && printf '%s' "$out" | grep -q -- '-32600'; then
+        echo "[codex-ask] resume $id 이 turn/start -32600 으로 거부됨 — 새 세션으로 1회 재시도" >&2
+        run_codex_filtered "$prompt"
+        return $?
+    fi
+    printf '%s\n' "$out"
+    return $rc
+}
+
+if [ "$FORCE_NEW" = true ]; then
+    run_codex_filtered "$PROMPT"
+elif [ -n "$SESSION_ID" ]; then
+    run_codex_filtered resume "$SESSION_ID" "$PROMPT"
+elif [ -n "$TOPIC" ]; then
+    MATCHED_ID=""
+    if [ -d "$SESSIONS_DIR" ]; then
+        MATCHED_ID=$(find "$SESSIONS_DIR" -name '*.jsonl' -type f | sort -r | head -50 | filter_sessions | head -30 | while read -r f; do
+            if grep -q '"role":"user"' "$f" 2>/dev/null && grep '"role":"user"' "$f" 2>/dev/null | grep -qi "$TOPIC"; then
+                basename "$f" .jsonl | grep -oP '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+                break
+            fi
+        done)
+    fi
+
+    if [ -n "$MATCHED_ID" ]; then
+        run_resume_or_new "$MATCHED_ID" "$PROMPT"
+    else
+        run_codex_filtered "$PROMPT"
+    fi
+else
+    # Default: resume latest session matching current cwd
+    LATEST_ID=""
+    if [ -d "$SESSIONS_DIR" ]; then
+        LATEST_ID=$(find "$SESSIONS_DIR" -name '*.jsonl' -type f | sort -r | head -50 | filter_sessions | head -1 | while read -r f; do
+            basename "$f" .jsonl | grep -oP '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+        done)
+    fi
+
+    if [ -n "$LATEST_ID" ]; then
+        run_resume_or_new "$LATEST_ID" "$PROMPT"
+    else
+        run_codex_filtered "$PROMPT"
+    fi
+fi

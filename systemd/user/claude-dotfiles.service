@@ -1,0 +1,25 @@
+[Unit]
+Description=Claude Code session for dotfiles (telegram remote-control)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/dotfiles/.claude/telegram/.env
+
+[Service]
+Type=simple
+WorkingDirectory=%h/dotfiles
+Environment="CLAUDE_SESSION_NAME=dotfiles"
+Environment="PATH=%h/.bun/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="TELEGRAM_STATE_DIR=%h/dotfiles/.claude/telegram"
+Environment="TERM=xterm-256color"
+ExecStart=%h/.local/bin/claude-service-exec
+ExecStartPost=%h/.local/bin/claude-service-notify start claude-dotfiles
+ExecStopPost=%h/.local/bin/claude-service-notify stop claude-dotfiles
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/.claude/logs/claude-dotfiles.log
+StandardError=append:%h/.claude/logs/claude-dotfiles.log
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

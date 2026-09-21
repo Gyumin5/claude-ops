@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# home-claude-health: 홈의 claude.ai 로그인이 살아있는지 1시간마다 확인하고,
+# 죽었으면 옆 기계 세션으로 알린다(홈이 못 알리는 상황을 다른 머신이 대신 알리는 설계).
+#
+# 왜 이렇게 복잡한가 (2026-08-07 오탐):
+#   옛 구현은 probe 출력을 버리고 rc≠0 을 전부 "로그인 만료" 로 라벨했다. 17:56 회차에
+#   CLI 자기업데이트가 겹쳐 두 번 다 즉시 실패했고(유닛 총 19초 = probe+sleep12+probe),
+#   사람에게 "재로그인 필요" 가 갔다. 실제로는 로그인이 멀쩡했다. `~/.local/bin/claude` 는
+#   버전 디렉토리를 가리키는 심링크라 자기업데이트 중 교체 창이 존재한다 — 그 창에 걸린 것이다.
+#   신호가 재는 것(프로세스가 성공했나)과 문구가 주장하는 것(로그인이 만료됐나)이 달랐다.
+#
+# 설계 (ai-debate run-20260807T091150Z, 1라운드 합의):
+#   - rc=0 이면 출력을 분류하지 않는다. 성공 probe 도 stderr 로 경고를 여러 줄 뱉기 때문이다.
+#   - 실패하면 같은 회차에서 백오프 후 한 번 더 본다. 분 단위 교체 창은 이걸로 넘어간다.
+#   - 두 번 다 인증 확정(좁은 allowlist)일 때만 "로그인 만료" 로 즉시 알린다. 진짜 만료는
+#     전 세션이 멈추므로 1시간 지연이 비싸다.
+#   - 그 외 실패는 연속 2회차(약 1시간)일 때만 "미분류 실패" 로 알린다. 문구는 rc 와 출력
+#     첫 줄을 그대로 싣는다 — 모르는 걸 아는 척하지 않는다.
+#   - 문구가 바뀌어 인증 실패가 미분류로 떨어지면 최대 1시간 늦게 알려질 뿐 조용해지지는
+#     않는다. 열화 방향을 그쪽으로 잡았다.
+#   - 복구 알림은 실제로 경보를 보낸 뒤에만 보낸다.
+
+set -uo pipefail
+
+# 이 스크립트는 home 전용이다. 다른 머신에서 돌면 그 머신을 재고서 '[home health]' 라벨로
+# 알린다 — 자기 상태를 남의 이름으로 보고하게 된다. 유닛 배포·심링크에도 머신 가드가
+# 있지만(install.sh), 스크립트 자신도 스스로를 막는다. (2026-08-07 옆 기계 지적: 공용 bin
+# 루프에 넣었더니 유닛 가드를 안 타고 옆 기계에 심겼다.)
+MID_FILE="$HOME/.config/claude-machine-id"
+MID=""
+[ -f "$MID_FILE" ] && MID="$(tr -d '[:space:]' < "$MID_FILE")"
+if [ -n "$MID" ] && [ "$MID" != "home" ]; then
+    echo "home-claude-health: machine=$MID — home 전용이라 실행하지 않는다." >&2
+    exit 0
+fi
+# 마커가 없거나 비었으면 fail-open 이다 — 그대로 돈다. home 에서 마커가 날아갔을 때
+# 감시가 조용히 죽는 쪽이 더 나쁘기 때문이다. 대신 라벨을 호스트명으로 바꿔서, 모르는
+# 머신에서 돌았을 때 "[home health]" 라고 남의 이름으로 보고하지는 않게 한다.
+# 침묵과 오보 중 하나를 고르는 대신 문구를 정직하게 만드는 쪽이다. (2026-08-07 옆 기계 질의.)
+LABEL="${MID:-$(hostname -s 2>/dev/null || echo unknown)}"
+
+STATE_DIR="${HOME_CLAUDE_HEALTH_STATE_DIR:-$HOME/.local/state/home-claude-health}"
+STATE="$STATE_DIR/state"
+LOG="$STATE_DIR/probe.log"
+LEGACY_STATE="$HOME/.cache/home-claude-health.state"
+BACKOFF="${HOME_CLAUDE_HEALTH_BACKOFF:-60}"
+CLAUDE_BIN="${HOME_CLAUDE_HEALTH_CLAUDE:-$HOME/.local/bin/claude}"
+NOTIFY_BIN="${HOME_CLAUDE_HEALTH_NOTIFY:-$HOME/.local/bin/claude-userbot-send}"
+# 수신처는 peer 프로젝트 세션이 아니라 peer-dotfiles 다(2026-08-21 사용자 지시).
+# peer 으로 보내면 그 세션은 자기 프로젝트 작업 중이라 이 경보를 처리할 맥락이 없고,
+# 사람이 손으로 peer-dotfiles 에 옮겨 붙이고 있었다. 인프라 경보는 인프라 세션으로 간다.
+NOTIFY_SESSION="${HOME_CLAUDE_HEALTH_SESSION:-peer-dotfiles}"
+EMPTY="${HOME_CLAUDE_HEALTH_EMPTY:-$STATE_DIR/empty-mcp.json}"
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+echo '{"mcpServers":{}}' > "$EMPTY" 2>/dev/null
+
+# 알림 경로는 telethon userbot 이라 claude.ai 인증과 독립이다 — 만료됐을 때도 나간다.
+notify() { "$NOTIFY_BIN" --session "$NOTIFY_SESSION" "$1" >/dev/null 2>&1; }
+
+# 출력에서 사람에게 보여줄 한 줄. ANSI 제거, 토큰성 문자열 마스킹, 길이 제한.
+first_line() {
+    printf '%s' "$1" \
+        | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+        | grep -v '^[[:space:]]*$' | head -1 \
+        | sed -E -e 's/(sk-[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1…/g' \
+                 -e 's/[A-Za-z0-9_-]{40,}/…/g' \
+        | cut -c1-200
+}
+
+# 인증 확정은 좁게만 잡는다. 401·oauth·authentication 단독 매칭은 금지 — 업데이트·네트워크
+# 오류 문구에 섞여 들어와 지금 고치는 오탐을 그대로 재현한다.
+classify() {
+    local rc="$1" low
+    low=$(printf '%s' "$2" | tr 'A-Z' 'a-z')
+    case "$low" in
+        *"please run /login"*|*"run /login"*|*"not logged in"*|*"invalid api key"*|\
+        *"oauth token expired"*|*"oauth token has expired"*|*"oauth token revoked"*|\
+        *"credentials expired"*|*"session expired"*|*"login expired"*)
+            echo auth; return;;
+    esac
+    [ "$rc" = "124" ] && { echo timeout; return; }
+    case "$low" in
+        *"command not found"*|*"no such file"*|*"permission denied"*|*"cannot execute"*|\
+        *"text file busy"*|*"exec format error"*) echo exec; return;;
+    esac
+    echo other
+}
+
+PROBE_RC=0; PROBE_OUT=""
+probe_once() {
+    PROBE_OUT=$(timeout 90 "$CLAUDE_BIN" --strict-mcp-config --mcp-config "$EMPTY" -p "ping" 2>&1)
+    PROBE_RC=$?
+}
+
+# 상태 읽기. 옛 경로(~/.cache, 내용 "down")도 받아준다 — 이관 중 경보가 중복되지 않게.
+prev_count=0; prev_alerted=0
+if [ -f "$STATE" ]; then
+    prev_count=$(sed -n 's/^count=//p' "$STATE" | head -1)
+    prev_alerted=$(sed -n 's/^alerted=//p' "$STATE" | head -1)
+elif [ -f "$LEGACY_STATE" ] && grep -q down "$LEGACY_STATE" 2>/dev/null; then
+    prev_count=1; prev_alerted=1
+fi
+case "$prev_count" in ''|*[!0-9]*) prev_count=0;; esac
+case "$prev_alerted" in ''|*[!0-9]*) prev_alerted=0;; esac
+
+clear_state() { rm -f "$STATE" "$LEGACY_STATE" 2>/dev/null; }
+save_state() {  # $1=class $2=count $3=alerted
+    { echo "class=$1"; echo "count=$2"; echo "alerted=$3"; echo "updated=$(date '+%F %T')"; } > "$STATE"
+}
+
+probe_once
+if [ "$PROBE_RC" -eq 0 ]; then
+    [ "$prev_alerted" = "1" ] && notify "[$LABEL health] claude.ai probe 정상 복귀. 직전 경보는 해소됐다."
+    clear_state
+    exit 0
+fi
+
+# 1차 실패. 같은 회차에서 한 번 더 본다 — 교체 창·일시 오류는 여기서 걸러진다.
+class1=$(classify "$PROBE_RC" "$PROBE_OUT")
+sleep "$BACKOFF"
+probe_once
+if [ "$PROBE_RC" -eq 0 ]; then
+    [ "$prev_alerted" = "1" ] && notify "[$LABEL health] claude.ai probe 정상 복귀(회차 내 재확인). 직전 경보는 해소됐다."
+    clear_state
+    exit 0
+fi
+
+class2=$(classify "$PROBE_RC" "$PROBE_OUT")
+line=$(first_line "$PROBE_OUT")
+count=$((prev_count + 1))
+{ echo "$(date '+%F %T') rc=$PROBE_RC class=$class1/$class2 count=$count line=$line"; } >> "$LOG" 2>/dev/null
+tail -n 500 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG" 2>/dev/null
+
+if [ "$class1" = "auth" ] && [ "$class2" = "auth" ]; then
+    # 인증 확정 — 즉시 알린다.
+    if [ "$prev_alerted" != "1" ]; then
+        notify "[$LABEL health] claude.ai 로그인 만료 확인(rc=$PROBE_RC, 같은 회차 2회 연속 인증 실패). $LABEL 에서 재로그인 필요. probe: $line"
+        save_state auth "$count" 1
+    else
+        save_state auth "$count" 1
+    fi
+    exit 0
+fi
+
+# 미분류 계열 — 연속 2회차(약 1시간)일 때만 알린다. 1회차는 조용히 세기만 한다.
+if [ "$count" -ge 2 ] && [ "$prev_alerted" != "1" ]; then
+    notify "[$LABEL health] claude.ai probe 가 연속 2회차 실패했다(rc=$PROBE_RC, 분류=$class2). 로그인 만료인지는 확인 안 됐다 — 인증 신호가 출력에 없다. probe: $line"
+    save_state "$class2" "$count" 1
+else
+    save_state "$class2" "$count" "$prev_alerted"
+fi
+exit 0

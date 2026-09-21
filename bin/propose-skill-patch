@@ -1,0 +1,54 @@
+#!/bin/bash
+# propose-skill-patch: scaffold a patch proposal file for a skill.
+# Auto-applied은 절대 안 함. 사용자 승인 후 수동 적용.
+#
+# Usage: propose-skill-patch <skill-name> [reason]
+
+set -uo pipefail
+
+skill="${1:?usage: propose-skill-patch <skill-name> [reason]}"
+reason="${2:-(reason TBD)}"
+
+dir=~/.claude/skill-patches
+mkdir -p "$dir"
+date=$(date +%Y-%m-%d)
+file="$dir/${date}-${skill}.md"
+
+if [ -e "$file" ]; then
+    echo "exists: $file" >&2
+    exit 1
+fi
+
+skill_path=""
+for cand in ~/.claude/skills/$skill/SKILL.md ~/dotfiles/claude/skills/$skill/SKILL.md; do
+    [ -e "$cand" ] && { skill_path="$cand"; break; }
+done
+
+cat > "$file" <<EOF
+# skill-patch proposal: $skill
+date: $date
+status: proposed (사람 승인 전 적용 금지)
+
+## 관찰 사실
+- $reason
+
+## 가설 (왜 잘못 동작했는가)
+- TBD
+
+## 패치 제안 (skill 본문 또는 trigger 변경안)
+- 위치: ${skill_path:-$skill SKILL.md (경로 미발견)}
+- 변경:
+  \`\`\`diff
+  TBD
+  \`\`\`
+
+## 검증 계획
+- 비슷한 입력 N개로 재현 → 패치 적용 → 결과 비교
+
+## 결정
+- [ ] 적용
+- [ ] 폐기
+- [ ] 보류
+EOF
+
+echo "$file"

@@ -1,0 +1,83 @@
+#!/bin/bash
+# claude-tg-status: 읽기 전용. 모든 claude 세션(systemd cs + cl 수동 둘 다)을 프로세스 트리로 찾아
+# 텔레그램 MCP(bun) 연결 유무와 중복(409 위험)을 한눈에 보여준다.
+# systemd 유닛 기준 healthcheck/bun-ensure 의 사각(cl 세션)을 메우는 진단용.
+# 아무것도 죽이거나 재시작하지 않음.
+
+set -uo pipefail
+
+# claude 세션 = --channels plugin:telegram 를 가진 claude 프로세스
+mapfile -t pids < <(pgrep -x claude 2>/dev/null)
+
+printf '%-7s %-9s %-26s %-22s %s\n' PID OWNER 'PROJECT(cwd)' TELEGRAM-BUN NOTE
+printf '%s\n' "--------------------------------------------------------------------------------------"
+
+declare -A cwd_count
+rows=()
+
+for p in "${pids[@]}"; do
+    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+    case "$cmd" in
+        *"--channels plugin:telegram"*) ;;
+        *) continue ;;
+    esac
+
+    cwd=$(readlink "/proc/$p/cwd" 2>/dev/null)
+    [ -z "$cwd" ] && cwd="?"
+    proj=$(basename "$cwd" 2>/dev/null)
+
+    # owner: cgroup 에 claude-<name>.service 있으면 systemd, 아니면 cl/manual
+    cg=$(cat "/proc/$p/cgroup" 2>/dev/null)
+    if [[ "$cg" == *"claude-"*".service"* ]]; then
+        unit=$(printf '%s' "$cg" | grep -oE 'claude-[a-zA-Z0-9_-]+\.service' | head -1)
+        owner="systemd"
+    else
+        unit=""
+        owner="cl"
+    fi
+
+    # bun(telegram MCP) 자식/손자 탐색: claude 의 직계 자식 중 bun
+    bun=""
+    for c in $(pgrep -P "$p" 2>/dev/null); do
+        ccmd=$(tr '\0' ' ' < "/proc/$c/cmdline" 2>/dev/null)
+        case "$ccmd" in
+            *bun*telegram*|*"bun run"*|*"bun server.ts"*) bun="$c"; break ;;
+        esac
+        # 한 단계 더 (script → claude → bun 인 경우 대비)
+        for g in $(pgrep -P "$c" 2>/dev/null); do
+            gcmd=$(tr '\0' ' ' < "/proc/$g/cmdline" 2>/dev/null)
+            case "$gcmd" in
+                *bun*telegram*|*"bun run"*|*"bun server.ts"*) bun="$g"; break 2 ;;
+            esac
+        done
+    done
+
+    if [ -n "$bun" ]; then tg="OK (bun $bun)"; else tg="DOWN (no bun)"; fi
+
+    cwd_count["$cwd"]=$(( ${cwd_count["$cwd"]:-0} + 1 ))
+    rows+=("$p|$owner|$proj|$tg|$cwd")
+done
+
+if [ ${#rows[@]} -eq 0 ]; then
+    echo "(텔레그램 채널 claude 세션 없음)"
+    exit 0
+fi
+
+for r in "${rows[@]}"; do
+    IFS='|' read -r p owner proj tg cwd <<< "$r"
+    note=""
+    if [ "${cwd_count["$cwd"]:-1}" -gt 1 ]; then
+        note="!! 중복 $cwd → 같은 봇 동시폴링 409 위험"
+    fi
+    printf '%-7s %-9s %-26s %-22s %s\n' "$p" "$owner" "$proj" "$tg" "$note"
+done
+
+# 중복 요약
+dup=0
+for k in "${!cwd_count[@]}"; do [ "${cwd_count[$k]}" -gt 1 ] && dup=1; done
+echo
+if [ "$dup" -eq 1 ]; then
+    echo "경고: 같은 프로젝트가 2개 이상 떠 있음 = Telegram 409 충돌 위험. 한 곳만 남겨라(systemd 또는 cl)."
+else
+    echo "중복 없음. 각 프로젝트 단일 인스턴스."
+fi

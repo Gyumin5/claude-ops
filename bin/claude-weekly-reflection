@@ -1,0 +1,91 @@
+#!/bin/bash
+# claude-weekly-reflection: 매주 일요일 11:00 KST.
+# 최근 7일 claude-daily-research 결과를 합쳐 trend / 누적 추천 / 보류 패턴 요약.
+# 컨트롤봇 한 채팅으로 전송.
+
+set -uo pipefail
+
+export NVM_DIR="$HOME/.nvm"
+set +u
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+set -u
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+
+CONTROL_ENV="$HOME/.claude/control-bot/.env"
+CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+DATA_DIR="$HOME/.local/share/ai-briefing"
+LOG_FILE="$DATA_DIR/weekly-reflection.log"
+TODAY="$(date +%Y-%m-%d)"
+OUT_FILE="$DATA_DIR/weekly-reflection_${TODAY}.md"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
+log "start"
+
+# 최근 7일 브리핑 파일 수집
+COMBINED=""
+DATES=""
+for i in 6 5 4 3 2 1 0; do
+    d=$(date -d "$i days ago" +%Y-%m-%d 2>/dev/null)
+    f="$DATA_DIR/claude-research_${d}.md"
+    if [ -f "$f" ]; then
+        COMBINED+="## ${d}
+
+$(cat "$f")
+
+"
+        DATES+="${d} "
+    fi
+done
+
+if [ -z "$COMBINED" ]; then
+    log "ABORT: 7일치 브리핑 파일 없음"
+    exit 0
+fi
+
+PROMPT="아래는 최근 일주일치 Claude Code 개선 리서치 일별 브리핑이다. 다음 4가지를 한국어 평문 한 덩어리로 정리해.
+
+1. 이 주에 반복 등장한 주제 (3개 이상 출현 항목)
+2. 도입 추천된 항목 누적 목록 + 실제 적용 가능성 평가
+3. 계속 보류로 밀린 항목들의 공통 이유 패턴
+4. 다음 주 우선 검토 권고 1~2건
+
+규칙: 백틱/코드펜스 금지, **굵게** 금지, 맨앞 공백/들여쓰기 금지, 서론·메타멘트 금지, 한 덩어리 평문.
+
+---
+$COMBINED"
+
+OUTPUT=$(timeout 600 claude --bare -p "$PROMPT" 2>> "$LOG_FILE") || true
+log "claude exit. length=${#OUTPUT}"
+
+if [ ${#OUTPUT} -lt 100 ] \
+    || echo "$OUTPUT" | grep -qE "대기 루프|hit your limit|limit · resets|usage limit"; then
+    log "ABORT: 한도 또는 무의미 응답 (length=${#OUTPUT})."
+    exit 1
+fi
+
+echo "$OUTPUT" > "$OUT_FILE"
+
+# 컨트롤봇 토큰 로드
+if [ ! -f "$CONTROL_ENV" ]; then
+    log "ERROR: 컨트롤봇 .env 없음"
+    exit 2
+fi
+. "$CONTROL_ENV"
+TOKEN="${CONTROL_BOT_TOKEN:-}"
+if [ -z "$TOKEN" ]; then
+    log "ERROR: CONTROL_BOT_TOKEN 비어있음"
+    exit 2
+fi
+
+MSG="Claude Code 주간 reflection (${TODAY}, 대상: ${DATES})
+
+${OUTPUT}"
+if [ ${#MSG} -gt 4000 ]; then
+    MSG="${MSG:0:3997}..."
+fi
+
+curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${CHAT_ID}" \
+    --data-urlencode "text=${MSG}" >> "$LOG_FILE" 2>&1
+
+log "sent (${#MSG} chars)"

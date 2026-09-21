@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# claude-account-switch: 재로그인으로 받은 fresh claude.ai 자격증명을 live 로 원자 교체하고
+# 이 PC 의 claude 세션 전체(동적 수집)를 재시작한다.
+#
+# 2026-06-24 단순화: 계정 스왑·캐시 스냅샷·활성계정 라벨·계정 식별/상태표시 전부 폐지.
+#   순수 "로그인 적용"만 남김 — 어떤 계정인지 따지지 않고, 방금 로그인한 creds 를 그대로 적용.
+#   (이전의 peer|home 스왑, --apply/--apply-home/--capture/--status 는 모두 제거.)
+#
+# 사용:
+#   claude-account-switch --apply-login <fresh-cred-path>
+set -uo pipefail
+
+CRED_LIVE="$HOME/.claude/.credentials.json"
+WORK_DIR="$HOME/.claude/account-creds"   # 락·백업 보관 (계정 스냅샷 아님)
+LOG="$HOME/.claude/logs/account-switch.log"
+
+mkdir -p "$WORK_DIR"; chmod 700 "$WORK_DIR" 2>/dev/null || true
+mkdir -p "$HOME/.claude/logs" 2>/dev/null || true
+
+die() { echo "[account-switch] $1" >&2; exit 1; }
+
+log() {
+    echo "[account-switch] $1"
+    printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$1" >> "$LOG" 2>/dev/null || true
+}
+
+valid_cred() {
+    python3 - "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    o = d.get("claudeAiOauth") or d
+    sys.exit(0 if o.get("accessToken") else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+# 고아 bun 폴러(getUpdates 409 락 보유) 즉시 회수 — 계정전환~zombie-cleaner 타이머 사이 창을 메움.
+# zombie-cleaner 는 active cgroup 아닌 reparent orphan 만 kill(안전). 새 세션 bun 은 active cgroup 이라 보호됨.
+reap_orphan_bun() {
+    # account-switch·zombie-cleaner 모두 dotfiles/bin 형제. ~/.local/bin 심링크 유무와 무관하게 동작.
+    local zc="$HOME/dotfiles/bin/claude-bun-zombie-cleaner"
+    [ -x "$zc" ] || zc="$HOME/.local/bin/claude-bun-zombie-cleaner"
+    [ -x "$zc" ] && "$zc" >/dev/null 2>&1 || true
+}
+
+# 유닛 재기동 후 telegram bun(MCP) 자식이 붙었는지 확인. 없으면 그 유닛만 1회 재시도.
+# 계정전환 직후 MCP race 로 bun 미기동 시, bun-ensure 타이머(GRACE 180s) 안 기다리고 즉시 복구.
+ensure_bun() {
+    local unit="$1" i
+    for i in $(seq 1 15); do
+        systemd-cgls --user-unit "$unit" --no-pager 2>/dev/null | grep -q bun && return 0
+        sleep 2
+    done
+    log "  bun 미기동 → $unit 1회 재시도"
+    systemctl --user restart "$unit" 2>/dev/null || true
+    for i in $(seq 1 15); do
+        systemd-cgls --user-unit "$unit" --no-pager 2>/dev/null | grep -q bun && { log "  bun 복구: $unit"; return 0; }
+        sleep 2
+    done
+    log "  WARN bun 여전히 미기동: $unit (bun-ensure 타이머가 후속 복구)"
+    return 1
+}
+
+# 이 PC 의 claude 세션 유닛 전체를 동적 수집해 재시작 (호출 세션은 마지막).
+# 판별: ExecStart 가 claude-service-exec 인 유닛만 — control-bot·헬퍼·타이머 제외.
+restart_sessions() {
+    local _u _self="" unit
+    local -a _sessions_all SESSIONS=()
+    mapfile -t _sessions_all < <(
+        systemctl --user list-unit-files 'claude-*.service' --state=enabled --no-legend 2>/dev/null \
+            | awk '{print $1}' \
+            | while read -r _u; do
+                systemctl --user cat "$_u" 2>/dev/null | grep -q 'ExecStart=.*claude-service-exec' && echo "$_u"
+              done
+    )
+    [ -n "${CLAUDE_SESSION_NAME:-}" ] && _self="claude-${CLAUDE_SESSION_NAME}.service"
+    for _u in "${_sessions_all[@]}"; do [ "$_u" != "$_self" ] && SESSIONS+=("$_u"); done
+    [ -n "$_self" ] && SESSIONS+=("$_self")
+    # 안전망: 동적 수집 실패 시 기존 기본값.
+    [ "${#SESSIONS[@]}" -eq 0 ] && SESSIONS=(claude-peer.service claude-dotfiles.service)
+    for unit in "${SESSIONS[@]}"; do
+        if systemctl --user list-unit-files "$unit" >/dev/null 2>&1; then
+            if systemctl --user restart "$unit" 2>/dev/null; then
+                log "  restarted $unit"
+                [ "$unit" != "$_self" ] && { reap_orphan_bun; ensure_bun "$unit"; }
+            else
+                log "  WARN restart 실패: $unit"
+            fi
+        fi
+    done
+    log "완료. 세션 재시작."
+}
+
+cmd="${1:-}"
+[ "$cmd" = "--apply-login" ] || die "사용: claude-account-switch --apply-login <fresh-cred-path>"
+
+SRC="${2:-}"
+[ -n "$SRC" ] || die "--apply-login <fresh-cred-path> 필요"
+[ -f "$SRC" ] || die "source 자격증명 없음 ($SRC)"
+valid_cred "$SRC" || die "source 자격증명이 유효한 토큰 형식 아님"
+# live 가 심볼릭 링크면 거부 (심링크 추종으로 엉뚱한 경로 덮어쓰기 방지)
+[ -L "$CRED_LIVE" ] && die "live 자격증명이 심볼릭 링크 — 수동 점검 필요 ($CRED_LIVE)"
+# 동시 적용 직렬화 (중복 /login·더블탭 경쟁 방지)
+exec 9>"$WORK_DIR/.apply.lock"
+flock -n 9 || die "다른 적용이 진행 중 — 잠시 후 재시도"
+# 기존 live 백업 (수동 롤백용)
+if [ -f "$CRED_LIVE" ]; then
+    cp "$CRED_LIVE" "$WORK_DIR/.last-live.json" 2>/dev/null || true
+    chmod 600 "$WORK_DIR/.last-live.json" 2>/dev/null || true
+fi
+# 원자적 교체: 같은 디렉토리에 temp write → chmod → atomic rename (부분쓰기/권한노출 방지)
+TMP="$CRED_LIVE.new.$$"
+cp "$SRC" "$TMP" || die "임시 자격증명 쓰기 실패"
+chmod 600 "$TMP"
+mv -f "$TMP" "$CRED_LIVE" || { rm -f "$TMP"; die "자격증명 원자 교체 실패 (live 무변경)"; }
+log "--apply-login: fresh 자격증명 적용. 세션 재시작 안 함(2026-07-08 사용자 결정)."
+exit 0

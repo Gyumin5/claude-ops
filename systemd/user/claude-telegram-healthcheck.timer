@@ -1,0 +1,10 @@
+[Unit]
+Description=Claude Telegram Healthcheck Timer (1분마다)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

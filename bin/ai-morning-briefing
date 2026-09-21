@@ -1,0 +1,798 @@
+#!/bin/bash
+# ai-morning-briefing: 매일 아침 AI 뉴스 수집 → 요약 → 텔레그램 전송
+#
+# 소스: HackerNews, Reddit (r/LocalLLaMA, r/ClaudeAI, r/MachineLearning),
+#       Anthropic News, OpenAI News, GitHub (MCP/Claude Code topics)
+# 요약: codex-ask
+# 전송: Telegram Bot API
+# 재노출: 쿨다운 7일 + 성장률 기반 조건부 재노출
+
+set -uo pipefail
+
+# === PATH 설정 (cron 환경 대응) ===
+export NVM_DIR="$HOME/.nvm"
+set +u  # nvm.sh는 unset 변수를 사용하므로 일시 해제
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+set -u
+# nvm PATH를 앞에 유지하면서 추가 경로 병합
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+
+# === 설정 ===
+TELEGRAM_ENV="$HOME/dotfiles/.claude/telegram/.env"
+CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+DATA_DIR="$HOME/.local/share/ai-briefing"
+TODAY=$(date +%Y-%m-%d)
+YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)
+RAW_FILE="$DATA_DIR/raw_${TODAY}.json"
+SUMMARY_FILE="$DATA_DIR/summary_${TODAY}.txt"
+LOG_FILE="$DATA_DIR/briefing.log"
+SQLITE_DB="$DATA_DIR/briefings.db"
+
+mkdir -p "$DATA_DIR"
+
+log() { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG_FILE"; }
+log "=== 브리핑 시작: $TODAY ==="
+
+# === 텔레그램 봇 토큰 로드 ===
+if [ -f "$TELEGRAM_ENV" ]; then
+    source "$TELEGRAM_ENV"
+fi
+
+BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${BOT_TOKEN:-}}"
+if [ -z "$BOT_TOKEN" ]; then
+    log "ERROR: 봇 토큰을 찾을 수 없음"
+    exit 1
+fi
+
+send_telegram() {
+    local text="$1"
+    if [ ${#text} -gt 4000 ]; then
+        text="${text:0:3997}..."
+    fi
+    # parse_mode 없이 전송 (LLM 출력에 Markdown 특수문자가 파싱 에러를 유발)
+    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text="$text" \
+        -d disable_web_page_preview="true" > /dev/null 2>&1
+}
+
+# === DB 초기화 (스키마 마이그레이션 포함) ===
+python3 - "$SQLITE_DB" <<'PYEOF'
+import sys, sqlite3
+
+db_path = sys.argv[1]
+conn = sqlite3.connect(db_path)
+
+conn.execute("""CREATE TABLE IF NOT EXISTS briefings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT UNIQUE,
+    raw_count INTEGER,
+    summary TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)""")
+
+conn.execute("""CREATE TABLE IF NOT EXISTS items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT,
+    title TEXT,
+    description TEXT,
+    action TEXT,
+    url TEXT,
+    priority TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)""")
+
+conn.execute("""CREATE TABLE IF NOT EXISTS item_appearances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_id TEXT NOT NULL,
+    briefing_date TEXT NOT NULL,
+    appearance_type TEXT NOT NULL,
+    title TEXT,
+    stars INTEGER,
+    score INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)""")
+
+conn.execute("""CREATE TABLE IF NOT EXISTS item_daily_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_id TEXT NOT NULL,
+    snapshot_date TEXT NOT NULL,
+    source TEXT,
+    title TEXT,
+    url TEXT,
+    stars INTEGER,
+    score INTEGER
+)""")
+
+# 인덱스
+conn.execute("CREATE INDEX IF NOT EXISTS idx_appearances_canonical ON item_appearances(canonical_id)")
+conn.execute("CREATE INDEX IF NOT EXISTS idx_appearances_date ON item_appearances(briefing_date)")
+conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_canonical ON item_daily_snapshots(canonical_id)")
+conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_unique ON item_daily_snapshots(canonical_id, snapshot_date, source)")
+
+conn.commit()
+conn.close()
+PYEOF
+
+# === 1단계: 수집 (JSON 형식) ===
+log "수집 시작"
+> "$RAW_FILE"
+
+# --- HackerNews ---
+collect_hn() {
+    log "HN 수집 중..."
+    python3 - "$RAW_FILE" <<'PYEOF'
+import json, urllib.request, sys
+
+raw_file = sys.argv[1]
+results = []
+
+keywords_re = "AI|LLM|GPT|Claude|Gemini|OpenAI|Anthropic|MCP|agent|model|transformer|diffusion|llama|mistral|deepseek|qwen|coding.agent|agentic"
+import re
+kw = re.compile(keywords_re, re.IGNORECASE)
+
+# top + best stories
+all_ids = set()
+for endpoint in ["topstories", "beststories"]:
+    try:
+        limit = 80 if endpoint == "topstories" else 50
+        data = json.loads(urllib.request.urlopen(f"https://hacker-news.firebaseio.com/v0/{endpoint}.json", timeout=15).read())
+        all_ids.update(data[:limit])
+    except: pass
+
+count = 0
+for sid in all_ids:
+    if count >= 15:
+        break
+    try:
+        item = json.loads(urllib.request.urlopen(f"https://hacker-news.firebaseio.com/v0/item/{sid}.json", timeout=5).read())
+        title = item.get("title", "")
+        url = item.get("url", "")
+        score = item.get("score", 0)
+        if kw.search(title) and score >= 30 and url:
+            results.append({
+                "source": "hn",
+                "title": title,
+                "url": url,
+                "score": score,
+                "stars": None,
+                "canonical_id": f"url:{url.rstrip('/')}"
+            })
+            count += 1
+    except: pass
+
+with open(raw_file, "a") as f:
+    for r in results:
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+print(f"HN: {count}건")
+PYEOF
+    log "$(tail -1 /dev/stdin 2>/dev/null || echo 'HN: 완료')"
+}
+
+# --- Reddit ---
+collect_reddit() {
+    log "Reddit 수집 중..."
+    python3 - "$RAW_FILE" <<'PYEOF'
+import json, urllib.request, sys, re
+
+raw_file = sys.argv[1]
+results = []
+keywords = re.compile(r"AI|LLM|GPT|Claude|Gemini|OpenAI|Anthropic|MCP|agent|model|release|launch|plugin|update", re.IGNORECASE)
+
+subs = ["ClaudeAI", "LocalLLaMA", "ChatGPT", "MachineLearning", "agentic"]
+seen_ids = set()
+
+for sub in subs:
+    for feed_type in ["hot.json?limit=15", "top.json?t=week&limit=10"]:
+        try:
+            req = urllib.request.Request(
+                f"https://www.reddit.com/r/{sub}/{feed_type}",
+                headers={"User-Agent": "ai-briefing/1.0"}
+            )
+            data = json.loads(urllib.request.urlopen(req, timeout=15).read())
+            for post in data.get("data", {}).get("children", []):
+                d = post.get("data", {})
+                pid = d.get("id", "")
+                if pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+
+                title = d.get("title", "")
+                url = d.get("url", "")
+                score = d.get("score", 0)
+                permalink = "https://reddit.com" + d.get("permalink", "")
+
+                if score < 50 or not keywords.search(title):
+                    continue
+
+                link = url if url and not url.startswith("https://www.reddit.com/r/") else permalink
+
+                # canonical_id: 외부 링크가 있으면 외부 링크 기준
+                if url and not url.startswith("https://www.reddit.com"):
+                    cid = f"url:{url.rstrip('/')}"
+                else:
+                    cid = f"reddit:{pid}"
+
+                results.append({
+                    "source": f"reddit:r/{sub}",
+                    "title": title,
+                    "url": link,
+                    "score": score,
+                    "stars": None,
+                    "canonical_id": cid
+                })
+        except: pass
+
+with open(raw_file, "a") as f:
+    for r in results:
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+PYEOF
+    log "Reddit: 수집 완료"
+}
+
+# --- GitHub 신규 (7일, stars>=3) ---
+collect_github_new() {
+    log "GitHub 신규 수집 중..."
+    python3 - "$RAW_FILE" <<'PYEOF'
+import json, urllib.request, sys
+from datetime import datetime, timedelta
+
+raw_file = sys.argv[1]
+results = []
+week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+queries = [
+    f"topic:mcp-server+created:>{week_ago}+stars:>=3",
+    f"topic:claude-code+created:>{week_ago}+stars:>=2",
+    f"claude+plugin+language:TypeScript+created:>{week_ago}+stars:>=3",
+    f"mcp+server+language:Python+created:>{week_ago}+stars:>=3",
+    f"claude-code+skill+created:>{week_ago}+stars:>=2",
+    f"claude+hook+created:>{week_ago}+stars:>=2",
+    f"anthropic+plugin+created:>{week_ago}+stars:>=3",
+    f"claude+agent+workflow+created:>{week_ago}+stars:>=3",
+]
+
+seen = set()
+for q in queries:
+    try:
+        url = f"https://api.github.com/search/repositories?q={q}&sort=stars&per_page=5"
+        data = json.loads(urllib.request.urlopen(url, timeout=15).read())
+        for repo in data.get("items", []):
+            name = repo.get("full_name", "")
+            if name in seen:
+                continue
+            seen.add(name)
+            desc = (repo.get("description", "") or "")[:100]
+            stars = repo.get("stargazers_count", 0)
+            html_url = repo.get("html_url", "")
+            results.append({
+                "source": "github_new",
+                "title": f"{name}: {desc}",
+                "url": html_url,
+                "score": None,
+                "stars": stars,
+                "canonical_id": f"github:{name.lower()}"
+            })
+    except: pass
+
+with open(raw_file, "a") as f:
+    for r in results:
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+PYEOF
+    log "GitHub 신규: 수집 완료"
+}
+
+# --- GitHub 트렌딩 (30일, stars>=20) ---
+collect_github_trending() {
+    log "GitHub 트렌딩 수집 중..."
+    python3 - "$RAW_FILE" <<'PYEOF'
+import json, urllib.request, sys
+from datetime import datetime, timedelta
+
+raw_file = sys.argv[1]
+results = []
+month_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+
+queries = [
+    f"claude+code+created:>{month_ago}+stars:>=20",
+    f"mcp+server+created:>{month_ago}+stars:>=20",
+    f"ai+agent+created:>{month_ago}+stars:>=50",
+    f"agentic+created:>{month_ago}+stars:>=30",
+    f"claude+plugin+created:>{month_ago}+stars:>=15",
+    f"coding+agent+created:>{month_ago}+stars:>=30",
+]
+
+seen = set()
+for q in queries:
+    try:
+        url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page=5"
+        data = json.loads(urllib.request.urlopen(url, timeout=15).read())
+        for repo in data.get("items", []):
+            name = repo.get("full_name", "")
+            if name in seen:
+                continue
+            seen.add(name)
+            desc = (repo.get("description", "") or "")[:100]
+            stars = repo.get("stargazers_count", 0)
+            html_url = repo.get("html_url", "")
+            results.append({
+                "source": "github_trending",
+                "title": f"{name}: {desc}",
+                "url": html_url,
+                "score": None,
+                "stars": stars,
+                "canonical_id": f"github:{name.lower()}"
+            })
+    except: pass
+
+with open(raw_file, "a") as f:
+    for r in results:
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+PYEOF
+    log "GitHub 트렌딩: 수집 완료"
+}
+
+# --- RSS: 공식 블로그 ---
+collect_rss() {
+    log "RSS 수집 중..."
+    python3 - "$RAW_FILE" <<'PYEOF'
+import json, urllib.request, sys, re
+
+raw_file = sys.argv[1]
+results = []
+
+feeds = [
+    ("https://openai.com/news/rss.xml", "OpenAI"),
+    ("https://blog.google/rss/", "Google"),
+]
+
+keywords = re.compile(r"AI|GPT|Claude|Gemini|model|agent|LLM", re.IGNORECASE)
+
+for feed_url, name in feeds:
+    try:
+        content = urllib.request.urlopen(feed_url, timeout=15).read().decode("utf-8", errors="replace")
+        items = re.findall(r"<item>.*?</item>", content, re.DOTALL)[:10]
+        for item in items:
+            title_m = re.search(r"<title>(.*?)</title>", item)
+            link_m = re.search(r"<link>(.*?)</link>", item)
+            if title_m and link_m and keywords.search(title_m.group(1)):
+                title = title_m.group(1).strip()
+                url = link_m.group(1).strip()
+                results.append({
+                    "source": f"rss:{name}",
+                    "title": title,
+                    "url": url,
+                    "score": None,
+                    "stars": None,
+                    "canonical_id": f"url:{url.rstrip('/')}"
+                })
+    except: pass
+
+with open(raw_file, "a") as f:
+    for r in results:
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+PYEOF
+    log "RSS: 수집 완료"
+}
+
+# 병렬 수집
+collect_hn &
+collect_reddit &
+collect_github_new &
+collect_github_trending &
+collect_rss &
+wait
+
+# === 2단계: 스냅샷 저장 + 재노출 판정 ===
+FILTERED_FILE="$DATA_DIR/filtered_${TODAY}.txt"
+
+python3 - "$SQLITE_DB" "$RAW_FILE" "$FILTERED_FILE" "$TODAY" <<'PYEOF'
+import sys, json, sqlite3, math
+
+db_path, raw_file, filtered_file, today = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+conn = sqlite3.connect(db_path)
+
+# 수집된 항목 읽기
+items = []
+try:
+    with open(raw_file) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    items.append(json.loads(line))
+                except: pass
+except: pass
+
+if not items:
+    with open(filtered_file, "w") as f:
+        pass
+    conn.close()
+    sys.exit(0)
+
+# canonical_id 중복 제거 (같은 canonical_id는 가장 높은 메트릭 유지)
+deduped = {}
+for item in items:
+    cid = item.get("canonical_id", "")
+    if not cid:
+        continue
+    if cid in deduped:
+        old = deduped[cid]
+        # 더 높은 메트릭 유지
+        if (item.get("stars") or 0) > (old.get("stars") or 0):
+            deduped[cid] = item
+        elif (item.get("score") or 0) > (old.get("score") or 0):
+            deduped[cid] = item
+    else:
+        deduped[cid] = item
+
+# 스냅샷 저장
+for cid, item in deduped.items():
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO item_daily_snapshots (canonical_id, snapshot_date, source, title, url, stars, score) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (cid, today, item.get("source", ""), item.get("title", ""), item.get("url", ""), item.get("stars"), item.get("score"))
+        )
+    except: pass
+conn.commit()
+
+# 이전 발송 이력 조회
+appearances = {}
+for row in conn.execute("""
+    SELECT canonical_id, MAX(briefing_date) as last_date,
+           COUNT(*) as total_count,
+           (SELECT COUNT(*) FROM item_appearances a2
+            WHERE a2.canonical_id = a1.canonical_id
+            AND a2.briefing_date >= date(?, '-30 day')) as count_30d
+    FROM item_appearances a1
+    GROUP BY canonical_id
+""", (today,)):
+    appearances[row[0]] = {
+        "last_date": row[1],
+        "total_count": row[2],
+        "count_30d": row[3]
+    }
+
+# 이전 메트릭 조회
+prev_metrics = {}
+for row in conn.execute("""
+    SELECT canonical_id, stars, score FROM item_daily_snapshots
+    WHERE (canonical_id, snapshot_date) IN (
+        SELECT canonical_id, MAX(snapshot_date) FROM item_daily_snapshots
+        WHERE snapshot_date < ? GROUP BY canonical_id
+    )
+""", (today,)):
+    prev_metrics[row[0]] = {"stars": row[1], "score": row[2]}
+
+conn.close()
+
+# 재노출 판정
+def classify_item(item):
+    cid = item.get("canonical_id", "")
+    hist = appearances.get(cid)
+
+    if not hist:
+        return "new", 100  # 처음 보는 항목
+
+    last_date = hist["last_date"]
+    count_30d = hist["count_30d"]
+
+    # 날짜 차이 계산
+    from datetime import datetime
+    try:
+        days_since = (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(last_date, "%Y-%m-%d")).days
+    except:
+        days_since = 0
+
+    # 쿨다운: 기본 7일
+    cooldown = 7
+    source = item.get("source", "")
+    if source.startswith("rss:"):
+        cooldown = 21  # 공식 발표는 길게
+    elif source.startswith("reddit:") or source == "hn":
+        cooldown = 14  # 커뮤니티 글은 중간
+
+    # 피로도 패널티
+    fatigue = count_30d * 25  # 30일 내 노출 횟수당 -25점
+
+    # 성장률 계산
+    prev = prev_metrics.get(cid, {})
+    stars_now = item.get("stars") or 0
+    stars_prev = prev.get("stars") or 0
+    score_now = item.get("score") or 0
+    score_prev = prev.get("score") or 0
+
+    star_delta = stars_now - stars_prev
+    score_delta = score_now - score_prev
+
+    # 동적 stars 임계값
+    def star_threshold(prev_stars):
+        if prev_stars < 500: return 100
+        elif prev_stars < 5000: return 300
+        elif prev_stars < 20000: return 700
+        else: return 1500
+
+    strong_growth = False
+    if stars_now > 0 and stars_prev > 0:
+        pct = star_delta / max(stars_prev, 1)
+        strong_growth = star_delta >= star_threshold(stars_prev) or pct >= 0.25
+    if score_now > 0 and score_prev > 0:
+        if score_delta >= 200:
+            strong_growth = True
+
+    # 교차 소스 확인 (같은 canonical_id가 다른 소스에서도 등장)
+    cross_source = False
+    for other_cid, other_item in deduped.items():
+        if other_cid == cid:
+            continue
+        # URL이 겹치는 경우
+        if other_item.get("url", "").rstrip("/") == item.get("url", "").rstrip("/"):
+            cross_source = True
+            break
+
+    # 판정
+    if days_since < 3 and not strong_growth:
+        return "skip", -999
+
+    if days_since < cooldown:
+        if strong_growth or cross_source:
+            momentum = math.log(1 + max(star_delta, score_delta)) * 6
+            return "update", 50 + momentum - fatigue
+        return "skip", -999
+
+    # 쿨다운 지남
+    if strong_growth or cross_source:
+        momentum = math.log(1 + max(star_delta, score_delta)) * 6
+        return "update", 60 + momentum - fatigue
+    elif days_since >= cooldown:
+        # 쿨다운 지났지만 성장 없으면 낮은 점수
+        return "skip", -999
+
+    return "skip", -999
+
+# 분류
+classified = []
+for cid, item in deduped.items():
+    item_type, score = classify_item(item)
+    if item_type != "skip":
+        classified.append({**item, "_type": item_type, "_score": score})
+
+# 정렬: new 우선, score 순
+new_items = sorted([i for i in classified if i["_type"] == "new"], key=lambda x: -x["_score"])
+update_items = sorted([i for i in classified if i["_type"] == "update"], key=lambda x: -x["_score"])
+
+# 최종 후보: new 최소 필요, update 최대 2개
+final = []
+# new 먼저 (최대 10개 후보)
+for item in new_items[:10]:
+    final.append(item)
+# update 추가 (최대 4개 후보)
+for item in update_items[:4]:
+    final.append(item)
+
+# 필터링된 결과를 텍스트로 저장 (LLM에 전달할 형식)
+with open(filtered_file, "w") as f:
+    for item in final:
+        tag = item["_type"].upper()
+        source = item.get("source", "")
+        title = item.get("title", "")
+        url = item.get("url", "")
+        stars = item.get("stars")
+        score = item.get("score")
+
+        metric = ""
+        if stars: metric += f"stars:{stars}"
+        if score: metric += f"{',' if metric else ''}score:{score}"
+
+        # 성장 정보
+        prev = prev_metrics.get(item.get("canonical_id", ""), {})
+        if tag == "UPDATE":
+            prev_stars = prev.get("stars", 0)
+            prev_score = prev.get("score", 0)
+            if stars and prev_stars:
+                metric += f",+{stars - prev_stars}stars"
+            if score and prev_score:
+                metric += f",+{score - prev_score}score"
+
+        f.write(f"[{tag}|{source}|{metric}] {title} | {url}\n")
+
+print(f"판정 완료: 전체 {len(deduped)}건, new {len(new_items)}건, update {len(update_items)}건, 후보 {len(final)}건")
+PYEOF
+
+# === 3단계: 건수 확인 ===
+RAW_COUNT=$(wc -l < "$RAW_FILE" 2>/dev/null || echo "0")
+FILTERED_COUNT=$(wc -l < "$FILTERED_FILE" 2>/dev/null || echo "0")
+log "수집 ${RAW_COUNT}건, 후보 ${FILTERED_COUNT}건"
+
+if [ ! -s "$FILTERED_FILE" ]; then
+    log "후보 0건"
+    send_telegram "🤖 *AI 모닝 브리핑 ($TODAY)*
+
+조용한 날입니다. 새로운 AI 뉴스가 없습니다."
+    log "=== 브리핑 완료 (0건) ==="
+    exit 0
+fi
+
+# === 4단계: LLM 요약 (claude -p 기본, codex-ask/gemini-ask 폴백) ===
+FILTERED_CONTENT=$(cat "$FILTERED_FILE")
+
+LLM_PROMPT="다음은 오늘(${TODAY}) 수집된 AI 관련 뉴스와 레포지토리 목록이다.
+각 항목에는 [NEW] 또는 [UPDATE] 태그가 붙어 있다.
+
+${FILTERED_CONTENT}
+
+위 목록에서 가장 중요하고 흥미로운 항목을 최대 5개 골라서 아래 형식으로 정리해줘.
+- 한국어로 작성
+- 각 항목은 이 형식: 제목, 왜 중요한지 1줄, 원문 링크
+- 중복되는 내용은 합치기
+- [UPDATE] 항목은 왜 다시 소개하는지 변화량을 반영해서 설명
+
+이 브리핑의 독자는 Claude Code를 메인 도구로 쓰는 개인 개발자다.
+관심사: agentic AI 활용, 현재 워크플로우 개선, 생산성 향상.
+
+선정 우선순위 (반드시 이 순서대로):
+1순위: Claude Code 사용성 개선 - 스킬, 플러그인, MCP 서버, hooks, 워크플로우 팁, 설정법, 베스트 프랙티스
+2순위: Agentic AI 활용법 - 에이전트 설계 패턴, 멀티 에이전트 협업, 자동화 워크플로우, 프롬프트 엔지니어링
+3순위: Claude Code와 연동 가능한 새 도구/서비스
+4순위: 새로운 AI 모델 출시/업데이트 (실무 영향이 있는 것만)
+
+5개 중 최소 3개는 1~2순위에서 골라라. 해당 항목이 없으면 그때만 3~4순위로 채워라.
+
+규칙:
+- 5개 중 [UPDATE]는 최대 2개, [NEW]는 최소 3개
+- [UPDATE] 선택 시 반드시 이전 대비 변화를 언급
+
+각 항목마다 반드시 아래 3줄을 추가해라:
+1. '적용 판정': 즉시 적용 / 검토 후 적용 / 참고만 중 하나
+2. '적용 방법': 설치 명령어나 구체적 행동 1줄 (즉시 적용인 경우 복사해서 바로 쓸 수 있는 명령어)
+3. '난이도/소요': 낮음(5분) / 중간(30분) / 높음(1시간+) 중 하나
+
+개발환경: dotfiles, skills, hooks, MCP, 스크립트 등.
+
+선정 시 성숙도 기준:
+- GitHub 레포는 stars 3개 이상, 또는 검증된 조직의 공식 레포만 포함
+- 오늘 막 만들어진 stars 0 레포는 제외
+- 실제로 설치/적용 가능한 수준의 문서와 코드가 있는 것만 추천
+- 마지막에 '오늘의 한줄 요약'을 추가
+
+출력 형식 예시:
+1. [NEW] 제목
+   요약: 무엇인지 1~2줄
+   적용 판정: 즉시 적용
+   적용 방법: pip install xxx && claude mcp add xxx
+   난이도/소요: 낮음(5분)
+   링크: URL
+
+2. [UPDATE] 제목 (+1800 stars, 6일)
+   요약: 왜 다시 소개하는지 + 변화량
+   적용 판정: 검토 후 적용
+   적용 방법: README 확인 후 skills/ 디렉토리에 스킬 파일 작성
+   난이도/소요: 중간(30분)
+   링크: URL
+
+중요: ** (별표 두 개)로 감싸는 Markdown 굵게 표기를 절대 사용하지 마라. 플레인 텍스트로만 작성.
+
+오늘의 한줄 요약: ..."
+
+# LLM 호출: claude -p 우선, 실패 시 codex-ask, 그 다음 gemini-ask
+SUMMARY=""
+LLM_USED=""
+
+# 1차: claude -p (항상 사용 가능)
+log "LLM 시도: claude -p"
+SUMMARY=$(echo "$LLM_PROMPT" | claude -p --model opus 2>&1)
+if [ -n "$SUMMARY" ] && ! echo "$SUMMARY" | grep -qiE "error|usage limit|rate limit"; then
+    LLM_USED="claude"
+    log "claude 요약 성공"
+fi
+
+# 2차: codex-ask (claude 실패 시)
+if [ -z "$LLM_USED" ]; then
+    log "LLM 시도: codex-ask"
+    SUMMARY=$(codex-ask --new "$LLM_PROMPT" 2>&1)
+    if [ -n "$SUMMARY" ] && ! echo "$SUMMARY" | grep -qiE "usage limit|SyntaxError|빈 응답"; then
+        LLM_USED="codex"
+        log "codex 요약 성공"
+    fi
+fi
+
+# 3차: gemini-ask (codex도 실패 시)
+if [ -z "$LLM_USED" ]; then
+    log "LLM 시도: gemini-ask"
+    SUMMARY=$(gemini-ask --new "$LLM_PROMPT" 2>&1)
+    if [ -n "$SUMMARY" ] && ! echo "$SUMMARY" | grep -qiE "CAPACITY_EXHAUSTED|빈 응답"; then
+        LLM_USED="gemini"
+        log "gemini 요약 성공"
+    fi
+fi
+
+# 모두 실패
+if [ -z "$LLM_USED" ]; then
+    log "LLM 모두 실패, raw 데이터로 전송"
+    SUMMARY="(요약 실패 - 모든 LLM 한도 초과, 원본 데이터)
+${FILTERED_CONTENT}"
+fi
+
+echo "$SUMMARY" > "$SUMMARY_FILE"
+log "요약 완료 (${LLM_USED:-none})"
+
+# === 5단계: 텔레그램 전송 ===
+MESSAGE="🤖 *AI 모닝 브리핑 (${TODAY})*
+
+${SUMMARY}"
+
+send_telegram "$MESSAGE"
+log "텔레그램 전송 완료"
+
+# === 6단계: 발송 이력 기록 ===
+python3 - "$SQLITE_DB" "$TODAY" "$RAW_COUNT" "$SUMMARY" "$FILTERED_FILE" <<'PYEOF'
+import sys, sqlite3, re, json
+
+db_path, date, raw_count, summary, filtered_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+
+conn = sqlite3.connect(db_path)
+
+# 브리핑 전체 저장
+conn.execute("INSERT OR REPLACE INTO briefings (date, raw_count, summary) VALUES (?, ?, ?)",
+             (date, int(raw_count), summary))
+
+# 개별 항목 파싱 및 저장
+conn.execute("DELETE FROM items WHERE date = ?", (date,))
+blocks = re.split(r'\n(?=\d+\.)', summary.strip())
+for block in blocks:
+    m = re.match(r'\d+\.\s*\*\*(.+?)\*\*', block)
+    if not m:
+        continue
+    title = m.group(1).strip()
+    desc_m = re.search(r'(?:요약|왜 중요)[：:]?\s*(.+)', block)
+    action_m = re.search(r'적용 제안[：:]?\s*(.+)', block)
+    url_m = re.search(r'링크[：:]?\s*(https?://\S+)', block)
+    desc = desc_m.group(1).strip() if desc_m else ""
+    action = action_m.group(1).strip() if action_m else ""
+    url = url_m.group(1).strip() if url_m else ""
+    conn.execute("INSERT INTO items (date, title, description, action, url) VALUES (?, ?, ?, ?, ?)",
+                 (date, title, desc, action, url))
+
+# 발송 이력 기록 (LLM이 선택한 항목의 canonical_id를 filtered_file에서 매칭)
+try:
+    with open(filtered_file) as f:
+        filtered_items = []
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # URL 추출
+            url_m = re.search(r'(https?://\S+)$', line)
+            tag_m = re.match(r'\[(NEW|UPDATE)', line)
+            if url_m:
+                url = url_m.group(1)
+                tag = tag_m.group(1).lower() if tag_m else "new"
+                filtered_items.append({"url": url, "type": tag})
+
+    # summary에서 실제 선택된 URL 추출
+    selected_urls = set(re.findall(r'링크[：:]?\s*(https?://\S+)', summary))
+
+    for fi in filtered_items:
+        if fi["url"] in selected_urls:
+            # canonical_id 찾기
+            row = conn.execute("SELECT canonical_id, stars, score FROM item_daily_snapshots WHERE url = ? AND snapshot_date = ?",
+                             (fi["url"], date)).fetchone()
+            if row:
+                conn.execute("INSERT INTO item_appearances (canonical_id, briefing_date, appearance_type, stars, score) VALUES (?, ?, ?, ?, ?)",
+                           (row[0], date, fi["type"], row[1], row[2]))
+except: pass
+
+conn.commit()
+conn.close()
+PYEOF
+log "DB 저장 완료: $SQLITE_DB"
+
+# 오래된 파일 정리 (30일 이상, DB는 유지)
+find "$DATA_DIR" -name "raw_*.json" -mtime +30 -delete 2>/dev/null
+find "$DATA_DIR" -name "raw_*.txt" -mtime +30 -delete 2>/dev/null
+find "$DATA_DIR" -name "summary_*.txt" -mtime +30 -delete 2>/dev/null
+find "$DATA_DIR" -name "filtered_*.txt" -mtime +30 -delete 2>/dev/null
+
+log "=== 브리핑 완료 ==="

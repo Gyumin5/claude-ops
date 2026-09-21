@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""claude-quota-observe — 계정 한도 관측을 셸에서 쓸 수 있는 한 벌로 내놓는다.
+
+`claude-quota-observe` → key=value 줄들. `eval "$(claude-quota-observe --sh)"` 로 쓴다.
+
+왜 있나: 같은 캐시 계산이 rate-limit-recovery · rate-limit-guard.sh ·
+rate-limit-prompt-guard.sh 에 세 벌 복제돼 있었고 셋 다 cached_at 을 안 봐서,
+얼어붙은 7일 창의 99% 가 한도 해제 뒤에도 세션을 계속 가뒀다(2026-08-28 옆 기계
+6시간). 규칙을 lib 한 곳에 두고 셸은 이걸 부른다.
+
+내놓는 것:
+  status        fresh | stale | missing | error   (fresh 가 아니면 수치는 근거가 아니다)
+  cached_age    캐시가 몇 초 전 것인가. 모르면 -1
+  blocked       true | false   (fresh 관측이 임계를 넘을 때만 true)
+  why           그렇게 판정한 한 줄
+  fh_*, sd_*    5시간·7일 창의 status / pct / reset_at / reset_remain
+                pct 는 모르면 -1, reset_at 은 모르면 빈 문자열
+"""
+import datetime
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import claude_session_lib as csl   # noqa: E402  (판정 규칙 단일 출처)
+
+
+def fmt_reset(ts):
+    if not isinstance(ts, (int, float)):
+        return "", ""
+    kst = datetime.timezone(datetime.timedelta(hours=9))
+    reset = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).astimezone(kst)
+    remain = int((ts - time.time()) // 60)
+    h, m = divmod(max(remain, 0), 60)
+    return reset.strftime("%Y-%m-%d %H:%M KST"), "%dh%02dm" % (h, m)
+
+
+def main():
+    obs = csl.account_quota_observation()
+    blocked, why = csl.quota_blocked()
+    ca = obs.get("cached_at")
+    rows = [
+        ("status", obs["status"]),
+        ("cached_age", int(time.time() - ca) if isinstance(ca, (int, float)) else -1),
+        ("blocked", "true" if blocked else "false"),
+        ("why", why),
+    ]
+    for key, pre in (("five_hour", "fh"), ("seven_day", "sd")):
+        w = obs[key]
+        at, remain = fmt_reset(w.get("resets_at"))
+        rows += [(pre + "_status", w["status"]),
+                 (pre + "_pct", int(w["used"]) if w["used"] is not None else -1),
+                 (pre + "_reset_at", at),
+                 (pre + "_reset_remain", remain)]
+    sh = "--sh" in sys.argv[1:]
+    for k, v in rows:
+        print(("QUOTA_%s='%s'" % (k.upper(), str(v).replace("'", "'\\''")))
+              if sh else "%s=%s" % (k, v))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

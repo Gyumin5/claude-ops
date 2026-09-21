@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""
+ai-debate-cache-tester
+
+10분 주기 systemd timer 로 호출되어 ai-debate 를 무자비하게 부르지 않으면서
+cache poisoning / cross-topic 적중 / --no-cache 무시 등의 사고가 재발하는지
+감시한다.
+
+전략
+- task A, task B 두 가지를 번갈아 호출 (i 짝수 → A, 홀수 → B). --no-cache 미지정.
+  · 첫 호출: cache miss → 새로 토론 후 캐시 저장.
+  · 두 번째 호출 (같은 task): cache HIT 기대. ai-debate stderr/stdout 에 task_sha
+    match 가 들어가야 한다 (32-char hash + task preview 보존 변경 후).
+- 매 호출 결과를 ~/.claude/state/ai-debate-cache-tester/log.txt 에 append.
+- 다음 중 하나라도 발생하면 즉시 timer disable + 텔레그램 알림:
+  · stderr 에 "cache poisoning 의심" 또는 "WARNING" 포함
+  · stdout 의 cached/current task preview 가 어긋남 (다른 토픽 적중)
+  · ai-debate exit code != 0 이 3회 연속
+- 카운터(.count) 가 MAX_RUNS(12) 도달 시 자동 정지.
+"""
+from __future__ import annotations
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+
+STATE_DIR = Path.home() / ".claude" / "state" / "ai-debate-cache-tester"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+LOG = STATE_DIR / "log.txt"
+COUNT_FILE = STATE_DIR / "count"
+FAIL_FILE = STATE_DIR / "consecutive_fail"
+TG_ENV = Path.home() / "dotfiles" / ".claude" / "telegram" / ".env"
+MAX_RUNS = 12
+
+TASK_A = (
+    "[cache-tester] 한 줄로 답해라. 'systemd user timer 의 OnUnitActiveSec=10min "
+    "사용 시 첫 트리거 지연이 얼마나 발생하는가' 만 1문장 답변. 다른 토픽 금지."
+)
+TASK_B = (
+    "[cache-tester] 한 줄로 답해라. 'Python argparse 의 store_true 액션이 "
+    "기본값으로 채택하는 값은 무엇인가' 만 1문장 답변. 다른 토픽 금지."
+)
+
+
+def log(line: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S KST")
+    with LOG.open("a") as f:
+        f.write(f"[{ts}] {line}\n")
+
+
+def read_int(p: Path, default: int = 0) -> int:
+    try:
+        return int(p.read_text().strip())
+    except Exception:
+        return default
+
+
+def telegram(msg: str):
+    if not TG_ENV.is_file():
+        return
+    env = {}
+    for line in TG_ENV.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        env[k.strip()] = v.strip().strip('"').strip("'")
+    token = env.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return
+    try:
+        subprocess.run(
+            [
+                "curl", "-sS", "-X", "POST",
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                "--data-urlencode", "chat_id=TELEGRAM_CHAT_ID",
+                "--data-urlencode", f"text={msg}",
+            ],
+            capture_output=True, timeout=15,
+        )
+    except Exception:
+        pass
+
+
+def stop_timer(reason: str):
+    log(f"STOP timer reason={reason}")
+    subprocess.run(
+        ["systemctl", "--user", "disable", "--now", "ai-debate-cache-tester.timer"],
+        capture_output=True, timeout=15,
+    )
+
+
+def run_once(idx: int, task_name: str, task: str):
+    log(f"run #{idx} task={task_name} starting")
+    proc = subprocess.run(
+        ["ai-debate", "--max-rounds", "1", task],
+        capture_output=True, text=True, timeout=900,
+    )
+    rc = proc.returncode
+    out = proc.stdout or ""
+    err = proc.stderr or ""
+
+    # 진단 신호
+    warning = "WARNING" in err or "cache poisoning" in err
+    cache_hit = "CACHE HIT" in out
+    cached_line = ""
+    current_line = ""
+    for line in out.splitlines():
+        if line.startswith("cached task :"):
+            cached_line = line[len("cached task :"):].strip()
+        elif line.startswith("current task:"):
+            current_line = line[len("current task:"):].strip()
+    # task preview 비교 (HIT 시): 두 줄이 어긋나면 cross-topic.
+    mismatch = False
+    if cache_hit and cached_line and current_line:
+        # task name marker 가 양쪽에 들어있어야 같은 토픽.
+        marker = "[cache-tester]"
+        if cached_line.find(marker) == -1 or current_line.find(marker) == -1:
+            mismatch = True
+        # 더 강한 검사: 두 preview 의 첫 80자가 완전히 다르면 의심.
+        if cached_line[:80] != current_line[:80]:
+            mismatch = True
+
+    log(
+        f"run #{idx} rc={rc} cache_hit={cache_hit} warning={warning} "
+        f"mismatch={mismatch} cached='{cached_line[:120]}' current='{current_line[:120]}' "
+        f"out_bytes={len(out)} err_bytes={len(err)}"
+    )
+    if err.strip():
+        log(f"run #{idx} stderr_tail: {err[-400:]}")
+    # 디버그: cache 디렉토리 현재 파일 수 + 본 task 의 예상 cache 경로
+    try:
+        import hashlib, json as _j
+        cdir = Path.home() / ".claude" / "state" / "ai-debate" / "cache"
+        files = sorted([p.name for p in cdir.glob("*.json")])
+        src = _j.dumps({"task": task, "max_rounds": 1, "with_memory": False}, ensure_ascii=False, sort_keys=True)
+        expect = hashlib.sha256(src.encode("utf-8")).hexdigest()[:32]
+        present = (cdir / f"{expect}.json").is_file()
+        log(f"run #{idx} cache files={len(files)} expected_key={expect} present={present}")
+    except Exception as e:
+        log(f"run #{idx} cache-debug-err: {e}")
+
+    if warning or mismatch:
+        telegram(
+            f"[ai-debate-cache-tester] 사고 감지! run #{idx} task={task_name} "
+            f"warning={warning} mismatch={mismatch}. timer 정지. "
+            f"로그: {LOG}"
+        )
+        stop_timer(f"anomaly idx={idx} warning={warning} mismatch={mismatch}")
+        return
+
+    if rc != 0:
+        fails = read_int(FAIL_FILE, 0) + 1
+        FAIL_FILE.write_text(str(fails))
+        log(f"run #{idx} non-zero exit. consecutive_fail={fails}")
+        if fails >= 3:
+            telegram(
+                f"[ai-debate-cache-tester] ai-debate 3회 연속 실패. timer 정지. "
+                f"마지막 stderr 앞 200자: {err[:200]}"
+            )
+            stop_timer("3-consecutive-fail")
+        return
+    else:
+        FAIL_FILE.write_text("0")
+
+
+def main():
+    idx = read_int(COUNT_FILE, 0) + 1
+    COUNT_FILE.write_text(str(idx))
+    if idx > MAX_RUNS:
+        log(f"MAX_RUNS={MAX_RUNS} reached. stopping timer.")
+        telegram(
+            f"[ai-debate-cache-tester] {MAX_RUNS}회 완료 — 사고 0건. timer 자동 정지. "
+            f"로그 {LOG}"
+        )
+        stop_timer("max-runs")
+        return
+    task_name = "A" if idx % 2 == 1 else "B"
+    task = TASK_A if task_name == "A" else TASK_B
+    try:
+        run_once(idx, task_name, task)
+    except subprocess.TimeoutExpired:
+        log(f"run #{idx} timeout 900s — 이상 호출. timer 정지.")
+        telegram(f"[ai-debate-cache-tester] run #{idx} 15분 timeout. timer 정지.")
+        stop_timer("timeout")
+
+
+if __name__ == "__main__":
+    main()

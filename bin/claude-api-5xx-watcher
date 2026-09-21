@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""
+claude-api-5xx-watcher
+
+각 claude-<proj>.service 의 최신 jsonl 을 tail 하며, 마지막 assistant 메시지가
+"API Error: 5xx"(예: 529 Overloaded) 로 끝나 턴이 죽은 세션을 감지한다.
+감지 시 자동으로 "계속 진행해" 를 그 세션 봇에 재주입(재전송)한다.
+
+재주입 메커니즘:
+  봇 sendMessage 는 인바운드가 안 됨(봇→사용자 방향). 세션이 새 프롬프트로
+  받게 하려면 "사용자 계정→봇" 메시지가 필요 → 유저봇(claude-userbot-send).
+  - 로컬에 유저봇(userbot.session) 있으면 로컬 실행(home).
+  - 없으면 ~/.claude/userbot/host 에 적힌 호스트로 ssh 해서 거기 유저봇 실행
+    (peer = 회사 머신, 개인 유저봇 미설치 → ssh home). 봇은 Telegram 으로
+    어느 머신에서든 접근되므로 home 유저봇이 peer 세션 봇에도 쏠 수 있다.
+
+폭주 방지(기존 retry-dead-loop 가드를 안전하게 대체):
+  - 백오프: 60 → 180 → 420 초.
+  - 최대 3회 자동 재전송. 그래도 5xx 면 "수동 필요" 알림 후 멈춤(gave_up).
+  - 처리 대기(직전 재전송/사용자 메시지가 아직 처리 안 됨) 중엔 재전송 안 함.
+  - 5xx 아닌 응답이 나오면(복구) 상태 초기화.
+  - 처음 봤을 때 이미 10분+ 지난 오래된 에러는 무시(시작 시 과거에러 스팸 방지).
+
+상태: ~/.claude/state/api-5xx-watcher/<proj>.retry.json
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+STATE_DIR = Path.home() / ".claude" / "state" / "api-5xx-watcher"
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import claude_session_lib as csl   # noqa: E402  (transcript 선택 규칙 단일 출처)
+
+# 저장소 뿌리를 이 파일 위치에서 찾는다. 예전엔 홈 아래 고정 경로였는데,
+# 그러면 다른 자리에 받은 사람은 그대로 못 돌린다.
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+USERBOT_SESSION = Path.home() / ".claude" / "userbot" / "userbot.session"
+USERBOT_HOST_FILE = Path.home() / ".claude" / "userbot" / "host"
+SEND_BIN = Path(__file__).resolve().parent / "claude-userbot-send"
+ERROR_RE = re.compile(r"API Error:\s*5\d\d")
+CODE_RE = re.compile(r"API Error:\s*(5\d\d)")
+
+DRYRUN = os.environ.get("CLAUDE_5XX_DRYRUN") == "1"  # 발송/알림 대신 stderr 출력
+PAYLOAD = "계속 진행해"
+BACKOFF = [60, 180, 420]   # 재전송 간 대기(초). attempts 인덱스.
+MAX_RETRIES = 3
+STALE_SEC = 600            # 처음 봤을 때 이 이상 지난 에러는 무시
+# 세션이 아닌 보조 유닛만 넣는다. 세션 이름과 겹치면 그 세션은 영구 사각지대가
+# 되므로 새 이름을 넣기 전에 `~/.claude/userbot/targets.json` 과 대조할 것.
+# "resume" 는 도입(8612bd8, 2026-05-22)부터 여기 있었으나 실제로는 세션 이름이라
+# claude-resume.service 가 내내 감시 밖이었다(2026-08-01 제거).
+SKIP = {"progress-updater", "rate-limit-recovery", "daily-research",
+        "control-bot", "watchdog", "bun-ensure", "memory-lifecycle",
+        "weekly-stability-check", "telegram-healthcheck",
+        "api-5xx-watcher", "usage-daily-report"}
+
+
+WARN_EVERY = 3600          # 같은 문구를 30초마다 저널에 쏟지 않는다
+
+
+def warn(msg, key=None):
+    """stderr(=journal) 로 신호. key 를 주면 그 키당 1시간에 한 번만.
+
+    '조용히 return' 이 사각지대를 만든 게 이 스크립트의 실제 사고였다
+    (session_c, 도입 후 내내 미감시). 알림은 늘리지 않되 로그는 남긴다.
+    """
+    if key:
+        stamp = STATE_DIR / ("warn-%s.stamp" % re.sub(r"[^a-zA-Z0-9]", "-", key))
+        try:
+            if stamp.exists() and time.time() - stamp.stat().st_mtime < WARN_EVERY:
+                return
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            stamp.touch()
+        except OSError:
+            pass
+    print("[5xx-watcher] %s" % msg, file=sys.stderr)
+
+
+def list_services():
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "list-units", "claude-*.service",
+             "--no-legend", "--state=active", "--plain"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception:
+        return []
+    names = []
+    for line in out.splitlines():
+        unit = line.split()[0] if line.strip() else ""
+        if unit.startswith("claude-") and unit.endswith(".service"):
+            proj = unit[len("claude-"):-len(".service")]
+            # claude-job-*(detach 잡)와 템플릿 인스턴스(claude-session-nudge@x)는
+            # 세션이 아니다. 잡은 발신 세션의 cwd 를 물려받아 그 세션의 jsonl 을
+            # 자기 것처럼 보게 되고, 그래서 잡 이름으로 된 유령 retry 상태가 남는다
+            # (peer 에서 job-session-a-... retry.json 이 7-27 부터 방치돼 있었다).
+            if proj.startswith("job-") or "@" in proj:
+                continue
+            if proj not in SKIP:
+                names.append(proj)
+    return names
+
+
+def unit_props(proj):
+    """(WorkingDirectory, Transient). 한 번의 show 로 둘 다 받는다."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", f"claude-{proj}.service",
+             "-p", "WorkingDirectory", "-p", "Transient"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return "", False
+    d = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k] = v
+    return d.get("WorkingDirectory", ""), d.get("Transient") == "yes"
+
+
+def workingdir(proj):
+    return unit_props(proj)[0]
+
+
+_recorded_cwd = csl.recorded_cwd
+_transcript_kind = csl.transcript_kind
+_DIR_CACHE = {}
+
+
+def project_dir(cwd):
+    """세션 cwd → `~/.claude/projects/<key>`. 규칙은 claude_session_lib 한 곳에 있다."""
+    if not cwd:
+        return None
+    if cwd in _DIR_CACHE:
+        d = _DIR_CACHE[cwd]
+        return d if d and d.is_dir() else None
+    d = csl.project_dir(cwd, str(PROJECTS_DIR), on_fallback=warn)
+    d = Path(d) if d else None
+    _DIR_CACHE[cwd] = d
+    return d
+
+
+def latest_jsonl(cwd):
+    """그 세션의 대화형 transcript. 없으면 None(호출부가 시끄럽게 경고한다)."""
+    proj_dir = project_dir(cwd)
+    if proj_dir is None:
+        return None
+    p = csl.session_transcript(
+        str(proj_dir),
+        on_fallback=lambda m: warn(m, key="kind:" + proj_dir.name))
+    return Path(p) if p else None
+
+
+def load_bot_token(cwd):
+    env_path = Path(cwd) / ".claude" / "telegram" / ".env"
+    if not env_path.is_file():
+        return None
+    for line in env_path.read_text(errors="ignore").splitlines():
+        if line.startswith("TELEGRAM_BOT_TOKEN="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+def bot_username(token):
+    """토큰 → @username (getMe). 실패 시 None."""
+    url = f"https://api.telegram.org/bot{token}/getMe"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            d = json.loads(r.read().decode("utf-8", errors="ignore"))
+        u = d.get("result", {}).get("username")
+        return ("@" + u) if u else None
+    except Exception:
+        return None
+
+
+def notify(token, text):
+    if DRYRUN:
+        import sys
+        sys.stderr.write(f"[DRYRUN notify] {text}\n")
+        return
+    data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": text}).encode()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        urllib.request.urlopen(url, data=data, timeout=10).read()
+    except Exception:
+        pass
+
+
+def do_resend(username):
+    """유저봇으로 PAYLOAD 재주입. (ok, detail) 반환."""
+    if DRYRUN:
+        import sys
+        mode = "local" if USERBOT_SESSION.exists() else "ssh:" + (
+            USERBOT_HOST_FILE.read_text().strip() if USERBOT_HOST_FILE.is_file() else "?")
+        sys.stderr.write(f"[DRYRUN resend] {mode} -> {username} : {PAYLOAD}\n")
+        return True, "DRYRUN"
+    if not SEND_BIN.exists():
+        return False, "claude-userbot-send 없음"
+    if USERBOT_SESSION.exists():
+        cmd = [str(SEND_BIN), username, PAYLOAD]
+    else:
+        host = ""
+        if USERBOT_HOST_FILE.is_file():
+            host = USERBOT_HOST_FILE.read_text(errors="ignore").strip()
+        if not host:
+            return False, "로컬 유저봇 없음 + host 미설정"
+        remote = fos.path.join(REPO, "bin/claude-userbot-send {shlex.quote(username)} {shlex.quote(PAYLOAD)}")
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, remote]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+        det = ((r.stderr or "") + (r.stdout or "")).strip()
+        # ssh 원격 셸 init 잡음(예: 'lean-ctx: command not found') 제거
+        det = "\n".join(l for l in det.splitlines()
+                        if "command not found" not in l)[-200:]
+        return (r.returncode == 0), det
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def load_state(proj):
+    f = STATE_DIR / f"{proj}.retry.json"
+    if f.is_file():
+        try:
+            return json.loads(f.read_text())
+        except Exception:
+            pass
+    return {"active": False, "first_seen_ts": 0.0, "attempts": 0,
+            "last_attempt_ts": 0.0, "gave_up": False}
+
+
+def save_state(proj, st):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / f"{proj}.retry.json").write_text(json.dumps(st))
+
+
+def clear_state(proj):
+    f = STATE_DIR / f"{proj}.retry.json"
+    try:
+        f.unlink()
+    except Exception:
+        pass
+
+
+def parse_ts(rec):
+    t = rec.get("timestamp")
+    if not t:
+        return None
+    try:
+        return datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def is_real_user(d):
+    if not d or d.get("type") != "user":
+        return False
+    c = (d.get("message", {}) or {}).get("content")
+    if isinstance(c, str):
+        return True
+    if isinstance(c, list):
+        for it in c:
+            if isinstance(it, dict):
+                if it.get("type") == "tool_result" or "tool_use_id" in it:
+                    return False
+                if it.get("type") == "text" or "text" in it:
+                    return True
+        return True
+    return False
+
+
+def assistant_text(d):
+    c = (d.get("message", {}) or {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        out = ""
+        for it in c:
+            if isinstance(it, dict) and it.get("type") == "text":
+                out += it.get("text", "")
+        return out
+    return ""
+
+
+def tail_records(jsonl):
+    try:
+        with jsonl.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 1_000_000))
+            raw = f.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+    recs = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            recs.append(json.loads(line))
+        except Exception:
+            continue
+    return recs
+
+
+def process(proj):
+    cwd, transient = unit_props(proj)
+    if transient:
+        # systemd-run 으로 띄운 일회성 유닛(claude-mcp-restart-<ts> 등)은 세션이
+        # 아니다. 이름이 claude- 로 시작해 목록에는 들어오지만 transcript 가 없어
+        # 경고만 낳는다. 이름 규칙이 아니라 유닛 속성으로 거른다.
+        return
+    if not cwd:
+        warn("%s: WorkingDirectory 를 못 읽었다 — 감시 불가" % proj, key=proj)
+        return
+    jsonl = latest_jsonl(cwd)
+    if not jsonl:
+        # active 세션인데 jsonl 이 없는 건 정상 상태가 아니다. 조용히 넘기면
+        # 그 세션은 영구 사각지대가 된다 — 실제로 그렇게 놓쳤다.
+        warn("%s: transcript jsonl 을 못 찾았다(cwd=%s) — 이 세션은 감시되지 않는다"
+             % (proj, cwd), key=proj)
+        return
+    recs = tail_records(jsonl)
+    if not recs:
+        return
+
+    # 마지막 5xx 텍스트를 찾고, "그 뒤에 턴이 더 진행됐는가"로 판정한다.
+    #
+    # 예전에는 '텍스트가 있는 마지막 assistant 레코드'만 봤다. 그런데 도구를 연속으로
+    # 쓰는 동안 쌓이는 assistant 레코드는 tool_use/thinking 뿐이라 텍스트가 없어 전부
+    # 건너뛰고, 한참 전에 지나간 5xx 가 계속 현재 상태로 읽혔다(peer session_c
+    # 실측: 06:53 까지 정상 작업 중인데 06:14 의 500 을 골랐다). 그 상태에서 에러가
+    # STALE_SEC 이내였으면 멀쩡히 일하는 세션에 '계속 진행해' 를 최대 3회 밀어넣는다.
+    # 텍스트 유무가 아니라 시간 순서가 기준이어야 한다.
+    last_5xx = -1
+    for i in range(len(recs) - 1, -1, -1):
+        if recs[i].get("type") != "assistant":
+            continue
+        t = assistant_text(recs[i])
+        if t and ERROR_RE.search(t):
+            last_5xx = i
+            break
+
+    if last_5xx < 0:
+        tail_5xx = False
+        atext = ""
+        pending_after = False
+    else:
+        atext = assistant_text(recs[last_5xx])
+        # 5xx 뒤에 어떤 종류든 assistant 레코드가 있으면 그 턴은 이미 되살아났다.
+        progressed = any(recs[j].get("type") == "assistant"
+                         for j in range(last_5xx + 1, len(recs)))
+        tail_5xx = not progressed
+        pending_after = any(is_real_user(recs[j])
+                            for j in range(last_5xx + 1, len(recs)))
+
+    st = load_state(proj)
+    now = time.time()
+
+    if not tail_5xx:
+        if st.get("active") and st.get("attempts", 0) > 0 and not st.get("gave_up"):
+            tok = load_bot_token(cwd)
+            if tok:
+                notify(tok, f"[{proj}] 자동 재전송으로 복구됨 ✓")
+        clear_state(proj)
+        return
+
+    # 여기부터 tail 이 5xx
+    m = CODE_RE.search(atext)
+    code = m.group(1) if m else "5xx"
+
+    # 새 incident 시작
+    if not st.get("active"):
+        age = None
+        ats = parse_ts(recs[last_5xx])
+        if ats:
+            age = now - ats
+        # 처음 봤는데 이미 오래된 에러 → 무시(시작 시 과거에러 스팸 방지)
+        if age is not None and age > STALE_SEC:
+            save_state(proj, {"active": True, "first_seen_ts": now,
+                              "attempts": MAX_RETRIES, "last_attempt_ts": now,
+                              "gave_up": True})
+            return
+        st = {"active": True, "first_seen_ts": now, "attempts": 0,
+              "last_attempt_ts": 0.0, "gave_up": False}
+        save_state(proj, st)
+
+    if st.get("gave_up"):
+        return
+    if pending_after:
+        return  # 직전 재전송/사용자 메시지 처리 대기 중 → 중복 발송 금지
+
+    attempts = st.get("attempts", 0)
+    if attempts >= MAX_RETRIES:
+        tok = load_bot_token(cwd)
+        if tok:
+            notify(tok, f"[{proj}] API {code} — 자동 재전송 {MAX_RETRIES}회 실패. 수동 재전송 필요.")
+        st["gave_up"] = True
+        save_state(proj, st)
+        return
+
+    wait = BACKOFF[min(attempts, len(BACKOFF) - 1)]
+    ref = st["last_attempt_ts"] if attempts > 0 else st["first_seen_ts"]
+    if now - ref < wait:
+        return  # 백오프 대기 중
+
+    tok = load_bot_token(cwd)
+    username = bot_username(tok) if tok else None
+    if not username:
+        if tok:
+            notify(tok, f"[{proj}] API {code} — 봇 식별 실패, 자동 재전송 불가. 수동 필요.")
+        st["gave_up"] = True
+        save_state(proj, st)
+        return
+
+    ok, detail = do_resend(username)
+    st["attempts"] = attempts + 1
+    st["last_attempt_ts"] = now
+    save_state(proj, st)
+    if ok:
+        notify(tok, f"[{proj}] API {code} — 자동 재전송 {st['attempts']}/{MAX_RETRIES} (계속 진행해)")
+    else:
+        notify(tok, f"[{proj}] API {code} — 자동 재전송 실패({detail or '유저봇 오류'}). 수동 필요.")
+        st["gave_up"] = True
+        save_state(proj, st)
+
+
+def main():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for proj in list_services():
+        try:
+            process(proj)
+        except Exception:
+            continue
+
+
+if __name__ == "__main__":
+    main()

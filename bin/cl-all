@@ -1,0 +1,41 @@
+#!/bin/bash
+# cl-all: 이 기계의 모든 Claude Code 세션을 gnome-terminal 탭으로 한 번에 연다.
+#
+# 열 폴더 목록을 여기 적어 두지 않는다. 세션 유닛의 WorkingDirectory 가 정본이라,
+# 세션을 더하거나 지워도 이 파일은 그대로 맞는다. 보조·워치독 유닛이 섞이지 않게
+# ExecStart 가 claude-service-exec 인 것만 세션 유닛으로 본다 — cl 의 각인 판정과
+# 같은 기준이다.
+set -u
+
+unit_list=$(systemctl --user list-unit-files 'claude-*.service' \
+            --no-pager --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -v '@')
+
+DIRS=()
+if [ -n "$unit_list" ]; then
+  wd=""; is_sess=0
+  while IFS= read -r line; do
+    case "$line" in
+      WorkingDirectory=*) wd="${line#WorkingDirectory=}" ;;
+      ExecStart=*claude-service-exec*) is_sess=1 ;;
+      "")
+        if [ "$is_sess" = 1 ] && [ -n "$wd" ] && [ -d "$wd" ]; then
+          DIRS+=("$wd")
+        fi
+        wd=""; is_sess=0 ;;
+    esac
+  done <<< "$(systemctl --user show $unit_list -p WorkingDirectory -p ExecStart 2>/dev/null; echo)"
+fi
+
+if [ "${#DIRS[@]}" -eq 0 ]; then
+  echo "[cl-all] 세션 유닛이 없다. install.sh 를 돌렸는지, machines/<이름>.list 에" >&2
+  echo "         세션 이름이 적혀 있는지 본다." >&2
+  exit 1
+fi
+
+CMD="gnome-terminal"
+for dir in "${DIRS[@]}"; do
+  name=$(basename "$dir")
+  CMD="$CMD --tab --title=\"$name\" --working-directory=\"$dir\" -- bash -c 'source ~/.bashrc; cl; exec bash'"
+done
+
+eval "$CMD"

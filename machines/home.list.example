@@ -1,0 +1,12 @@
+# 이 기계가 자동으로 켤 세션 목록. 한 줄에 세션 이름 하나다.
+# 세션 하나가 systemd 유닛 claude-<이름>.service 하나에 대응한다.
+#
+# 쓰는 법
+#   1. 이 파일을 <기계이름>.list 로 복사한다. 예: cp home.list.example home.list
+#   2. ~/.config/claude-machine-id 에 그 기계 이름을 적는다. 예: echo home > ~/.config/claude-machine-id
+#   3. 세션마다 systemd/user/claude-<이름>.service 를 만든다(claude-dotfiles.service 가 본보기다).
+#   4. install.sh 를 돌린다.
+#
+# 여기 적혀 있어도 그 세션 작업 디렉토리에 .claude/telegram/.env 가 없으면 건너뛴다.
+# 같은 봇 토큰을 두 기계가 함께 쓰면 메시지를 한쪽만 받으므로, 세션마다 다른 봇을 쓴다.
+dotfiles

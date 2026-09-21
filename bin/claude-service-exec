@@ -1,0 +1,105 @@
+#!/bin/bash
+# claude-service-exec: systemd ExecStart에서 호출. 현재 디렉토리의 jsonl 존재 여부로
+# claude -c (resume) vs claude (fresh) 자동 선택.
+
+set -uo pipefail
+
+# 같은 cwd 의 다른 claude --remote-control 세션/폴러 정리 (텔레그램 봇 getUpdates 409 방지).
+# cl 함수는 이 정리를 하지만 systemd 경로엔 없어서, cl→exit→systemd 전환 시 새 세션의
+# 텔레그램 플러그인이 이전 세션의 살아있는 롱폴과 충돌(409)해 죽고 안 붙던 문제 해결. (2026-06-17)
+_cwd_now="$(pwd)"
+for _p in $(pgrep -f "claude.*--remote-control" 2>/dev/null); do
+    [ "$_p" = "$$" ] && continue
+    if [ "$(readlink "/proc/$_p/cwd" 2>/dev/null)" = "$_cwd_now" ]; then
+        kill -TERM "$_p" 2>/dev/null || true
+    fi
+done
+sleep 2
+for _p in $(pgrep -f "claude.*--remote-control" 2>/dev/null); do
+    [ "$_p" = "$$" ] && continue
+    if [ "$(readlink "/proc/$_p/cwd" 2>/dev/null)" = "$_cwd_now" ]; then
+        kill -KILL "$_p" 2>/dev/null || true
+    fi
+done
+
+# 프로젝트 키 생성: cwd의 / 와 _ 를 - 로 변환 (Claude Code 디렉토리 명명 규칙과 일치)
+proj_key=$(pwd | sed -e 's|/|-|g' -e 's|_|-|g')
+proj_dir="$HOME/.claude/projects/${proj_key}"
+
+# jsonl 존재 여부 확인
+has_jsonl=0
+if ls "$proj_dir"/*.jsonl > /dev/null 2>&1; then
+    has_jsonl=1
+fi
+
+# 모델 강제 핀 (옵트인): 유닛 Environment 에 CLAUDE_MODEL 있으면 --model 로 전달.
+# 구독(OAuth) 경로에선 settings model / ANTHROPIC_MODEL env 가 안 먹는 케이스 확인돼 CLI 플래그가 유일 확실. (2026-06-10)
+model_arg=""
+if [ -n "${CLAUDE_MODEL:-}" ]; then
+    model_arg=" --model ${CLAUDE_MODEL}"
+fi
+
+# 세션별 모델/effort 설정 (~/.config/claude-models.json, 컨트롤봇 Model 메뉴가 기록).
+# { "<proj_key>": {"model": "...", "effort": "low|medium|high"} }
+# 우선순위: CLAUDE_MODEL env(유닛 명시 핀) > json. 설정 없거나 값 불량이면 기존 동작 그대로.
+MODELS_JSON="$HOME/.config/claude-models.json"
+if [ -f "$MODELS_JSON" ]; then
+    cfg=$(python3 - "$proj_key" "$MODELS_JSON" <<'PYEOF' 2>/dev/null
+import json, re, sys
+key, path = sys.argv[1], sys.argv[2]
+try:
+    entry = json.load(open(path)).get(key) or {}
+except Exception:
+    entry = {}
+model = entry.get("model") or ""
+effort = entry.get("effort") or ""
+if effort == "mid":
+    effort = "medium"
+if not re.fullmatch(r"[A-Za-z0-9._-]+", model or "x"):
+    model = ""
+if effort not in ("low", "medium", "high", "xhigh", "max"):
+    effort = ""
+print(f"{model}\t{effort}")
+PYEOF
+)
+    json_model="${cfg%%$'\t'*}"
+    json_effort="${cfg#*$'\t'}"
+    if [ -z "$model_arg" ] && [ -n "$json_model" ]; then
+        model_arg=" --model ${json_model}"
+    fi
+    if [ -n "$json_effort" ]; then
+        model_arg="${model_arg} --effort ${json_effort}"
+    fi
+fi
+
+# 부팅 직후 네트워크 미준비 상태에서 telegram bun MCP 가 첫 getMe/getUpdates 에 실패해
+# 죽고 안 붙는 문제 완화 (2026-07-20 ai-debate run-20260720T013145Z, D안 완화형).
+# systemctl --user 스코프엔 network-online.target 이 없어 유닛 After/Wants 는 no-op →
+# 도달성을 직접 소프트 프로브한다. 최대 CLAUDE_NET_WAIT_MAX(기본 90)초까지 대기하되
+# 실패해도 세션은 기동(텔레그램 API 장애를 세션 전체 장애로 확대하지 않음).
+# curl 은 -f 금지: api.telegram.org 루트는 404 를 반환하므로 HTTP 상태 무관,
+# 응답 수신(exit 0)=연결성공으로 판정. canary: 유닛 Environment CLAUDE_NET_WAIT=1 로 옵트인.
+if [ "${CLAUDE_NET_WAIT:-0}" = "1" ]; then
+    sleep $(( RANDOM % 5 ))   # 동시 부팅 stampede 완화용 소량 지터
+    _nw_max="${CLAUDE_NET_WAIT_MAX:-90}"
+    _nw_start=$(date +%s)
+    _nw_ok=0
+    while [ $(( $(date +%s) - _nw_start )) -lt "$_nw_max" ]; do
+        if curl -s --connect-timeout 3 --max-time 5 -o /dev/null https://api.telegram.org; then
+            _nw_ok=1; break
+        fi
+        sleep 2
+    done
+    if [ "$_nw_ok" = "1" ]; then
+        echo "[net-wait] api.telegram.org reachable after $(( $(date +%s) - _nw_start ))s" >&2
+    else
+        echo "[net-wait] WARN: api.telegram.org unreachable after ${_nw_max}s, proceeding anyway" >&2
+    fi
+fi
+
+# exec script with pty (claude --remote-control requires tty)
+if [ "$has_jsonl" = "1" ]; then
+    exec script -q -c "claude -c${model_arg} --remote-control --channels plugin:telegram@claude-plugins-official" /dev/null < /dev/null
+else
+    exec script -q -c "claude${model_arg} --remote-control --channels plugin:telegram@claude-plugins-official" /dev/null < /dev/null
+fi

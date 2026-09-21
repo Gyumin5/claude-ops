@@ -1,0 +1,13 @@
+[Unit]
+Description=bun (telegram MCP) 누락 세션 자동 복구 (부팅 후 + 주기)
+
+[Timer]
+# 부팅 후 240초 첫 실행(세션이 grace 180s 를 넘긴 시점이라 boot race 실패를 잡음).
+# 이후 300초 주기로 반복 → 부팅 외 시점의 bun crash/누락도 자동 복구.
+# grace/cooldown 가드는 스크립트 안에 있어 기동 중 세션 오재시작·churn 방지.
+OnBootSec=240s
+OnUnitActiveSec=300s
+Unit=claude-bun-ensure.service
+
+[Install]
+WantedBy=timers.target

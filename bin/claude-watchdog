@@ -1,0 +1,57 @@
+#!/bin/bash
+# claude-watchdog: claude-*.service 건강 감시. 매 1분 실행 (systemd timer).
+# 처리: failed 복구 / 한도 패턴 감지 / jsonl 무응답 감지.
+# 순수 bash — claude 의존성 없음.
+
+set -uo pipefail
+
+LOG_DIR="$HOME/.claude/logs"
+STATE_DIR="$HOME/.claude/state/watchdog"
+mkdir -p "$STATE_DIR"
+
+# backoff 설정 (jsonl stuck 재시작 간격: 15min → 1h → 포기)
+BACKOFF_MIN=(0 15 60)
+
+log() {
+    echo "[$(date -Iseconds)] $1" >> "$LOG_DIR/watchdog.log"
+}
+
+telegram_alert() {
+    local text="$1"
+    # dotfiles 봇으로 운영자에게 알림
+    local env="$HOME/dotfiles/.claude/telegram/.env"
+    [ ! -f "$env" ] && return 0
+    # shellcheck disable=SC1090
+    . "$env"
+    local tok="${TELEGRAM_BOT_TOKEN:-${BOT_TOKEN:-}}"
+    [ -z "$tok" ] && return 0
+    curl -s -m 5 -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+        --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+        --data-urlencode "text=${text}" > /dev/null 2>&1 || true
+}
+
+# === 1. enabled claude-*.service 순회 ===
+for unit in $(systemctl --user list-unit-files 'claude-*.service' --state=enabled --no-legend 2>/dev/null | awk '{print $1}'); do
+    [[ "$unit" == "claude-watchdog.service" ]] && continue
+
+    state=$(systemctl --user is-active "$unit" 2>/dev/null)
+
+    # --- 1a. failed → reset + start ---
+    if [ "$state" = "failed" ]; then
+        log "$unit failed → reset + start"
+        systemctl --user reset-failed "$unit"
+        systemctl --user start "$unit"
+        continue
+    fi
+
+    # --- 1b. inactive는 건드리지 않음 (사용자 의도 stop 존중) ---
+    [ "$state" != "active" ] && continue
+
+    # --- 2. 한도 패턴 자동 복구 비활성화 (false positive 빈번) ---
+    # --- 3. jsonl 무응답 자동 복구 비활성화 (idle 세션과 구분 불가, false positive 잦음) ---
+    # 멈춘 세션은 사용자가 claude-sessions restart <name> 수동 복구.
+done
+
+# 루프 마지막 명령이 false 테스트([ != active ])면 종료코드가 1로 새어 systemd가
+# 매분 service를 failed로 표시함. 작업은 정상 수행됐으므로 명시적 성공 종료.
+exit 0

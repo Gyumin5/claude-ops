@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""
+claude-ctx-metrics: 최근 세션 jsonl을 훑어 tool_result 크기 분포/압축 효율 계측.
+Context Mode 같은 도입 결정에 근거 되는 객관 데이터 생성.
+
+Usage:
+  claude-ctx-metrics                    # 최근 7일 전체 세션
+  claude-ctx-metrics --days 3           # 최근 3일
+  claude-ctx-metrics --project session-p     # 특정 프로젝트만
+  claude-ctx-metrics --threshold 5000   # 임계 토큰 (char 기준 기본 20000)
+"""
+import json
+import os
+import sys
+import time
+import argparse
+from pathlib import Path
+from collections import defaultdict
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+# 프로젝트 키는 작업 디렉토리 절대경로의 슬래시를 하이픈으로 바꾼 것이다.
+# 홈 부분은 어느 줄에나 같이 붙으므로 표에서는 떼고 보여 준다.
+HOME_KEY = str(Path.home()).replace("/", "-") + "-"
+
+
+def iter_jsonl(path):
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    yield json.loads(line)
+                except Exception:
+                    continue
+    except Exception:
+        return
+
+
+def extract_tool_events(entry):
+    """assistant의 tool_use와 user(tool_result) 이벤트 추출"""
+    msg = entry.get("message", {})
+    role = msg.get("role", "")
+    ts = entry.get("timestamp", "")
+    content = msg.get("content", [])
+
+    if not isinstance(content, list):
+        return []
+
+    events = []
+    for c in content:
+        if not isinstance(c, dict):
+            continue
+        if role == "assistant" and c.get("type") == "tool_use":
+            name = c.get("name", "")
+            events.append(("tool_use", ts, name, c.get("id", ""), 0))
+        elif role == "user" and c.get("type") == "tool_result":
+            result = c.get("content", "")
+            size = 0
+            if isinstance(result, str):
+                size = len(result)
+            elif isinstance(result, list):
+                for r in result:
+                    if isinstance(r, dict) and r.get("type") == "text":
+                        size += len(r.get("text", ""))
+            events.append(("tool_result", ts, "", c.get("tool_use_id", ""), size))
+    return events
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--days", type=int, default=7)
+    p.add_argument("--project", type=str, default="")
+    p.add_argument("--threshold", type=int, default=20000,
+                   help="char threshold for 'large result' flag")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    cutoff_epoch = time.time() - args.days * 86400
+
+    per_tool = defaultdict(lambda: {"count": 0, "total_chars": 0, "max_chars": 0, "large_cnt": 0})
+    total_events = 0
+    project_sizes = defaultdict(int)
+
+    for proj_dir in PROJECTS_DIR.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        proj_name = proj_dir.name
+        if args.project and args.project not in proj_name:
+            continue
+
+        for jsonl in proj_dir.glob("*.jsonl"):
+            if jsonl.stat().st_mtime < cutoff_epoch:
+                continue
+
+            pending_uses = {}
+            for entry in iter_jsonl(jsonl):
+                for event in extract_tool_events(entry):
+                    kind, ts, name, tid, size = event
+                    if kind == "tool_use":
+                        pending_uses[tid] = name
+                    elif kind == "tool_result":
+                        tool_name = pending_uses.pop(tid, "?")
+                        total_events += 1
+                        per_tool[tool_name]["count"] += 1
+                        per_tool[tool_name]["total_chars"] += size
+                        if size > per_tool[tool_name]["max_chars"]:
+                            per_tool[tool_name]["max_chars"] = size
+                        if size >= args.threshold:
+                            per_tool[tool_name]["large_cnt"] += 1
+                            project_sizes[proj_name] += 1
+
+    # 정렬: large_cnt 내림차순
+    rows = [(name, d) for name, d in per_tool.items()]
+    rows.sort(key=lambda x: (-x[1]["large_cnt"], -x[1]["total_chars"]))
+
+    print(f"=== tool_result 크기 분석 (최근 {args.days}일, threshold={args.threshold} chars) ===")
+    print(f"전체 tool_result 수: {total_events}")
+    print()
+    print(f"{'tool':40s} {'count':>7s} {'avg':>8s} {'max':>9s} {'large':>7s}  large%")
+    print("-" * 86)
+    for name, d in rows[:25]:
+        if d["count"] == 0:
+            continue
+        avg = d["total_chars"] / d["count"]
+        pct = d["large_cnt"] * 100 / d["count"]
+        print(f"{name[:40]:40s} {d['count']:>7d} {avg:>8.0f} {d['max_chars']:>9d} {d['large_cnt']:>7d}  {pct:>5.1f}%")
+
+    print()
+    print(f"=== 프로젝트별 large result 건수 (threshold 넘음) ===")
+    for proj, cnt in sorted(project_sizes.items(), key=lambda x: -x[1])[:15]:
+        short = proj.replace(HOME_KEY, "")
+        print(f"  {short:40s} {cnt}건")
+
+
+if __name__ == "__main__":
+    main()

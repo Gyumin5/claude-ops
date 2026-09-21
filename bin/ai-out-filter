@@ -1,0 +1,30 @@
+#!/bin/bash
+# ai-out-filter: stdin을 받아서 길면 파일로 저장, 요약+경로 출력.
+# Usage: some-command | ai-out-filter <tool-name>
+# Env: AI_OUT_DIR (default: ~/.claude/ai-out), AI_OUT_THRESHOLD_LINES (default: 60), AI_OUT_HEAD_LINES (default: 40)
+
+set -uo pipefail
+
+TOOL="${1:-ai}"
+OUT_DIR="${AI_OUT_DIR:-$HOME/.claude/ai-out}"
+THRESHOLD="${AI_OUT_THRESHOLD_LINES:-60}"
+HEAD_N="${AI_OUT_HEAD_LINES:-40}"
+
+mkdir -p "$OUT_DIR"
+TS=$(date +%Y%m%d-%H%M%S)
+FILE="$OUT_DIR/${TS}-${TOOL}.md"
+
+# tee to file and count lines
+tee "$FILE" | awk -v n="$HEAD_N" -v th="$THRESHOLD" -v f="$FILE" '
+  { buf[NR]=$0 }
+  END {
+    if (NR <= th) {
+      for (i=1; i<=NR; i++) print buf[i]
+    } else {
+      print "[ai-out] full response saved: " f " (" NR " lines)"
+      print "[ai-out] --- first " n " lines ---"
+      for (i=1; i<=n; i++) print buf[i]
+      print "[ai-out] --- " (NR-n) " more lines in file ---"
+    }
+  }
+'

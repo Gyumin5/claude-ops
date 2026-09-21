@@ -1,0 +1,258 @@
+#!/bin/bash
+# claude-soft-restart: restart-soft 오케스트레이터 (P2a 단일 + P2b 로컬 브로드캐스트).
+#
+# 하드 재시작(systemctl restart = 즉시 강제)과 달리, 세션 봇에 서명된 트리거를 보내
+# 세션이 "턴 경계(현재 작업 끝난 안전지점)"에서 스스로 재시작하게 한다.
+#   - 전달: 기존 유저봇 레일(claude-userbot-send). 트리거=telegram 메시지.
+#   - 수신: soft-restart-guard.sh(UserPromptSubmit 훅)가 검증 후 systemd-run 자가 재시작.
+#   - 관측: job registry(.job/.ack) + systemd InvocationID 폴링으로 실제 재시작 확인.
+#   - 인증: per-machine secret HMAC 서명 + 1회용 job_id + TTL 로 오타/주입/replay 차단.
+#
+# 사용법:
+#   claude-soft-restart <name> [--dry-run] [--timeout SEC]
+#   claude-soft-restart --all   [--dry-run] [--timeout SEC] [--stagger SEC]
+# 주의: 로컬(같은 머신) 세션만. cross-host(peer) relay 는 P2b-2(미구현, graceful 스킵).
+#
+# 구조적 한계 — 이 레일은 대상이 "턴 경계"에 있을 때만 동작한다. 텔레그램 메시지가 턴
+# 진행중에 도착하면 fresh prompt 가 아니라 현재 턴에 주입되고, 그러면 UserPromptSubmit
+# 훅 자체가 안 돈다(가드가 거부한 게 아니라 실행이 안 된 것이라 사유 로그도 안 남는다).
+# 따라서 사용자와 대화중인 바쁜 세션은 못 잡는다. 미확인이 나오면 하드 재시작으로
+# 올라가지 말고 대상이 유휴가 된 뒤 재시도할 것.
+#
+# self-trigger 는 실패하지 않는다 — 단 트리거를 보낸 뒤 그 턴을 즉시 끝내야 한다.
+# 그래야 메시지가 도착할 때 자기가 유휴다. 같은 턴 안에서 결과를 기다리면 영원히 안 온다
+# (그래서 자기 세션이면 폴링을 생략하고 다음 턴에 훅이 소비하게 둔다).
+# 2026-06 큐 flush 자가 테스트가 이 함정에 걸렸던 것이고, 2026-08-03 스윕에서는 home·peer
+# 양쪽 dotfiles 가 자기 자신을 정상 재시작했다.
+# (session-g 는 대화중이라 3회 전부 enqueue→remove, dequeue 없음 — 유휴가 된 뒤 재시도로 붙었다.)
+set -uo pipefail
+
+SECRET_FILE="$HOME/.claude/userbot/soft-restart.secret"
+JOB_DIR="$HOME/.claude/state/soft-restart"
+USERBOT_SEND="$HOME/.local/bin/claude-userbot-send"
+USERBOT_SESSION="$HOME/.claude/userbot/userbot.session"
+RELAY_CONF="$HOME/.claude/userbot/relay.conf"
+FALLBACK_ENV="$HOME/dotfiles/.claude/telegram/.env"
+TTL=120
+TIMEOUT_DEFAULT=90
+STAGGER_DEFAULT=3
+
+name=""; do_all=0; do_rotate=0; dry=0; timeout=""; stagger="$STAGGER_DEFAULT"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --all)        do_all=1 ;;
+        --rotate)     do_rotate=1 ;;
+        --dry-run|-n) dry=1 ;;
+        --timeout)    shift; timeout="${1:-}" ;;
+        --stagger)    shift; stagger="${1:-$STAGGER_DEFAULT}" ;;
+        -*)           echo "unknown flag: $1" >&2; exit 2 ;;
+        *)            name="$1" ;;
+    esac
+    shift
+done
+if [ "$do_all" = 0 ] && [ -z "$name" ]; then
+    echo "usage: claude-soft-restart <name>|--all [--rotate] [--dry-run] [--timeout SEC] [--stagger SEC]" >&2
+    exit 2
+fi
+if [ "$do_all" = 1 ] && [ "$do_rotate" = 1 ]; then
+    echo "--all 과 --rotate 동시 불가(rotate-all 은 전세션 맥락 폐기 위험)" >&2; exit 2
+fi
+# 액션: soft-restart(맥락유지 프로세스 재시작, 훅 결정적) vs soft-rotate(모델이 handoff 작성 후 새 세션 교체).
+ACTION="soft-restart"; [ "$do_rotate" = 1 ] && ACTION="soft-rotate"
+if [ -z "$timeout" ]; then timeout="$TIMEOUT_DEFAULT"; [ "$do_rotate" = 1 ] && timeout=180; fi
+# rotate 는 세션이 턴 경계에서만 소비할 수 있어 TTL 이 짧으면 바쁜 세션이 못 받는다.
+# 훅(soft-restart-guard.sh)의 ROTATE_TTL 과 같은 값을 유지해야 한다 — 어긋나면 job
+# 기록의 ttl 이 실제 판정과 달라져 사후 분석이 틀린다.
+[ "$do_rotate" = 1 ] && TTL=900
+
+# ---- 공통 헬퍼 ----
+session_wd() { local wd; wd=$(systemctl --user show "claude-${1}.service" -p WorkingDirectory --value 2>/dev/null); echo "${wd#!}"; }
+is_real() { local wd; wd=$(session_wd "$1"); [ -n "$wd" ] && [ "$wd" != "$HOME" ] && [ -d "$wd" ]; }
+list_real_sessions() {
+    systemctl --user list-unit-files 'claude-*.service' --state=enabled --no-legend 2>/dev/null \
+        | awk '{print $1}' | while read -r u; do
+            local n="${u#claude-}"; n="${n%.service}"
+            is_real "$n" && echo "$n"
+        done
+}
+ensure_secret() {
+    mkdir -p "$JOB_DIR" "$(dirname "$SECRET_FILE")" 2>/dev/null
+    if [ ! -s "$SECRET_FILE" ]; then
+        ( umask 077; head -c 32 /dev/urandom | base64 | tr -d '\n' > "$SECRET_FILE" ); chmod 600 "$SECRET_FILE" 2>/dev/null
+    fi
+}
+hmac() { python3 -c 'import hmac,hashlib,sys
+print(hmac.new(open(sys.argv[1]).read().strip().encode(), sys.argv[2].encode(), hashlib.sha256).hexdigest())' "$SECRET_FILE" "$1"; }
+resolve_botuser() {
+    local env_file="$1"; [ -f "$env_file" ] || return 1
+    ( . "$env_file"; [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || exit 1
+      curl -s --max-time 8 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" \
+      | python3 -c 'import json,sys
+try: print("@"+json.load(sys.stdin)["result"]["username"])
+except: sys.exit(1)' ) 2>/dev/null
+}
+
+# 트리거 발송: 로컬 유저봇(세션 있으면) 또는 relay(peer 등 유저봇 없는 PC → home 에 ssh 위임).
+# rate-limit-recovery trigger_flush 와 동일 패턴. 서명은 이 머신에서 로컬로 끝났고 여기선 전달만
+# 하므로 relay 대상(home)은 secret 몰라도 됨(머신 간 secret 조율 불필요).
+send_via_userbot() {
+    local botuser="$1" text="$2"
+    if [ -x "$USERBOT_SEND" ] && [ -f "$USERBOT_SESSION" ]; then
+        "$USERBOT_SEND" --no-origin --delete-after 8 "$botuser" "$text" >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    if [ -f "$RELAY_CONF" ]; then
+        # shellcheck disable=SC1090
+        . "$RELAY_CONF"
+        if [ -n "${USERBOT_HOST:-}" ]; then
+            ssh -o BatchMode=yes -o ConnectTimeout=20 "$USERBOT_HOST" \
+                "~/.local/bin/claude-userbot-send --no-origin --delete-after 8 '${botuser}' '${text}'" >/dev/null 2>&1 && return 0
+        fi
+    fi
+    return 1
+}
+
+machine=$(cat "$HOME/.config/claude-machine-id" 2>/dev/null || echo "?")
+
+# 트리거 발송(관측 없음). 전역 배열 SENT_JOB[name], SENT_PRE[name] 채움. 성공 0.
+declare -A SENT_JOB SENT_PRE
+send_trigger() {
+    local n="$1" wd svc env_file botuser now rand job_id sig pre_inv job_file trigger_text
+    svc="claude-${n}.service"; wd=$(session_wd "$n")
+    env_file="${wd}/.claude/telegram/.env"; [ -f "$env_file" ] || env_file="$FALLBACK_ENV"
+    botuser=$(resolve_botuser "$env_file")
+    if [ -z "$botuser" ]; then echo "  [$n] 봇 해석 실패(env=$env_file) — 스킵" >&2; return 1; fi
+    now=$(date +%s); rand=$(head -c 6 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 8)
+    job_id="${now}-${rand}"; sig=$(hmac "${ACTION}|${job_id}|${n}")
+    pre_inv=$(systemctl --user show "$svc" -p InvocationID --value 2>/dev/null)
+    job_file="$JOB_DIR/${job_id}.job"
+    python3 -c 'import json,sys
+open(sys.argv[8],"w").write(json.dumps(dict(job_id=sys.argv[1],host=sys.argv[2],target=sys.argv[3],
+ botuser=sys.argv[4],sent_at=int(sys.argv[5]),pre_invocation=sys.argv[6],ttl=int(sys.argv[7]),state="sent"),ensure_ascii=False))' \
+        "$job_id" "$machine" "$n" "$botuser" "$now" "$pre_inv" "$TTL" "$job_file"
+    trigger_text="trigger:${ACTION} ${job_id} ${n} ${sig}"
+    if send_via_userbot "$botuser" "$trigger_text"; then
+        SENT_JOB["$n"]="$job_id"; SENT_PRE["$n"]="$pre_inv"
+        echo "  [$n] 트리거 발송(job=$job_id, bot=$botuser)"
+        return 0
+    fi
+    echo "  [$n] 유저봇 발송 실패" >&2; return 1
+}
+
+# 단일 세션: 발송 + 폴링 + 리포트. rc 0=재시작확인.
+soft_restart_one() {
+    local n="$1"
+    if ! is_real "$n"; then echo "[soft-restart] 거부: '$n' 은 세션 아님(유틸/미존재)" >&2; return 1; fi
+    local svc="claude-${n}.service" wd env_file botuser pre_inv
+    if [ "$dry" = 1 ]; then
+        wd=$(session_wd "$n"); env_file="${wd}/.claude/telegram/.env"; [ -f "$env_file" ] || env_file="$FALLBACK_ENV"
+        botuser=$(resolve_botuser "$env_file"); pre_inv=$(systemctl --user show "$svc" -p InvocationID --value 2>/dev/null)
+        echo "[soft-restart --dry-run] machine=$machine 세션=$n cwd=$wd 봇=${botuser:-<실패>} pre_inv=${pre_inv:-none} TTL=${TTL}s → 발송 안 함"
+        return 0
+    fi
+    send_trigger "$n" || return 1
+    local job_id="${SENT_JOB[$n]}" pre="${SENT_PRE[$n]}" ack_file waited acked cur
+    ack_file="$JOB_DIR/${job_id}.ack"; waited=0; acked=0
+
+    # 자기 자신을 대상으로 보낸 경우 폴링은 구조적으로 불가능하다: 트리거를 소비하는
+    # 훅은 그 세션의 다음 턴 경계에서 도는데, 그 세션은 지금 이 명령을 기다리며 턴을
+    # 점유하고 있다. 기다리면 100% 타임아웃 → 거짓 실패 알림까지 나간다. 그래서
+    # 발송만 확인하고 빠진다(2026-07-30). 결과는 다음 턴에 ack 파일로 확인.
+    if [ -n "${CLAUDE_SESSION_NAME:-}" ] && [ "$CLAUDE_SESSION_NAME" = "$n" ]; then
+        echo "[${ACTION}] 📨 $n(자기 세션) 트리거 발송 완료 — 폴링 생략."
+        echo "  다음 턴에 훅이 소비한다. 수신 확인: $ack_file"
+        return 0
+    fi
+
+    # rotate 는 완료까지 세션이 handoff·progress·history 를 쓰는 다단계 작업이라
+    # 시간이 걸린다. 그래서 "수신(ack)" 을 1차 성공으로 보고, 그 뒤 남은 시간 동안
+    # 실제 교체(InvocationID 변경)까지 잡히면 그걸 함께 보고한다.
+    if [ "$do_rotate" = 1 ]; then
+        while [ "$waited" -lt "$timeout" ]; do
+            sleep 3; waited=$((waited+3))
+            [ -f "$ack_file" ] && { acked=1; break; }
+        done
+        if [ "$acked" = 0 ]; then
+            echo "[soft-rotate] ⚠ $n 수신 확인 없음(${timeout}s) — 세션이 긴 작업 중이면 TTL(15분) 안에 늦게 받을 수 있다. $ack_file 로 확인." >&2
+            return 3
+        fi
+        echo "[soft-rotate] ✅ $n 수신·검증 확인(ack, ${waited}s) — 세션이 handoff 작성 후 스스로 rotate."
+        while [ "$waited" -lt "$timeout" ]; do
+            sleep 3; waited=$((waited+3))
+            cur=$(systemctl --user show "$svc" -p InvocationID --value 2>/dev/null)
+            if [ -n "$cur" ] && [ "$cur" != "$pre" ]; then
+                echo "[soft-rotate] ✅ $n 교체 확인(InvocationID 변경, ${waited}s)"; return 0
+            fi
+        done
+        echo "[soft-rotate] $n 교체는 아직 미확인(${timeout}s) — 세션이 저장 중일 수 있다. 확인: systemctl --user show claude-${n}.service -p InvocationID --value"
+        return 0
+    fi
+    while [ "$waited" -lt "$timeout" ]; do
+        sleep 3; waited=$((waited+3))
+        [ -f "$ack_file" ] && acked=1
+        cur=$(systemctl --user show "$svc" -p InvocationID --value 2>/dev/null)
+        if [ -n "$cur" ] && [ "$cur" != "$pre" ]; then
+            echo "[soft-restart] ✅ $n 재시작 확인(InvocationID 변경, ack=$acked, ${waited}s)"; return 0
+        fi
+    done
+    echo "[soft-restart] ⚠ $n 무응답(${timeout}s, ack=$acked) — 가장 흔한 원인은 hang 이 아니라 '대상이 턴 중'이다." >&2
+    echo "  텔레그램 메시지가 턴 진행중에 도착하면 UserPromptSubmit 훅이 안 돈다(현재 턴에 주입될 뿐) → 가드가 아예 실행되지 않는다." >&2
+    echo "  거부가 아니라 미실행이라 로그에도 사유가 안 남는다. 큐가 enqueue→remove 이고 dequeue 가 없으면 이 경우다." >&2
+    echo "  대응: 하드 재시작 말고 대상이 유휴가 된 뒤 재시도. 하드 폴백이 정말 필요하면: claude-sessions restart $n" >&2
+    # stderr 는 대화형으로 지켜보는 사람만 봄 — 무인/백그라운드 실행이면 그냥 조용히 묻힘.
+    # 설계상 "소프트 타임아웃=보류+알림"이었는데 알림이 빠져있었음(2026-07-06 사용자 지적).
+    # 실패를 사용자가 확실히 알 수 있게 텔레그램으로 직접 push.
+    wd=$(session_wd "$n"); env_file="${wd}/.claude/telegram/.env"; [ -f "$env_file" ] || env_file="$FALLBACK_ENV"
+    (
+        # shellcheck disable=SC1090
+        . "$env_file" 2>/dev/null
+        [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || exit 0
+        curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+            --data-urlencode "text=⚠ 소프트재시작 미확인 — ${n}(${timeout}초, ack=${acked}). 대개 hang 이 아니라 대상이 턴 중이라 훅이 안 돈 것이다(턴 진행중 도착 메시지는 UserPromptSubmit 을 발동시키지 않는다). 유휴가 되면 재시도하면 붙는다. 그래도 안 되면: cs restart ${n} --hard" \
+            >/dev/null 2>&1
+    )
+    return 3
+}
+
+ensure_secret
+
+if [ "$do_all" = 0 ]; then
+    soft_restart_one "$name"; exit $?
+fi
+
+# ---- 브로드캐스트(--all): stagger 발송 → 일괄 폴링 → 집계 ----
+sessions=$(list_real_sessions)
+if [ -z "$sessions" ]; then echo "[soft-restart --all] 대상 세션 없음"; exit 0; fi
+echo "[soft-restart --all] machine=$machine 대상: $(echo $sessions | tr '\n' ' ')(stagger ${stagger}s, timeout ${timeout}s)"
+if [ "$dry" = 1 ]; then
+    for n in $sessions; do soft_restart_one "$n"; done
+    exit 0
+fi
+# 발송(stagger)
+order=()
+for n in $sessions; do
+    send_trigger "$n" && order+=("$n")
+    sleep "$stagger"
+done
+if [ "${#order[@]}" = 0 ]; then echo "[soft-restart --all] 발송 성공 세션 없음" >&2; exit 1; fi
+# 일괄 폴링 (done_count 로 진행 카운트 — 빈 연관배열 ${#DONE[@]} 의 set -u 트랩 회피)
+declare -A DONE
+done_count=0
+deadline=$(( $(date +%s) + timeout ))
+while [ "$(date +%s)" -lt "$deadline" ] && [ "$done_count" -lt "${#order[@]}" ]; do
+    for n in "${order[@]}"; do
+        [ -n "${DONE[$n]:-}" ] && continue
+        cur=$(systemctl --user show "claude-${n}.service" -p InvocationID --value 2>/dev/null)
+        if [ -n "$cur" ] && [ "$cur" != "${SENT_PRE[$n]:-}" ]; then DONE["$n"]=1; done_count=$((done_count+1)); fi
+    done
+    sleep 3
+done
+# 집계
+ok_n=0; fail_list=""
+echo "[soft-restart --all] 결과:"
+for n in "${order[@]}"; do
+    if [ -n "${DONE[$n]:-}" ]; then echo "  ✅ $n"; ok_n=$((ok_n+1)); else echo "  ⚠ $n (미확인)"; fail_list="$fail_list $n"; fi
+done
+echo "[soft-restart --all] ${ok_n}/${#order[@]} 재시작 확인.${fail_list:+ 미확인:$fail_list (하드 폴백 고려)}"
+[ -z "$fail_list" ]

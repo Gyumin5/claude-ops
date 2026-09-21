@@ -1,0 +1,10 @@
+[Unit]
+Description=Claude Session Healthcheck Timer (15분마다)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

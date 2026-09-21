@@ -1,0 +1,76 @@
+#!/bin/bash
+# claude-rotate-archive: jsonl/log 보존 상한 + 로테이션.
+# - jsonl: 7일 이상 안 쓴 파일은 gzip (-c 모드는 latest jsonl만 사용하므로 archive 안전).
+# - logs:  100MB 초과 시 .1로 회전 + truncate. 7일 이상된 .1은 gzip.
+#
+# 크론 (예): 0 4 * * * $HOME/.local/bin/claude-rotate-archive
+#
+# 토큰/디스크 절약 1순위: 누적 jsonl이 ctx 팽창 + 검색 노이즈.
+
+set -uo pipefail
+
+PROJECTS=~/.claude/projects
+LOGS=~/.claude/logs
+LOG_FILE=~/.claude/logs/rotate-archive.log
+
+ts() { date -Iseconds; }
+log() { echo "[$(ts)] $1" >> "$LOG_FILE"; }
+
+mkdir -p "$LOGS"
+
+# 1) jsonl 압축: 각 프로젝트 디렉토리에서 가장 최근 파일은 보존, 나머지는 7일 이상이면 gzip.
+JSONL_OLD_DAYS=7
+gz_count=0
+for proj_dir in "$PROJECTS"/*/; do
+    [ -d "$proj_dir" ] || continue
+    # latest jsonl (mtime 기준)
+    latest=$(ls -t "$proj_dir"*.jsonl 2>/dev/null | head -1)
+    [ -z "$latest" ] && continue
+    # latest 외의 jsonl 중 N일 이상 오래된 것 gzip
+    while IFS= read -r -d '' f; do
+        [ "$f" = "$latest" ] && continue
+        gzip -9 "$f" 2>/dev/null && gz_count=$((gz_count + 1))
+    done < <(find "$proj_dir" -maxdepth 1 -name "*.jsonl" -mtime +${JSONL_OLD_DAYS} -print0 2>/dev/null)
+done
+[ "$gz_count" -gt 0 ] && log "jsonl gzipped: $gz_count files"
+
+# 2) logs 회전: 100MB 초과 시 .1로 회전 + truncate. 7일+ .1은 gzip.
+LOG_LIMIT_BYTES=$((100 * 1024 * 1024))
+for f in "$LOGS"/claude-*.log; do
+    [ -f "$f" ] || continue
+    sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+    if [ "$sz" -gt "$LOG_LIMIT_BYTES" ]; then
+        # 회전: .1이 있으면 gzip → .1.gz, .1.gz가 있으면 덮어씀
+        if [ -f "$f.1" ]; then
+            gzip -9 -f "$f.1" 2>/dev/null
+        fi
+        cp "$f" "$f.1" 2>/dev/null
+        : > "$f"  # truncate
+        log "rotated $(basename "$f") (was $((sz / 1024 / 1024))MB)"
+    fi
+done
+
+# 3) 7일+ .gz 정리 (90일 이상): 디스크 압박 시 추가 안전장치.
+find "$LOGS" -name "*.log.1.gz" -mtime +90 -delete 2>/dev/null
+find "$PROJECTS" -name "*.jsonl.gz" -mtime +90 -delete 2>/dev/null
+
+# 3.5) ai-debate run dirs 14일+ 삭제. 7500+개 디렉토리 / 126MB 누적이 가장 빠른
+# 디스크 압박 원인 (하루 ~400개 생성). 14일 retention 으로 운영 회고 가능.
+# 새 경로(~/claude-work/ai-debate)와 옛 경로(~/.claude/state/ai-debate) 둘 다 본다 —
+# 2026-08-05 이관에서 옛 데이터는 제자리에 뒀다. 청소하는 쪽이 옛 경로를 놓으면
+# 그 126MB 가 영원히 남는다. 옛 경로는 다 지워지면 자연히 사라진다.
+DEBATE_OLD_DAYS=14
+for DEBATE_DIR in ~/claude-work/ai-debate ~/.claude/state/ai-debate; do
+    [ -d "$DEBATE_DIR" ] || continue
+    old_count=$(find "$DEBATE_DIR" -maxdepth 1 -type d -name 'run-*' -mtime +${DEBATE_OLD_DAYS} 2>/dev/null | wc -l)
+    if [ "$old_count" -gt 0 ]; then
+        find "$DEBATE_DIR" -maxdepth 1 -type d -name 'run-*' -mtime +${DEBATE_OLD_DAYS} -exec rm -rf {} + 2>/dev/null
+        log "ai-debate runs deleted: $old_count dirs (>${DEBATE_OLD_DAYS}d) in $DEBATE_DIR"
+    fi
+done
+
+# 4) 본 스크립트 로그도 너무 커지면 truncate
+own_sz=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+[ "$own_sz" -gt $((5 * 1024 * 1024)) ] && tail -c 1M "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+
+exit 0

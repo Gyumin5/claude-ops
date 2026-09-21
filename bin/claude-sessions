@@ -1,0 +1,385 @@
+#!/bin/bash
+# claude-sessions: 모든 claude 세션 통합 관리 CLI.
+# Termius/SSH에서 원격 호출 가능. claude 프로세스 독립적으로 동작.
+#
+# 사용법:
+#   claude-sessions list              # 모든 세션 상태
+#   claude-sessions restart-all       # 전부 킬+재시작
+#   claude-sessions restart <name>    # 특정 세션 (unit 이름: claude-<name>)
+#   claude-sessions rotate <name> [--force]  # fresh 시작. handoff.md 신선본(<=30분) 필수(없으면 거부). --force로 검사 생략
+#   claude-sessions kill-orphans      # 고아 bun 청소
+#   claude-sessions health            # stuck 세션 감지
+
+set -uo pipefail
+
+cmd="${1:-help}"
+
+list_services() {
+    systemctl --user list-unit-files 'claude-*.service' --state=enabled --no-legend 2>/dev/null \
+        | awk '{print $1}' \
+        | grep -v '^claude-watchdog.service$' \
+        | grep -v '^claude-control-bot.service$'
+}
+
+# 세션 재구동 allowlist 게이트 (P1).
+# 진짜 인터랙티브 세션만 restart 허용 — 유틸/봇 서비스(WD=$HOME)나 미존재 이름 오조작 차단.
+# (b3e9882 통찰: 유틸/봇 서비스는 WorkingDirectory=$HOME, 진짜 세션은 프로젝트 디렉토리.)
+session_wd() {
+    # systemd 는 일부 유닛의 WorkingDirectory 를 "!$HOME" 처럼 앞에 ! 를 붙여 표기 →
+    # 진짜 세션은 깨끗한 프로젝트 경로. 비교 위해 선행 ! 제거.
+    local wd; wd=$(systemctl --user show "claude-${1}.service" -p WorkingDirectory --value 2>/dev/null)
+    echo "${wd#!}"
+}
+is_real_session() {
+    local wd; wd=$(session_wd "$1")
+    [ -n "$wd" ] || return 1          # 유닛 없음
+    [ "$wd" = "$HOME" ] && return 1    # 유틸/봇 서비스 제외
+    [ -d "$wd" ] || return 1           # 실제 프로젝트 디렉토리 존재
+    return 0
+}
+list_real_sessions() {
+    local svc name
+    for svc in $(list_services); do
+        name="${svc#claude-}"; name="${name%.service}"
+        is_real_session "$name" && echo "$name"
+    done
+}
+
+cmd_list() {
+    echo "=== systemd 관리 세션 ==="
+    for svc in $(list_services); do
+        state=$(systemctl --user is-active "$svc" 2>/dev/null)
+        pid=$(systemctl --user show "$svc" -p MainPID 2>/dev/null | cut -d= -f2)
+        [ "$pid" = "0" ] && pid="-"
+        etime="-"
+        [ "$pid" != "-" ] && etime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+        printf "  %-30s %-10s PID=%-10s uptime=%s\n" "$svc" "$state" "$pid" "$etime"
+    done
+    echo ""
+    echo "=== cl 또는 수동 기동 세션 (systemd 밖) ==="
+    for p in $(pgrep -f "^claude.*remote-control" 2>/dev/null); do
+        cwd=$(readlink /proc/$p/cwd 2>/dev/null)
+        # systemd 관리 세션은 cgroup이 claude-*.service에 속함
+        cg=$(grep -oP 'user\.slice/user-\d+\.slice/user@\d+\.service/\K[^ ]+' "/proc/$p/cgroup" 2>/dev/null | head -1)
+        if [[ "$cg" != claude-*.service ]]; then
+            et=$(ps -o etime= -p "$p" | tr -d ' ')
+            printf "  PID=%-10s uptime=%-8s cwd=%s\n" "$p" "$et" "$cwd"
+        fi
+    done
+}
+
+cmd_restart() {
+    # 인자 파싱: <name> [--soft|--hard] [--dry-run]  (기본 --hard)
+    local mode="hard" dry=0 rest=()
+    local a
+    for a in "$@"; do
+        case "$a" in
+            --soft)        mode="soft" ;;
+            --hard)        mode="hard" ;;
+            --dry-run|-n)  dry=1 ;;
+            *)             rest+=("$a") ;;
+        esac
+    done
+    set -- "${rest[@]}"
+    local name="${1:?usage: claude-sessions restart <name> [--hard|--soft] [--dry-run]}"
+
+    if [ "$mode" = "soft" ]; then
+        # P2a/P2b: restart-soft 오케스트레이터에 위임(트리거 발송+폴링+관측). name=all → 전세션 브로드캐스트.
+        local orch; orch="$(dirname "$(readlink -f "$0")")/claude-soft-restart"
+        [ -x "$orch" ] || orch="claude-soft-restart"
+        local sargs=()
+        if [ "$name" = "all" ]; then sargs+=("--all"); else sargs+=("$name"); fi
+        [ "$dry" = "1" ] && sargs+=("--dry-run")
+        "$orch" "${sargs[@]}"
+        return $?
+    fi
+
+    # allowlist 게이트: 진짜 세션만. 유틸/봇/미존재 이름 거부.
+    if ! is_real_session "$name"; then
+        local badwd; badwd=$(session_wd "$name")
+        echo "[restart] 거부: '$name' 은 재시작 가능한 세션이 아님."
+        if [ -z "$badwd" ]; then
+            echo "  이유: claude-${name}.service 유닛 없음."
+        elif [ "$badwd" = "$HOME" ]; then
+            echo "  이유: WorkingDirectory=\$HOME (유틸/봇 서비스) — 세션 아님."
+        else
+            echo "  이유: WorkingDirectory=$badwd 디렉토리 없음."
+        fi
+        echo "  재시작 가능한 세션: $(list_real_sessions | tr '\n' ' ')"
+        return 1
+    fi
+
+    local svc="claude-${name}.service"
+    local wd; wd=$(session_wd "$name")
+    local machine; machine=$(cat "$HOME/.config/claude-machine-id" 2>/dev/null || echo "?")
+
+    if [ "$dry" = "1" ]; then
+        local state pid inv
+        state=$(systemctl --user is-active "$svc" 2>/dev/null)
+        pid=$(systemctl --user show "$svc" -p MainPID --value 2>/dev/null)
+        inv=$(systemctl --user show "$svc" -p InvocationID --value 2>/dev/null)
+        echo "[restart --dry-run] machine=$machine  mode=hard"
+        echo "  대상 유닛 : $svc"
+        echo "  cwd       : $wd"
+        echo "  현재 상태 : state=$state MainPID=$pid"
+        echo "  InvocationID(현재): ${inv:-<none>}"
+        echo "  동작(hard): reset-failed → systemctl restart → 텔레그램 봇 alive 확인(최대 8s×3)."
+        echo "  → dry-run 이므로 실제 재시작 안 함."
+        return 0
+    fi
+
+    local bot_pid_path="${wd}/.claude/telegram/bot.pid"
+    local need_bot=0
+    [ -d "${wd}/.claude/telegram" ] && need_bot=1
+
+    for attempt in 1 2 3; do
+        echo "[$(date '+%H:%M:%S')] restart $svc (attempt $attempt)"
+        systemctl --user reset-failed "$svc" 2>/dev/null
+        systemctl --user restart "$svc"
+
+        if [ "$need_bot" = "0" ]; then
+            return 0
+        fi
+
+        # reconnect fix B (2026-06-18): 재시작으로 orphan 된 옛 텔레그램 bun 이
+        # getUpdates 잠금을 물면 새 bun 이 409 로 못 붙는다. 즉시 reap.
+        # (active 서비스 cgroup 에 속한 bun 은 절대 안 죽임 — cleaner 가 보장.)
+        _reaper="$(dirname "$(readlink -f "$0")")/claude-bun-zombie-cleaner"
+        [ -x "$_reaper" ] || _reaper="claude-bun-zombie-cleaner"
+        "$_reaper" 2>/dev/null || true
+
+        # 봇 spawn 확인 (최대 8s 대기)
+        for i in 1 2 3 4 5 6 7 8; do
+            sleep 1
+            if [ -f "$bot_pid_path" ]; then
+                # bot.pid는 stop 시 안 지워질 수 있음. 실제 PID 살아있는지 확인
+                local pid=$(cat "$bot_pid_path" 2>/dev/null)
+                if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                    echo "  ✅ telegram bot alive (pid=$pid)"
+                    return 0
+                fi
+            fi
+        done
+        echo "  ⚠ telegram bot not detected after 8s, retrying..."
+    done
+    echo "  ❌ telegram bot still not up after 3 attempts"
+    return 1
+}
+
+cmd_rotate() {
+    # 인자 파싱: <name> [--force] [--soft] [--dry-run]
+    # --soft 경로로 넘길 플래그는 여기서 명시적으로 받아 전달한다. 모르는 플래그를
+    # 이름 자리(rest)로 흘리면 조용히 버려진다 — 실제로 `--soft --dry-run` 이 dry 가
+    # 아닌 실제 트리거 발송으로 실행됐다(2026-07-30). 안 마른 dry-run 은 그냥 사고다.
+    local force=0
+    local soft=0
+    local passthru=()
+    local rest=()
+    local a
+    local want_val=""
+    for a in "$@"; do
+        if [ -n "$want_val" ]; then passthru+=("$a"); want_val=""; continue; fi
+        case "$a" in
+            --force|-f)   force=1 ;;
+            --soft)       soft=1 ;;
+            --dry-run|-n) passthru+=("--dry-run") ;;
+            # 값을 받는 소프트 경로 플래그. 값 토큰을 이름으로 오인하지 않도록 다음
+            # 토큰까지 함께 넘긴다(2026-07-30: --timeout 을 몰라서 거부하는 바람에
+            # 예약 발송이 rc=2 로 죽고 테스트가 조용히 안 돌았다).
+            --timeout)    passthru+=("--timeout"); want_val=1 ;;
+            -*)           echo "[rotate] 모르는 플래그: $a" >&2; return 2 ;;
+            *) rest+=("$a") ;;
+        esac
+    done
+    if [ -n "$want_val" ]; then echo "[rotate] --timeout 에 값이 없다" >&2; return 2; fi
+    set -- "${rest[@]}"
+    local name="${1:?usage: claude-sessions rotate <name> [--force] [--soft] [--dry-run]}"
+    if [ "$soft" = 1 ]; then
+        # P3: rotate-soft — 트리거로 세션이 handoff 작성 후 스스로 rotate(모델 협조형).
+        local orch; orch="$(dirname "$(readlink -f "$0")")/claude-soft-restart"
+        [ -x "$orch" ] || orch="claude-soft-restart"
+        "$orch" --rotate "${passthru[@]}" "$name"
+        return $?
+    fi
+    if [ ${#passthru[@]} -gt 0 ]; then
+        echo "[rotate] --dry-run 은 --soft 경로에서만 의미가 있다(하드 rotate 는 즉시 교체)." >&2
+        return 2
+    fi
+    local svc="claude-${name}.service"
+    local wd=$(systemctl --user show "$svc" -p WorkingDirectory 2>/dev/null | cut -d= -f2)
+    if [ -z "$wd" ]; then
+        echo "[rotate] $svc not found"
+        return 1
+    fi
+
+    # --- handoff 게이트: 맥락 손실 방지 (debate run-20260623T111711Z) ---
+    # rotate 는 인메모리 대화를 버린다. 신선한 handoff.md 없이는 거부.
+    local handoff="$wd/handoff.md"
+    local max_age="${CS_HANDOFF_MAX_AGE:-1800}"   # 초, 기본 30분
+    if [ "$force" -ne 1 ]; then
+        if [ ! -f "$handoff" ]; then
+            echo "[rotate] 거부: $handoff 없음."
+            echo "  rotate 전에 현재 세션에서 handoff.md 를 먼저 작성하라:"
+            echo "  다음 1~3개 행동(첫 명령 수준)·관련 파일경로·결정과 이유·금지할 접근·"
+            echo "  실패했던 시도·외부상태(systemd unit/포트/env/계정/실행중 프로세스)·재개 검증명령."
+            echo "  바이패스(맥락 버려도 될 때만): claude-sessions rotate $name --force"
+            return 1
+        fi
+        local now mtime age
+        now=$(date +%s)
+        mtime=$(stat -c %Y "$handoff" 2>/dev/null || echo 0)
+        age=$(( now - mtime ))
+        if [ "$age" -gt "$max_age" ]; then
+            echo "[rotate] 거부: handoff.md 가 ${age}s 전 갱신(임계 ${max_age}s) — 직전 세션 잔여로 stale 의심."
+            echo "  현재 세션에서 handoff.md 를 갱신하라. 바이패스: --force"
+            return 1
+        fi
+        echo "[rotate] handoff.md OK (${age}s 전 갱신) — 새 세션이 인계받음."
+    else
+        echo "[rotate] --force: handoff 검사 생략(맥락 손실 감수)."
+    fi
+    # --- 게이트 끝 ---
+
+    local proj_key=$(echo "$wd" | sed -e 's|/|-|g' -e 's|_|-|g')
+    local proj_dir="$HOME/.claude/projects/${proj_key}"
+    local archive="${proj_dir}/archive"
+    mkdir -p "$archive"
+    local ts=$(date +%Y%m%d-%H%M%S)
+
+    echo "[$(date '+%H:%M:%S')] rotating $svc (cwd=$wd)"
+
+    # rotate 실행 주체가 해당 service cgroup 안에 있으면 stop이 자기 자신을 kill함.
+    # systemd-run --scope로 detach시켜서 실행 (caller가 죽어도 살아남음).
+    # --collect로 완료 시 자동 정리.
+    # transient scope에서 실행하면 user.slice 직속이라 claude-*.service cgroup 밖에 위치.
+
+    local rotate_cmd='
+set -uo pipefail
+systemctl --user reset-failed "'"$svc"'" 2>/dev/null
+systemctl --user stop "'"$svc"'"
+sleep 3
+moved=0
+for jsonl in "'"$proj_dir"'"/*.jsonl; do
+    [ -f "$jsonl" ] || continue
+    mv "$jsonl" "'"$archive"'"/$(basename "$jsonl" .jsonl).'"$ts"'.jsonl
+    moved=$((moved+1))
+done
+echo "archived $moved jsonl(s)"
+systemctl --user start "'"$svc"'"
+sleep 2
+echo "state=$(systemctl --user is-active "'"$svc"'")"
+'
+
+    # systemd-run으로 detach 실행. 현재 cgroup(claude-*.service) 밖에서 돌아감.
+    systemd-run --user --unit="cs-rotate-${name}-${ts}" --collect --quiet \
+        /bin/bash -c "$rotate_cmd"
+    echo "  rotate 명령 detach됨. systemd-run으로 claude service cgroup 밖에서 실행 중."
+    echo "  완료 확인: systemctl --user status cs-rotate-${name}-${ts}"
+    echo "  또는 journalctl --user -u cs-rotate-${name}-${ts}"
+}
+
+cmd_restart_all() {
+    for svc in $(list_services); do
+        echo "[$(date '+%H:%M:%S')] restart $svc"
+        systemctl --user reset-failed "$svc" 2>/dev/null
+        systemctl --user restart "$svc" &
+    done
+    wait
+    echo "모든 세션 재시작 명령 전송 완료"
+}
+
+cmd_kill_orphans() {
+    local killed=0
+    for p in $(pgrep -af "bun server.ts" 2>/dev/null | awk '{print $1}'); do
+        ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+        # parent가 systemd-user(보통 PID < 10000, /lib/systemd/systemd --user)면 고아
+        if [ -n "$ppid" ]; then
+            pcmd=$(ps -o command= -p "$ppid" 2>/dev/null)
+            if [[ "$pcmd" == *"systemd --user"* ]]; then
+                dir=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep TELEGRAM_STATE_DIR | cut -d= -f2)
+                echo "orphan bun $p (dir=$dir) → kill"
+                kill -KILL "$p" 2>/dev/null
+                killed=$((killed+1))
+            fi
+        fi
+    done
+    echo "killed $killed orphan(s)"
+}
+
+cmd_health() {
+    echo "=== 세션 상태 ==="
+    for svc in $(list_services); do
+        state=$(systemctl --user is-active "$svc" 2>/dev/null)
+        wd=$(systemctl --user show "$svc" -p WorkingDirectory | cut -d= -f2)
+        proj=$(basename "$wd")
+
+        if [ "$state" != "active" ]; then
+            printf "  %-25s %s\n" "$proj" "⏹ 꺼짐"
+            continue
+        fi
+
+        # 최근 jsonl 찾기
+        proj_dir_key=$(echo "$wd" | sed 's|/|-|g')
+        jsonl=$(ls -t "$HOME/.claude/projects/${proj_dir_key}"/*.jsonl 2>/dev/null | head -1)
+
+        if [ -z "$jsonl" ]; then
+            printf "  %-25s %s\n" "$proj" "✅ 켜짐 (새 세션)"
+            continue
+        fi
+
+        now=$(date +%s)
+        mtime=$(stat -c %Y "$jsonl")
+        age=$(( now - mtime ))
+        age_h=$(( age / 3600 ))
+
+        # 로그에서 한도 패턴 체크
+        log="$HOME/.claude/logs/${svc%.service}.log"
+        hit_limit=""
+        reset_time=""
+        if [ -f "$log" ]; then
+            if tail -200 "$log" 2>/dev/null | grep -q "hit your limit"; then
+                hit_limit="yes"
+                reset_time=$(tail -200 "$log" | grep "hit your limit" | tail -1 | grep -oP 'resets \K[0-9]+[ap]m' | head -1)
+            fi
+        fi
+
+        flag="✅ 켜짐"
+        [ -n "$hit_limit" ] && flag="⚠ RATE_LIMIT(reset=$reset_time)"
+        printf "  %-25s %s  age=%dh\n" "$proj" "$flag" "$age_h"
+    done
+}
+
+case "$cmd" in
+    list|ls)          cmd_list ;;
+    restart)          shift; cmd_restart "$@" ;;
+    rotate)           shift; cmd_rotate "$@" ;;
+    restart-all)      cmd_restart_all ;;
+    kill-orphans)     cmd_kill_orphans ;;
+    health)           cmd_health ;;
+    help|-h|--help|*)
+        cat <<'HELP'
+claude-sessions <command>
+
+Commands:
+  list                   모든 세션 상태
+  restart <name> [--hard|--soft] [--dry-run]
+                         특정 세션 재시작 (claude -c로 resume, 맥락 유지).
+                         --hard(기본): 즉시 재시작. --soft: P2 예약(미구현).
+                         --dry-run: 대상·현재상태만 표시, 실제 재시작 안 함.
+                         유틸/봇 서비스(WD=$HOME)·미존재 이름은 거부(allowlist).
+  rotate <name> [--force]  fresh 시작 (jsonl을 archive/로 이동, 새 세션)
+                         — handoff.md 신선본(<=30분, CS_HANDOFF_MAX_AGE 조정) 필수. 없으면 거부.
+                         — --force 로 검사 생략(맥락 버릴 때만)
+  restart-all            모든 enabled 세션 재시작
+  kill-orphans           고아 bun 프로세스 청소
+  health                 stuck/rate-limit 세션 감지
+  help                   이 도움말
+
+Examples:
+  claude-sessions list
+  claude-sessions restart dotfiles
+  claude-sessions rotate dotfiles
+  claude-sessions restart-all
+HELP
+        ;;
+esac

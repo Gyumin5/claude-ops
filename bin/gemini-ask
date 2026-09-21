@@ -1,0 +1,131 @@
+#!/bin/bash
+# gemini-ask: Antigravity CLI (agy) wrapper — 라벨은 gemini 유지, 백엔드는 agy.
+#
+# 2026-05-21 마이그레이션: gemini-cli (EOL 2026-06-18) → antigravity CLI.
+# 외부 호출자 4개 (ai-morning-briefing, ai-briefing-review, ai-weekly-review,
+# kill-ai-zombies) 의 API 호환을 위해 wrapper 보존.
+#
+# Usage:
+#   gemini-ask "프롬프트"                       - 새 호출 (이전엔 latest resume)
+#   gemini-ask --new "프롬프트"                 - 새 호출 (default 와 동일)
+#   gemini-ask --session <id> "프롬프트"        - agy --conversation <id>
+#   gemini-ask --topic "주제" "프롬프트"        - 토픽 매칭 미지원 → 새 호출
+#   gemini-ask --list                           - agy 미지원 → 빈 출력
+#   echo "..." | gemini-ask "..."               - stdin pipe 지원
+
+set -uo pipefail
+
+AGY=$HOME/.local/bin/agy
+
+_AI_TELEM_START=$(date +%s%3N)
+_AI_TELEM_KIND=""
+_ai_telem_finalize() {
+    local ec=$?
+    local dur=$(( $(date +%s%3N) - _AI_TELEM_START ))
+    local mode="new"
+    [ -n "$SESSION_ID" ] && mode="session"
+    case $ec in
+        2) _AI_TELEM_KIND="rate_limit_429" ;;
+        3) _AI_TELEM_KIND="auth_401" ;;
+        4) _AI_TELEM_KIND="server_500" ;;
+        1) [ -z "$_AI_TELEM_KIND" ] && _AI_TELEM_KIND="empty_response" ;;
+    esac
+    ai-telemetry-log gemini "$ec" "$dur" "$mode" "$_AI_TELEM_KIND" 2>/dev/null || true
+}
+trap _ai_telem_finalize EXIT
+
+FORCE_NEW=false
+TOPIC=""
+SESSION_ID=""
+
+while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+        --new)
+            FORCE_NEW=true
+            shift
+            ;;
+        --topic)
+            TOPIC="$2"
+            shift 2
+            ;;
+        --session)
+            SESSION_ID="$2"
+            shift 2
+            ;;
+        --list)
+            # agy has no session list. Print informational note + exit clean.
+            echo "[gemini-ask] --list: agy 미지원. (gemini-cli EOL 후 세션 기능 비활성)" >&2
+            exit 0
+            ;;
+        *)
+            echo "Unknown flag: $1" >&2
+            shift
+            ;;
+    esac
+done
+
+PROMPT="${1:-}"
+if [ -z "$PROMPT" ]; then
+    echo "Usage: gemini-ask [--new|--topic TOPIC|--session ID] \"프롬프트\"" >&2
+    exit 1
+fi
+
+# agy resume flag. 이어받기(--session) 아니면 --new-project로 매번 완전히 새
+# 프로젝트를 강제(2026-07-20 — agy가 로컬에 프로젝트 하나를 몇 달째 재사용 중이던
+# 걸 발견, codex(--new)/claude(격리 HOME)와 격리수준 맞춤).
+RESUME_ARG=()
+if [ -n "$SESSION_ID" ]; then
+    RESUME_ARG=(--conversation "$SESSION_ID")
+else
+    RESUME_ARG=(--new-project)
+fi
+
+run_gemini() {
+    local output exit_code full_prompt
+    full_prompt="$PROMPT"
+    if [ ! -t 0 ]; then
+        # agy 는 stdin 을 읽지 않는다 — 예전엔 파이프 내용을 agy stdin 으로 흘려보내
+        # 그대로 유실시켰다(모델은 $PROMPT 한 줄만 받음). 파이프 입력은 -p 본문에
+        # 합쳐서 넘긴다. (2026-07-22 ai-debate gemini 토픽이탈 조사 중 발견.)
+        local _stdin
+        _stdin=$(cat)
+        [ -n "$_stdin" ] && full_prompt="$PROMPT"$'\n\n'"$_stdin"
+    fi
+    # -p 는 단일 argv 라 리눅스 MAX_ARG_STRLEN(128KiB) 하드limit 에 걸린다. 파이프로
+    # 큰 파일을 넣으면 쉽게 넘어가므로 미리 명확히 실패시킨다(넘으면 exec 가 알 수 없는
+    # 오류로 죽어 원인 파악이 어렵다).
+    local _plen
+    _plen=$(printf '%s' "$full_prompt" | wc -c)
+    if [ "$_plen" -gt 100000 ]; then
+        echo "[gemini-ask] 입력이 너무 큼(${_plen}B > 100000B). agy 는 stdin 을 안 읽어 -p 로만 전달 가능하니 입력을 줄여서 다시 시도." >&2
+        return 1
+    fi
+    output=$(timeout --kill-after=10s 600 "$AGY" "${RESUME_ARG[@]}" -p "$full_prompt" --print-timeout 5m 2>&1)
+    exit_code=$?
+
+    if echo "$output" | grep -qE 'MODEL_CAPACITY_EXHAUSTED|429|RESOURCE_EXHAUSTED'; then
+        echo "[gemini-ask] 서버 용량 부족 (429)." >&2
+        echo "$output"
+        return 2
+    elif echo "$output" | grep -qE '401|UNAUTHENTICATED|invalid_grant'; then
+        echo "[gemini-ask] 인증 만료 (401). agy 재로그인 필요." >&2
+        echo "$output"
+        return 3
+    elif echo "$output" | grep -qE '500|INTERNAL'; then
+        echo "[gemini-ask] 서버 내부 오류 (500)." >&2
+        echo "$output"
+        return 4
+    elif [ $exit_code -ne 0 ] && [ -z "$output" ]; then
+        echo "[gemini-ask] 빈 응답 (exit code: $exit_code)" >&2
+        return 1
+    fi
+
+    echo "$output"
+    return $exit_code
+}
+
+if [ "${AI_OUT_RAW:-}" = "1" ]; then
+    run_gemini
+else
+    run_gemini | ai-out-filter gemini
+fi

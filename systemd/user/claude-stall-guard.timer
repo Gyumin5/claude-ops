@@ -1,0 +1,10 @@
+[Unit]
+Description=Claude Stall Guard Timer (5분마다 — 2회 연속 확인 후 주입하므로 실동작은 10분+)
+
+[Timer]
+OnBootSec=8min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

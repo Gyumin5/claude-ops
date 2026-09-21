@@ -1,0 +1,11 @@
+[Unit]
+Description=Claude session nudge daemon (%i)
+
+[Service]
+Type=simple
+ExecStart=%h/dotfiles/bin/claude-session-nudge --daemon %i
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

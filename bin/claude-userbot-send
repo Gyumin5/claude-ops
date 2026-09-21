@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Telethon user-mode 메시지 발송 — 내 계정으로 임의 봇/채팅에 텍스트 전송.
+
+용도:
+  - 크로스세션 전달: 다른 세션의 프로젝트봇 채팅창에 프롬프트 주입 (그 세션이 user inbound 로 받아 자동 응답).
+  - rate-limit 자동 재개: 해제 시 큐 텍스트를 해당 세션 봇에 발송.
+
+비대화형. 사전에 claude-userbot-login 으로 userbot.session 생성돼 있어야 함.
+
+사용법:
+  claude-userbot-send <target> <message...>
+  claude-userbot-send --session <name> <message...>   # targets.json 매핑 사용
+
+  target = @봇유저네임  또는  숫자 chat_id/user_id
+  매핑   = ~/.claude/userbot/targets.json  {"세션이름": "@봇유저네임", ...}
+
+종료코드: 0 성공, 1 설정/인자 오류, 2 미인증(login 필요), 3 발송 실패.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+USERBOT_DIR = os.path.expanduser("~/.claude/userbot")
+ENV_PATH = os.path.join(USERBOT_DIR, ".env")
+SESSION_PATH = os.path.join(USERBOT_DIR, "userbot")
+TARGETS_PATH = os.path.join(USERBOT_DIR, "targets.json")
+LOCK_PATH = os.path.join(USERBOT_DIR, "userbot.lock")
+RELAY_CONF = os.path.join(USERBOT_DIR, "relay.conf")
+RELAY_ALIAS_PATH = os.path.join(USERBOT_DIR, "relay-alias.json")
+
+
+def compute_origin():
+    """출처 마커 = <machine>/<session>. 받는 쪽·운영자가 '어느 PC 의 어느 세션'인지 식별.
+
+    machine = ~/.config/claude-machine-id (home/peer). session = CLAUDE_SESSION_NAME,
+    없으면 /proc/self/cgroup 의 claude-<name>.service 로 추적, 그래도 없으면 '?'.
+    완료-핑 정규식(completion-notify)이 ':' 를 구분자로 쓰므로 origin 에 ':' 금지 → '/' 사용.
+    --origin 으로 호출자가 명시 지정 가능(ssh 릴레이처럼 env/cgroup 추적 불가한 경로용)."""
+    # 실패 fallback 은 '?' 가 아니라 사유를 담은 토큰이다. '?' 는 "왜 못 구했는지"가
+    # 남지 않아 추적에 시간이 든다(2026-07-28: home/? 하나를 세 세션이 각각 몇 시간씩
+    # 추적했다). 모호한 신호는 신호 자체를 고친다.
+    machine = "unknown-no-machine-id"
+    try:
+        with open(os.path.expanduser("~/.config/claude-machine-id")) as f:
+            machine = f.read().strip() or "unknown-empty-machine-id"
+    except Exception:
+        pass
+    session = (os.environ.get("CLAUDE_SESSION_NAME") or "").strip()
+    if not session:
+        # env 가 없을 때만 cgroup 추적. 여기서 못 찾는 대표 경로가 ssh 릴레이 호출과
+        # claude-job-* transient 유닛이다 — 그 경우 호출자가 --origin 을 넘겨야 한다.
+        session = "unknown-no-cgroup"
+        try:
+            with open("/proc/self/cgroup") as f:
+                m = re.search(r"claude-([^/]+)\.service", f.read())
+                session = m.group(1) if m else "unknown-not-a-session-cgroup"
+        except Exception:
+            pass
+    safe = lambda s: re.sub(r"[\]:\s/]+", "-", s)  # 마커 구분자/괄호/공백/슬래시 정리
+    return f"{safe(machine)}/{safe(session)}"
+
+
+def load_env(path):
+    env = {}
+    if not os.path.exists(path):
+        sys.exit(f"[send] {path} 없음. API_ID/API_HASH 작성 필요.")
+    for line in open(path):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        env[k.strip()] = v.strip()
+    return env
+
+
+def _relay_host():
+    """relay.conf 의 USERBOT_HOST 값. 없으면 빈 문자열."""
+    try:
+        with open(RELAY_CONF) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("USERBOT_HOST="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return ""
+
+
+def maybe_relay(args, message):
+    """로컬에 userbot 이 없는 머신(peer 등)에서 USERBOT_HOST 로 ssh 릴레이.
+
+    배경: peer 은 로컬 telethon userbot 이 없어 targets.json 자체가 없다. 그래서
+    claude-userbot-send 를 그냥 부르면 "targets.json 없음" 으로 죽었고, 세션이 이
+    사실과 우회로(ssh 로 home 것을 부르기)를 스스로 알아야만 크로스세션 전송이
+    됐다 — 실제로 몰라서 못 보내는 사고가 반복됐다(2026-07-22 사용자 보고).
+    우회로는 CLAUDE.md 에 적혀는 있었으나 장시간작업 detach 설명 안에 파묻혀 있어
+    발견되지 않았다. 문서가 아니라 도구가 알아서 하도록 여기로 내린다
+    (claude-job-detach 가 이미 쓰던 검증된 패턴을 본체로 옮긴 것).
+
+    fail-closed: relay-alias.json 에 명시 등록된 세션만 릴레이한다. 미등록 이름을
+    그대로 넘기면 다른 머신의 동명 세션으로 조용히 오배송될 수 있기 때문.
+    릴레이한 경우 True 를 반환한다(호출측은 그대로 종료).
+    """
+    # 세션명 해석이 필요한 경우만 릴레이. @봇유저네임/chat_id 직접 지정은 로컬
+    # 자격증명으로 보내는 용도라 릴레이 대상이 아니다.
+    if not args.session:
+        return False
+    # 로컬에 매핑이 있으면(= 여기가 userbot 호스트) 로컬 발송.
+    if os.path.exists(TARGETS_PATH):
+        return False
+    # depth guard: 릴레이로 들어온 호출은 절대 다시 릴레이하지 않는다. targets.json
+    # 부재는 '머신 역할'이 아니라 '상태'라, 릴레이 대상 쪽에서 그 파일이 유실되거나
+    # USERBOT_HOST 가 자기 자신을 가리키면 무한 재귀가 될 수 있다
+    # (ai-debate run-20260722T081932Z 지적). 그 경우 재릴레이 대신 설정오류로 끝낸다.
+    if args.no_relay:
+        sys.exit(f"[send] 릴레이 대상 설정오류: 릴레이로 받은 호출인데 이 머신에도 "
+                 f"{TARGETS_PATH} 가 없음. USERBOT_HOST 가 잘못 지정됐거나 매핑 파일이 유실됨.")
+    host = _relay_host()
+    # USERBOT_HOST 는 ssh 인자로 들어가므로 '-' 로 시작하는 값 등이 ssh 옵션으로
+    # 해석되지 않게 형태를 제한한다(같은 지적).
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+", host or ""):
+        sys.exit(f"[send] 로컬 userbot 없음({TARGETS_PATH} 부재)인데 relay.conf 의 "
+                 f"USERBOT_HOST 가 없거나 형식이상(user@host 형태만 허용) — 릴레이 불가.")
+    try:
+        alias = (json.load(open(RELAY_ALIAS_PATH)) or {}).get(args.target)
+    except Exception:
+        alias = None
+    if not alias:
+        sys.exit(f"[send] 릴레이 거부(fail-closed): '{args.target}' 이 {RELAY_ALIAS_PATH} 에 "
+                 f"미등록. 다른 머신 동명 세션으로 오배송을 막기 위해 명시 등록된 세션만 릴레이함.\n"
+                 f"       등록하려면 {RELAY_ALIAS_PATH} 에 "
+                 f'{{"{args.target}": "<원격 targets.json 의 세션이름>"}} 항목을 추가할 것.')
+
+    # 출처는 여기서 계산해 --origin 으로 넘긴다. 원격에서 다시 계산하면 릴레이 호스트
+    # 기준으로 찍혀 진짜 발신자를 잃는다.
+    # --no-relay: 원격이 재릴레이하지 못하게 막는다(depth guard).
+    remote = ["--session", alias, "--no-relay"]
+    if args.delete_after:
+        remote += ["--delete-after", str(args.delete_after)]
+    if args.notify_done:
+        remote += ["--notify-done"]
+    if args.no_origin:
+        remote += ["--no-origin"]
+    else:
+        remote += ["--origin", args.origin.strip() or compute_origin()]
+    remote += ["--", message]
+    # 실행 경로는 인용하지 않는다 — shlex.quote 를 씌우면 '~' 가 리터럴이 되어
+    # 원격 셸이 홈으로 확장하지 못한다(exit 127). 경로는 우리가 고정한 상수라
+    # 인젝션 위험이 없고, 사용자 입력이 섞이는 인자만 인용한다.
+    # -n: stdin 을 /dev/null 로. 세션/systemd 컨텍스트에는 tty 가 없어 ssh 가 stdin 을
+    # 물고 늘어지면 그대로 멈춘다.
+    cmd = ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+           "~/.local/bin/claude-userbot-send " + " ".join(shlex.quote(x) for x in remote)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        sys.exit(f"[send] ssh 연결 실패(host={host}): {e}")
+    if proc.returncode != 0:
+        # ssh 자신의 실패는 255. 그 외는 원격 스크립트가 낸 실패라 원인이 완전히 다르다
+        # (전자는 네트워크/키/호스트 문제, 후자는 매핑·telethon·텔레그램 문제).
+        stage = "ssh 연결/인증 실패" if proc.returncode == 255 else "원격 발송 실패"
+        sys.exit(f"[send] {stage}(host={host}, exit={proc.returncode}): "
+                 f"{(proc.stderr or proc.stdout).strip()[:300]}")
+    print(f"[send] OK (relay via {host} → {alias})")
+    return True
+
+
+def resolve_target(raw, use_session):
+    if use_session:
+        if not os.path.exists(TARGETS_PATH):
+            sys.exit(f"[send] {TARGETS_PATH} 없음. 세션→봇 매핑 필요.")
+        targets = json.load(open(TARGETS_PATH))
+        if raw not in targets:
+            sys.exit(f"[send] targets.json 에 '{raw}' 없음. 등록된: {list(targets)}")
+        return targets[raw]
+    return raw
+
+
+def coerce_entity(target):
+    # 'me'/'self' = 내 Saved Messages (telethon 특수값)
+    if target.lower() in ("me", "self"):
+        return "me"
+    # 숫자면 int chat_id, 아니면 @username 문자열 그대로
+    t = target.lstrip("@")
+    if t.lstrip("-").isdigit():
+        return int(t)
+    return target if target.startswith("@") else "@" + target
+
+
+def _delayed_delete_worker(delay, target_s, message_id):
+    """--_delayed-delete 내부 워커. detached 자식 프로세스로 실행돼 sleep 하는 동안
+    machine-wide lock 을 잡지 않는다 — 잡으면 그 sleep 시간만큼 다른 모든 발송이
+    막힌다(peer 실측 발견: delete-after 600 도입 후 rate-limit-recovery tick 이
+    10분씩 직렬화되던 회귀, 2026-07-09)."""
+    import time as _time
+    _time.sleep(delay)
+    lock_fd = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        from telethon.sync import TelegramClient
+        env = load_env(ENV_PATH)
+        api_id = int(env["API_ID"])
+        api_hash = env["API_HASH"]
+        entity = coerce_entity(target_s)
+        with TelegramClient(SESSION_PATH, api_id, api_hash) as client:
+            try:
+                client.delete_messages(entity, [message_id], revoke=True)
+            except Exception as e:
+                print(f"[send] 지연삭제 실패 (무해): {e}", file=sys.stderr)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
+def main():
+    if len(sys.argv) >= 5 and sys.argv[1] == "--_delayed-delete":
+        _delayed_delete_worker(float(sys.argv[2]), sys.argv[3], int(sys.argv[4]))
+        return
+    ap = argparse.ArgumentParser()
+    ap.add_argument("target", help="@봇유저네임 / chat_id / (--session 일 때) 세션이름")
+    ap.add_argument("message", nargs="+", help="보낼 메시지 (공백 포함 가능)")
+    ap.add_argument("--session", action="store_true", help="target 을 targets.json 세션이름으로 해석")
+    ap.add_argument("--delete-after", type=float, default=0, metavar="SEC",
+                    help="발송 N초 뒤 메시지 삭제 (대상 세션 getUpdates 가 받은 뒤 채팅 정리용). trigger 노이즈 제거.")
+    ap.add_argument("--notify-done", action="store_true",
+                    help="크로스세션 작업 완료 핑 요청. 마커에 :notify 추가. "
+                         "받은 세션 Stop 훅(completion-notify)이 완료 시 자기 봇으로 운영자 챗에 1회 알림.")
+    ap.add_argument("--no-origin", action="store_true",
+                    help="출처 마커 생략 (인프라용: trigger:queue-flush 등). 기본은 항상 출처 박음.")
+    ap.add_argument("--origin", default="", metavar="MACHINE/SESSION",
+                    help="출처를 명시 지정 (env/cgroup 추적 불가한 ssh 릴레이용). 미지정 시 자동 계산.")
+    ap.add_argument("--no-relay", action="store_true",
+                    help="내부용: ssh 릴레이로 들어온 호출 표시. 재릴레이(무한 재귀)를 막는다.")
+    args = ap.parse_args()
+
+    text = " ".join(args.message)
+    # 로컬 userbot 이 없는 머신은 여기서 ssh 릴레이하고 종료. 마커 prepend 전에 해야
+    # 원격에서 --origin 으로 받은 진짜 출처로 마커를 붙인다(이중 prepend 방지).
+    if maybe_relay(args, text):
+        return
+    # 출처 마커는 기본 항상 prepend → 받는 세션·운영자가 '어느 PC 의 어느 세션'인지 식별.
+    # :notify 가 붙은 경우에만 받는 세션 Stop 훅이 완료 핑 발송.
+    if not args.no_origin:
+        origin = args.origin.strip() or compute_origin()
+        suffix = ":notify" if args.notify_done else ""
+        text = f"[[xsrc:from={origin}{suffix}]]\n{text}"
+    target = resolve_target(args.target, args.session)
+    entity = coerce_entity(target)
+
+    env = load_env(ENV_PATH)
+    api_id = env.get("API_ID")
+    api_hash = env.get("API_HASH")
+    if not api_id or not api_hash:
+        sys.exit("[send] .env 에 API_ID / API_HASH 필요.")
+    try:
+        api_id = int(api_id)
+    except ValueError:
+        sys.exit("[send] API_ID 정수 아님.")
+
+    if not os.path.exists(f"{SESSION_PATH}.session"):
+        print("[send] userbot.session 없음. claude-userbot-login 먼저 실행.", file=sys.stderr)
+        sys.exit(2)
+
+    import time as _time
+    from telethon.sync import TelegramClient
+
+    # userbot.session 은 sqlite 파일이라 동시에 여러 프로세스(로컬 직접호출 +
+    # peer 등의 ssh relay 호출)가 열면 파일락 충돌로 발송 실패함
+    # (2026-07-06 전세션 소프트재시작 배치 중 peer 2건 발송실패로 재현·확인).
+    # 같은 홈 머신에서 실행되는 모든 호출(직접+relay)이 이 lockfile 하나로 직렬화됨.
+    lock_fd = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)  # blocking — 앞선 발송 끝날 때까지 대기
+        with TelegramClient(SESSION_PATH, api_id, api_hash) as client:
+            if not client.is_user_authorized():
+                print("[send] 미인증 세션. claude-userbot-login 재실행.", file=sys.stderr)
+                sys.exit(2)
+            try:
+                # parse_mode=None 이어야 본문이 글자 그대로 간다. 생략하면 telethon 이
+                # 기본값 () 를 "안 넘김" sentinel 로 보고 클라이언트 기본 파스모드
+                # (markdown) 로 떨어지고, 그 파서가 백틱을 MessageEntityCode 로 바꾸면서
+                # 본문에서 지운다 — 감싼 내용은 남아서 받는 쪽엔 멀쩡한 문장으로 보인다.
+                # 조용한 변조라 지문 없이는 못 잡는다(2026-08-15 옆 기계 SPEC 사본 2자리).
+                # None 은 () 와 다른 값이다: sanitize_parse_mode 를 타고 falsy 가 되어
+                # 파싱 자체를 건너뛴다.
+                sent = client.send_message(entity, text, parse_mode=None)
+            except Exception as e:
+                print(f"[send] 발송 실패 ({entity}): {e}", file=sys.stderr)
+                sys.exit(3)
+            deleted = False
+            if args.delete_after and args.delete_after > 0:
+                # 대상 세션 getUpdates 가 메시지를 받은 뒤 삭제 → wake 는 유지, 채팅엔 안 남음.
+                # 여기서 그대로 sleep 하면 이 lock(위 flock, machine-wide) 을 delete_after
+                # 만큼 붙잡아 다른 모든 발송을 막는다 — detached 자식으로 분리해 즉시 리턴.
+                try:
+                    subprocess.Popen(
+                        [sys.executable, os.path.abspath(__file__), "--_delayed-delete",
+                         str(args.delete_after), str(target), str(sent.id)],
+                        start_new_session=True,
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    deleted = True  # 예약됨(비동기) — 즉시 확인된 삭제 아님
+                except Exception as e:
+                    print(f"[send] 지연삭제 예약 실패 (무해): {e}", file=sys.stderr)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+    suffix = f", delete scheduled in {args.delete_after}s" if deleted else ""
+    print(f"[send] OK → {entity} ({len(text)} chars{suffix})")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,52 @@
+#!/bin/bash
+# claude-progress-updater-all: 활성 세션 전부에 progress-updater 적용.
+# systemd timer가 30분마다 이 스크립트 한 번만 호출한다.
+#
+# 대상 판정은 systemd 에서 직접 읽는다. 2026-08-11 이전에는 세션이름→디렉토리 매핑이
+# 이 파일 안에 손으로 박혀 있었고(9개), 목록에 없는 이름은 조용히 continue 했다.
+# 그 결과 peer·session-a·session-g·session-b·session-h·session-f·session_c
+# 일곱 세션이 도입 이후 내내 갱신 대상이 아니었다 — progress.md 가 19~92시간씩 낡아 있었고
+# 로그에 흔적조차 없어 아무도 몰랐다(history #57). 유닛의 WorkingDirectory 는 systemd 가
+# 이미 정확히 알고 있으므로 손목록을 둘 이유가 없다.
+#
+# 세션 판정 기준은 stall-guard 와 같다: Environment 에 CLAUDE_SESSION_NAME 이 있는
+# 비-transient 활성 유닛. 그게 없는 상시 유닛(watchdog·control-bot·각종 감시기)과
+# systemd-run 일회성 잡(claude-job-*)은 자동으로 빠진다.
+
+set -uo pipefail
+
+UPDATER="${PROGRESS_UPDATER_BIN:-$HOME/.local/bin/claude-progress-updater}"
+LOG="$HOME/.claude/logs/progress-updater.log"
+
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$LOG"; }
+
+units=$(systemctl --user list-units --plain --no-legend --type=service \
+        --state=active 'claude-*.service' 2>/dev/null | awk '{print $1}')
+
+seen=0
+for u in $units; do
+    # 템플릿 인스턴스(claude-session-nudge@foo.service)는 세션이 아니다.
+    case "$u" in *@*) continue ;; esac
+
+    props=$(systemctl --user show "$u" \
+            -p WorkingDirectory -p Environment -p Transient 2>/dev/null)
+    [ -n "$props" ] || continue
+
+    case "$props" in *"Transient=yes"*) continue ;; esac
+    case "$props" in *CLAUDE_SESSION_NAME=*) ;; *) continue ;; esac
+
+    cwd=$(printf '%s\n' "$props" | sed -n 's/^WorkingDirectory=//p' | head -1)
+    [ -n "$cwd" ] || continue
+    [ -d "$cwd" ] || { log "[${u#claude-}] cwd 없음: $cwd — 스킵"; continue; }
+
+    # progress.md 가 없는 디렉토리에 새로 만들지 않는다. 만드는 건 세션이 할 일이다.
+    if [ ! -f "$cwd/progress.md" ]; then
+        log "[$(basename "$cwd")] progress.md 없음 — 스킵"
+        continue
+    fi
+
+    seen=$((seen + 1))
+    "$UPDATER" "$cwd" || true
+done
+
+[ "$seen" -gt 0 ] || log "[all] 대상 세션 0개 — CLAUDE_SESSION_NAME 이 붙은 활성 유닛이 없다"

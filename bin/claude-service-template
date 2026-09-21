@@ -1,0 +1,40 @@
+#!/bin/bash
+# claude-service-template: 프로젝트 경로 주면 systemd user service 파일 stdout으로 출력.
+# Usage: claude-service-template <project-path>
+
+set -uo pipefail
+PROJECT_PATH="${1:?usage: $0 <project-path>}"
+if [ ! -d "$PROJECT_PATH" ]; then
+    echo "ERROR: $PROJECT_PATH not a directory" >&2
+    exit 1
+fi
+
+cat <<EOF
+[Unit]
+Description=Claude Code session for $(basename "$PROJECT_PATH") (telegram remote-control)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=${PROJECT_PATH}/.claude/telegram/.env
+
+[Service]
+Type=simple
+WorkingDirectory=${PROJECT_PATH}
+Environment="CLAUDE_SESSION_NAME=$(basename "$PROJECT_PATH" | tr '_' '-')"
+Environment="PATH=$HOME/.bun/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="TELEGRAM_STATE_DIR=${PROJECT_PATH}/.claude/telegram"
+Environment="TERM=xterm-256color"
+ExecStart=$HOME/.local/bin/claude-service-exec
+ExecStartPost=$HOME/.local/bin/claude-service-notify start claude-$(basename "$PROJECT_PATH" | tr '_' '-')
+ExecStopPost=$HOME/.local/bin/claude-service-notify stop claude-$(basename "$PROJECT_PATH" | tr '_' '-')
+Restart=always
+RestartSec=5
+StandardOutput=append:$HOME/.claude/logs/claude-$(basename "$PROJECT_PATH" | tr '_' '-').log
+StandardError=append:$HOME/.claude/logs/claude-$(basename "$PROJECT_PATH" | tr '_' '-').log
+KillMode=mixed
+TimeoutStopSec=20
+# 2026-05-21: cgroup 메모리 한도 제거. 5/17 도입한 MemoryMax=2G 가 jsonl 누적된
+# 활발한 세션에서 progress-updater 자식 OOM 유발 + precompact deadlock 악화 의심.
+
+[Install]
+WantedBy=default.target
+EOF

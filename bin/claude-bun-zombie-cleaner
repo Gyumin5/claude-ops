@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+claude-bun-zombie-cleaner
+
+plugin:telegram bun 프로세스 중 부모 세션이 죽어 orphan 으로 남은 것만 정리.
+"활성 세션의 정상 bun" 은 절대 건드리지 않음.
+
+판정 기준 (ALL 만족 시 SIGTERM):
+1) /proc/<pid>/exe 가 bun 바이너리
+2) cmdline 에 'plugin' + 'telegram' 포함
+3) /proc/<pid>/cgroup 의 claude-<proj>.service 가 (a) 존재 안 함(이탈/reparent) 또는
+   (b) 그 서비스가 inactive — 즉 부모 세션이 죽었는데 bun 만 orphan 으로 남은 경우.
+
+2026-06-18 (reconnect fix B): 기존엔 추가로 cwd 가 ' (deleted)' 여야 한다는 게이트가
+있었으나, 텔레그램 bun 의 cwd 는 플러그인 캐시 디렉터리라 보통 삭제되지 않아서
+부모 죽은 orphan 을 못 죽이는 맹점이 있었다(systemd 재시작/계정전환 후 옛 bun 이
+getUpdates 잠금을 물고 있어 새 bun 이 409 로 못 붙음). cwd 게이트를 제거하고
+orphan 판정을 cgroup 상태만으로 한다. active 서비스 cgroup 에 속한 bun 은 절대 안 죽임.
+
+2026-06-25 (cl-session fix): cgroup-only 판정이 cl 세션(systemd 서비스 아님) bun 을
+"no-cgroup" 으로 오인해 부모 claude 가 멀쩡히 살아있는데도 60초마다 죽이는 사고. cl 세션
+telegram 이 /mcp 재연결해도 다음 틱에 다시 끊김. 수정: no-cgroup 인 경우 bun 의 부모
+체인에 살아있는 claude 가 있으면 살린다(has_live_claude_ancestor). 부모가 죽어 init 으로
+reparent 된 진짜 orphan 만 죽인다 → 원래 목적(409 락 문 orphan 제거) 유지.
+
+--dry-run: 죽이지 않고 각 bun 의 판정만 출력(안전성 검증용).
+
+로그: ~/.claude/state/bun-zombie-cleaner.log (4KB 넘으면 truncate)
+"""
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+LOG = Path.home() / ".claude" / "state" / "bun-zombie-cleaner.log"
+LOG_MAX = 4096
+
+
+def log(line):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S KST")
+    try:
+        if LOG.is_file() and LOG.stat().st_size > LOG_MAX:
+            LOG.write_text("")
+        with LOG.open("a") as f:
+            f.write(f"[{ts}] {line}\n")
+    except Exception:
+        pass
+
+
+def cmdline(pid):
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="ignore")
+    except Exception:
+        return ""
+
+
+def cwd_link(pid):
+    try:
+        out = subprocess.run(
+            ["readlink", f"/proc/{pid}/cwd"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+        return out
+    except Exception:
+        return ""
+
+
+def cgroup_service(pid):
+    try:
+        cg = Path(f"/proc/{pid}/cgroup").read_text(errors="ignore")
+        m = re.search(r"claude-([^/]+)\.service", cg)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def service_active(proj):
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-active", f"claude-{proj}.service"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.stdout.strip() == "active"
+    except Exception:
+        # 판정 불가 시엔 보수적으로 active 취급(안 죽임)
+        return True
+
+
+def is_bun_process(pid):
+    """/proc/<pid>/exe 가 bun 바이너리이면 True. cmdline string match 보다 정확."""
+    try:
+        exe = subprocess.run(
+            ["readlink", f"/proc/{pid}/exe"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+        return exe.endswith("/bun") or exe == "/usr/bin/bun"
+    except Exception:
+        return False
+
+
+def ppid_of(pid):
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+        # comm 에 공백/괄호가 있을 수 있으므로 마지막 ')' 뒤에서 파싱. 그 뒤 2번째 필드가 ppid.
+        return int(data[data.rindex(")") + 1:].split()[1])
+    except Exception:
+        return None
+
+
+def comm_of(pid):
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except Exception:
+        return None
+
+
+def is_claude_proc(pid):
+    """진짜 claude 프로세스인지. comm 만으로는 스푸핑/우연 일치 위험이 있어
+    comm==claude AND cmdline 에 'claude' 포함을 함께 요구한다."""
+    if comm_of(pid) != "claude":
+        return False
+    return "claude" in cmdline(pid)
+
+
+def has_live_claude_ancestor(pid, max_depth=20):
+    """bun 의 부모 체인을 거슬러 살아있는 claude 세션이 있으면 True.
+    cl 세션 bun 은 claude-<proj>.service cgroup 이 없어도 부모 claude 가 살아있으므로
+    orphan 이 아니다. claude 가 죽어 init(pid 1) 으로 reparent 된 진짜 orphan 만 False.
+    depth 상한은 실제 cl 실행 체인(claude→bun run wrapper→bun server.ts 정도)보다 넉넉히
+    잡되 무한 루프(부모 사이클)만 막는 안전장치로 둔다."""
+    cur = ppid_of(pid)
+    depth = 0
+    while cur and cur > 1 and depth < max_depth:
+        if is_claude_proc(cur):
+            return True
+        cur = ppid_of(cur)
+        depth += 1
+    return False
+
+
+def is_orphan_bun(pid):
+    if not is_bun_process(pid):
+        return False, "not-bun-exe"
+    cmd = cmdline(pid)
+    if "plugin" not in cmd or "telegram" not in cmd:
+        return False, "not-telegram-plugin"
+    proj = cgroup_service(pid)
+    if proj is None:
+        # cgroup 매칭 실패. cl 세션(서비스 아님)이면 claude-*.service cgroup 이 없는 게 정상.
+        # 부모 claude 가 살아있으면 orphan 이 아니다 → 살린다. 부모가 죽어 reparent 된 것만 진짜 orphan.
+        if has_live_claude_ancestor(pid):
+            return False, "live-parent-no-cgroup"
+        return True, "no-cgroup-orphan"
+    if not service_active(proj):
+        return True, f"service-inactive:{proj}"
+    return False, f"active-service:{proj}"
+
+
+def main():
+    """orphan telegram bun (cgroup 없음 또는 service inactive) 만 SIGTERM. 알림 없음."""
+    dry = "--dry-run" in sys.argv or "-n" in sys.argv
+    try:
+        out = subprocess.run(
+            ["pgrep", "-x", "bun"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return
+    killed = 0
+    for line in out.splitlines():
+        pid = line.strip()
+        if not pid.isdigit():
+            continue
+        orphan, reason = is_orphan_bun(pid)
+        if dry:
+            # telegram-plugin bun 만 의미있게 출력(나머지 잡음 생략)
+            if reason != "not-bun-exe" and reason != "not-telegram-plugin":
+                verdict = "WOULD-KILL" if orphan else "SPARE"
+                print(f"{verdict:11} pid={pid} reason={reason} cwd={cwd_link(pid)}")
+            continue
+        if orphan:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+                log(f"killed pid={pid} reason={reason}")
+                killed += 1
+            except Exception as e:
+                log(f"kill-fail pid={pid} err={e}")
+    if killed:
+        log(f"total killed={killed}")
+
+
+if __name__ == "__main__":
+    main()

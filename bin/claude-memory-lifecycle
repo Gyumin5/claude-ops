@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""claude-memory-lifecycle <project-cwd>
+
+progress.md / history.md / history/active.md 의 deterministic lifecycle 자동화.
+
+처리 (LLM 사용 안 함, 정규식·상태 필드만):
+1. progress.md 의 [DECISION-CANDIDATE] 블록 → history.md ADR 추가 (필드 완성 시)
+   - 필드 누락 블록은 history/pending-promotions.md 에만 후보 보존
+   - 추가 후 progress.md 의 원문은 "Promoted: ADR-YYYY-MM-DD-NNN" 참조로 축약
+2. history.md > 200줄이면 Status: superseded/done/expired/obsolete 블록만
+   history/YYYY-MM.md 로 이동 (active.md 에서 ID 참조 중인 건 보존)
+3. progress.md "Do Not Repeat" 의 [DNR:STALE-CANDIDATE] 항목을 사용자 컨펌 리포트로만
+   (자동 삭제 금지). [DNR:PERMANENT]/[DNR:ACTIVE] 는 손대지 않음.
+
+안전장치:
+- ~/.cache/claude-memory-lifecycle/<key>.lock (flock 직렬화)
+- 매 변경 전 ~/.claude/state/memory-lifecycle/backups/<proj>/<ts>/{progress,history}.md 백업
+- DRY_RUN=1 환경변수 (기본): 실제 쓰기 안 함, 텔레그램 리포트만
+- 컨트롤봇 한 채팅으로 결과 알림 (chat_id TELEGRAM_CHAT_ID)
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+KST = timezone(timedelta(hours=9))
+CONTROL_BOT_ENV = Path.home() / ".claude" / "control-bot" / ".env"
+CONTROL_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+LOCK_DIR = Path.home() / ".cache" / "claude-memory-lifecycle"
+BACKUP_BASE = Path.home() / ".claude" / "state" / "memory-lifecycle" / "backups"
+DECISION_MARKER = "[DECISION-CANDIDATE]"
+DNR_MARKERS = {
+    "PERMANENT": "[DNR:PERMANENT]",
+    "ACTIVE": "[DNR:ACTIVE]",
+    "STALE": "[DNR:STALE-CANDIDATE]",
+}
+HISTORY_LINE_THRESHOLD = 200
+REQUIRED_FIELDS = ["Decision", "Rationale", "Revert if", "Experiment", "Scope"]
+ARCHIVABLE_STATUSES = {"superseded", "done", "expired", "obsolete"}
+
+
+def load_token():
+    if not CONTROL_BOT_ENV.is_file():
+        return None
+    for line in CONTROL_BOT_ENV.read_text().splitlines():
+        if "=" in line and not line.strip().startswith("#"):
+            k, v = line.split("=", 1)
+            if k.strip() == "CONTROL_BOT_TOKEN":
+                return v.strip().strip('"').strip("'")
+    return None
+
+
+def telegram_send(token, text):
+    if not token:
+        return False
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": CONTROL_CHAT_ID, "text": text}).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=8).read()
+        return True
+    except Exception:
+        return False
+
+
+def project_key(cwd):
+    return cwd.replace("/", "-").replace("_", "-").lstrip("-")
+
+
+def active_session_cwds():
+    """지금 돌고 있는 세션 유닛의 작업 디렉토리 목록.
+
+    템플릿 인스턴스(claude-session-nudge@x.service)와 일회성 잡(Transient=yes)은
+    세션이 아니라 뺀다. systemd 가 없거나 유닛이 없으면 빈 목록이다.
+    """
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "list-units", "--plain", "--no-legend",
+             "--type=service", "--state=active", "claude-*.service"],
+            capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in out.splitlines():
+        unit = line.split()[0] if line.split() else ""
+        if not unit.endswith(".service") or "@" in unit:
+            continue
+        try:
+            props = subprocess.run(
+                ["systemctl", "--user", "show", unit,
+                 "-p", "WorkingDirectory", "-p", "Transient"],
+                capture_output=True, text=True, timeout=20).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if "Transient=yes" in props:
+            continue
+        for l in props.splitlines():
+            if l.startswith("WorkingDirectory="):
+                cwd = l.split("=", 1)[1]
+                if cwd and Path(cwd).is_dir() and cwd not in found:
+                    found.append(cwd)
+    return found
+
+
+def acquire_lock(key):
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    fp = open(LOCK_DIR / f"{key}.lock", "w")
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fp
+    except BlockingIOError:
+        fp.close()
+        return None
+
+
+def now_iso_kst():
+    return datetime.now(tz=KST).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def backup_before_write(proj_name, prog_path, hist_path):
+    ts = datetime.now(tz=KST).strftime("%Y%m%d-%H%M%S")
+    bdir = BACKUP_BASE / proj_name / ts
+    bdir.mkdir(parents=True, exist_ok=True)
+    if prog_path.is_file():
+        (bdir / "progress.md").write_text(prog_path.read_text(), encoding="utf-8")
+    if hist_path.is_file():
+        (bdir / "history.md").write_text(hist_path.read_text(), encoding="utf-8")
+    # 30일 이상 backup 정리
+    cutoff = time.time() - 30 * 86400
+    for p in (BACKUP_BASE / proj_name).glob("*"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                for f in p.glob("*"):
+                    f.unlink()
+                p.rmdir()
+        except Exception:
+            pass
+    return bdir
+
+
+def atomic_write(path, content):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
+def parse_decision_candidates(progress_text):
+    """[DECISION-CANDIDATE] 블록 추출.
+
+    형식 예:
+      [DECISION-CANDIDATE]
+      Decision: ...
+      Rationale: ...
+      Revert if: ...
+      Experiment: (optional)
+      Scope: ...
+      [/DECISION-CANDIDATE]
+    """
+    blocks = []
+    pattern = re.compile(
+        r"\[DECISION-CANDIDATE\](.*?)\[/DECISION-CANDIDATE\]",
+        re.DOTALL,
+    )
+    for m in pattern.finditer(progress_text):
+        body = m.group(1)
+        fields = {}
+        for line in body.strip().splitlines():
+            mo = re.match(r"\s*([A-Za-z][A-Za-z ]+?)\s*:\s*(.*)$", line)
+            if mo:
+                fields[mo.group(1).strip()] = mo.group(2).strip()
+        missing = [f for f in REQUIRED_FIELDS if not fields.get(f)]
+        blocks.append({
+            "raw": m.group(0),
+            "span": m.span(),
+            "fields": fields,
+            "missing": missing,
+        })
+    return blocks
+
+
+def next_adr_id(history_text, today):
+    """ADR-YYYY-MM-DD-NNN 형식의 다음 시퀀스 번호 결정."""
+    prefix = f"ADR-{today.strftime('%Y-%m-%d')}-"
+    used = set()
+    for m in re.finditer(re.escape(prefix) + r"(\d{3})", history_text):
+        used.add(int(m.group(1)))
+    n = 1
+    while n in used:
+        n += 1
+    return f"{prefix}{n:03d}"
+
+
+def render_adr_block(adr_id, fields, source_proj):
+    lines = [
+        f"## {adr_id}",
+        f"Date: {datetime.now(tz=KST).strftime('%Y-%m-%d')}",
+        f"Status: proposed",
+        f"Source: {source_proj}/progress.md",
+    ]
+    for k in REQUIRED_FIELDS:
+        v = fields.get(k, "").strip()
+        if v:
+            lines.append(f"{k}: {v}")
+    if fields.get("Supersedes"):
+        lines.append(f"Supersedes: {fields['Supersedes']}")
+    return "\n".join(lines) + "\n"
+
+
+def parse_dnr_section(progress_text):
+    """progress.md 의 'Do Not Repeat' 섹션 추출, 마커별 분류."""
+    m = re.search(r"^##\s*Do Not Repeat\s*$(.*?)(?=^##\s|\Z)", progress_text, re.MULTILINE | re.DOTALL)
+    if not m:
+        return {"raw": "", "permanent": [], "active": [], "stale": [], "unmarked": []}
+    section = m.group(1)
+    permanent, active, stale, unmarked = [], [], [], []
+    for line in section.splitlines():
+        s = line.strip()
+        if not s.startswith("-"):
+            continue
+        if DNR_MARKERS["PERMANENT"] in s:
+            permanent.append(s)
+        elif DNR_MARKERS["ACTIVE"] in s:
+            active.append(s)
+        elif DNR_MARKERS["STALE"] in s:
+            stale.append(s)
+        else:
+            unmarked.append(s)
+    return {
+        "raw": section,
+        "permanent": permanent,
+        "active": active,
+        "stale": stale,
+        "unmarked": unmarked,
+    }
+
+
+def parse_history_blocks(history_text):
+    """history.md 를 ADR 블록 단위로 split."""
+    blocks = []
+    cur = []
+    cur_id = None
+    for line in history_text.splitlines(keepends=True):
+        m = re.match(r"^##\s+(\S+)", line)
+        if m and (m.group(1).startswith("ADR-") or re.match(r"\[\d{4}-\d{2}-\d{2}\]", m.group(1))):
+            if cur:
+                blocks.append({"id": cur_id, "text": "".join(cur)})
+            cur = [line]
+            cur_id = m.group(1)
+        else:
+            cur.append(line)
+    if cur:
+        blocks.append({"id": cur_id, "text": "".join(cur)})
+    return blocks
+
+
+def block_status(block_text):
+    m = re.search(r"^Status\s*:\s*(\w+)", block_text, re.MULTILINE)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+def extract_active_refs(active_path):
+    """active.md 에서 참조된 ADR ID 목록."""
+    if not active_path.is_file():
+        return set()
+    text = active_path.read_text()
+    return set(re.findall(r"ADR-\d{4}-\d{2}-\d{2}-\d{3}", text))
+
+
+def lifecycle_one(cwd, dry_run, report):
+    proj_name = Path(cwd).name
+    cwd_path = Path(cwd)
+    prog_path = cwd_path / "progress.md"
+    hist_path = cwd_path / "history.md"
+    active_path = cwd_path / "history" / "active.md"
+    pending_path = cwd_path / "history" / "pending-promotions.md"
+    archive_dir = cwd_path / "history"
+
+    findings = {
+        "project": proj_name,
+        "promotion_ok": [],
+        "promotion_pending": [],
+        "archive_moved": 0,
+        "dnr_stale_count": 0,
+        "errors": [],
+    }
+
+    if not prog_path.is_file() and not hist_path.is_file():
+        return findings  # nothing to do
+
+    today = datetime.now(tz=KST).date()
+    progress_text = prog_path.read_text() if prog_path.is_file() else ""
+    history_text = hist_path.read_text() if hist_path.is_file() else ""
+    active_refs = extract_active_refs(active_path)
+
+    # ===== 1. promotion =====
+    candidates = parse_decision_candidates(progress_text)
+    new_history_appendix = ""
+    new_progress_text = progress_text
+    pending_appendix = ""
+
+    for cand in candidates:
+        if cand["missing"]:
+            findings["promotion_pending"].append({
+                "missing": cand["missing"],
+                "snippet": cand["raw"][:200].replace("\n", " "),
+            })
+            pending_appendix += "\n\n## pending @ " + now_iso_kst() + "\n"
+            pending_appendix += f"missing: {','.join(cand['missing'])}\n"
+            pending_appendix += cand["raw"] + "\n"
+        else:
+            adr_id = next_adr_id(history_text + new_history_appendix, today)
+            block = render_adr_block(adr_id, cand["fields"], proj_name)
+            new_history_appendix += "\n" + block
+            findings["promotion_ok"].append(adr_id)
+            # progress.md 원문 → 짧은 참조로 교체 (멱등을 위해 raw 텍스트 자체를 치환)
+            replacement = f"[Promoted: {adr_id}]"
+            new_progress_text = new_progress_text.replace(cand["raw"], replacement, 1)
+
+    # ===== 2. archive =====
+    archived_blocks = []
+    new_history_text = history_text + new_history_appendix
+    line_count = new_history_text.count("\n") + 1
+    if line_count > HISTORY_LINE_THRESHOLD:
+        blocks = parse_history_blocks(new_history_text)
+        keep = []
+        for b in blocks:
+            st = block_status(b["text"])
+            bid = b.get("id") or ""
+            if st in ARCHIVABLE_STATUSES and bid not in active_refs and bid.startswith("ADR-"):
+                archived_blocks.append(b)
+            else:
+                keep.append(b)
+        if archived_blocks:
+            findings["archive_moved"] = len(archived_blocks)
+            new_history_text = "".join(b["text"] for b in keep)
+
+    # ===== 3. DNR 분류 (리포트만) =====
+    dnr = parse_dnr_section(progress_text)
+    findings["dnr_stale_count"] = len(dnr["stale"])
+
+    # ===== 쓰기 (DRY_RUN 아닐 때) =====
+    if not dry_run and (findings["promotion_ok"] or findings["promotion_pending"] or archived_blocks):
+        backup_before_write(proj_name, prog_path, hist_path)
+        if findings["promotion_ok"] or findings["promotion_pending"] or archived_blocks:
+            if findings["promotion_ok"] or new_history_appendix or archived_blocks:
+                # history.md 갱신
+                final_history = (new_history_text or history_text)
+                if hist_path.is_file() or final_history:
+                    atomic_write(hist_path, final_history)
+            if findings["promotion_ok"]:
+                atomic_write(prog_path, new_progress_text)
+            if findings["promotion_pending"] and pending_appendix:
+                pending_path.parent.mkdir(parents=True, exist_ok=True)
+                existing_pending = pending_path.read_text() if pending_path.is_file() else ""
+                atomic_write(pending_path, existing_pending + pending_appendix)
+            if archived_blocks:
+                ym = today.strftime("%Y-%m")
+                archive_path = archive_dir / f"{ym}.md"
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                archive_existing = archive_path.read_text() if archive_path.is_file() else ""
+                atomic_write(archive_path, archive_existing + "".join(b["text"] for b in archived_blocks))
+
+    report.append(findings)
+    return findings
+
+
+def format_report(reports, dry_run):
+    if not reports:
+        return None
+    has_action = any(
+        r["promotion_ok"] or r["promotion_pending"] or r["archive_moved"] or r["dnr_stale_count"]
+        for r in reports
+    )
+    if not has_action:
+        return None
+    lines = [f"[memory-lifecycle] {datetime.now(tz=KST).strftime('%Y-%m-%d %H:%M KST')} {'DRY-RUN' if dry_run else 'APPLIED'}"]
+    for r in reports:
+        if not (r["promotion_ok"] or r["promotion_pending"] or r["archive_moved"] or r["dnr_stale_count"]):
+            continue
+        lines.append(f"- {r['project']}:")
+        if r["promotion_ok"]:
+            lines.append(f"    promote OK: {', '.join(r['promotion_ok'])}")
+        if r["promotion_pending"]:
+            lines.append(f"    promote pending (필드 누락): {len(r['promotion_pending'])}건")
+            for p in r["promotion_pending"][:3]:
+                lines.append(f"      missing={','.join(p['missing'])}: {p['snippet'][:80]}")
+        if r["archive_moved"]:
+            lines.append(f"    archive 이동: {r['archive_moved']}블록 → history/YYYY-MM.md")
+        if r["dnr_stale_count"]:
+            lines.append(f"    DNR stale 후보: {r['dnr_stale_count']}항목 (자동 삭제 안 함, 검토 필요)")
+        if r["errors"]:
+            lines.append(f"    오류: {'; '.join(r['errors'])}")
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cwd", help="프로젝트 cwd 또는 'all' (모든 cs 관리 세션 순회)")
+    ap.add_argument("--no-dry-run", action="store_true", help="실제 쓰기 모드 (기본은 DRY_RUN)")
+    args = ap.parse_args()
+
+    dry_run = (os.environ.get("DRY_RUN", "1") == "1") and not args.no_dry_run
+    if args.no_dry_run:
+        dry_run = False
+
+    targets = []
+    if args.cwd == "all":
+        # 대상은 지금 돌고 있는 세션 유닛의 작업 디렉토리다. 목록을 코드에 박아 두면
+        # 세션이 늘거나 줄 때 조용히 어긋난다 — claude-progress-updater-all 과 같은 자리를 본다.
+        targets = active_session_cwds()
+    else:
+        targets.append(args.cwd)
+
+    reports = []
+    for cwd in targets:
+        key = project_key(cwd)
+        lk = acquire_lock(key)
+        if lk is None:
+            reports.append({"project": Path(cwd).name, "errors": ["lock busy"], "promotion_ok": [], "promotion_pending": [], "archive_moved": 0, "dnr_stale_count": 0})
+            continue
+        try:
+            lifecycle_one(cwd, dry_run, reports)
+        except Exception as e:
+            reports.append({"project": Path(cwd).name, "errors": [str(e)], "promotion_ok": [], "promotion_pending": [], "archive_moved": 0, "dnr_stale_count": 0})
+        finally:
+            try:
+                fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
+                lk.close()
+            except Exception:
+                pass
+
+    text = format_report(reports, dry_run)
+    if text:
+        token = load_token()
+        if not telegram_send(token, text):
+            print(text)
+
+
+if __name__ == "__main__":
+    main()

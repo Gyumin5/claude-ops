@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""코덱스 한도 사용률 추적.
+
+codex 는 회차마다 ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl 에
+계정 한도 사용률(rate_limits.used_percent)과 토큰 사용량을 남긴다.
+이 스크립트는 그 기록만 읽는다 — 별도 수집기도, codex 호출도 없다.
+
+판정 기준은 사용률이다. 토큰 수는 한도와 비례하지 않아(모델·캐시·요금제에 따라
+같은 토큰이 다른 몫을 먹는다) 얼마나 남았는지를 말해주지 못한다.
+
+한도는 계정 하나에 붙어 두 호스트가 같이 쓴다. 그래서 여기 나오는 사용률은
+이 기계의 몫이 아니라 계정 전체의 값이고, 다른 기계에서 쓴 것도 함께 올라간다.
+
+  codex-usage                 최근 24시간 사용률 추이
+  codex-usage --hours 168     최근 7일
+  codex-usage --tokens        토큰 사용량 표도 같이
+  codex-usage --json          기계용 출력
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+
+KST = timezone(timedelta(hours=9))
+SESSIONS = os.path.expanduser("~/.codex/sessions")
+
+
+def candidate_files(start):
+    """창 안에 걸칠 수 있는 rollout 파일만 고른다.
+
+    날짜 폴더로 범위를 좁히지 않는다. codex 는 대화를 시작한 날짜 폴더에 계속
+    덧붙이므로, 오래 열려 있는 대화는 지금 쓰고 있어도 옛 폴더에 있다. 폴더를
+    기준으로 고르면 그런 대화가 최근 구간에서 통째로 빠진다 (2026-09-15 옆 기계
+    실측: 7일치가 1억 2,513만으로 나왔는데 실제는 3억 6,522만이고, 빠진
+    2억 3,955만이 13일째 살아 있는 대화 하나였다. 홈에도 폴더 날짜를 최대
+    7.4일 넘겨 쓰인 파일이 24개 있다).
+
+    그래서 트리 전체를 훑고 최종수정 시각으로만 고른다. 파일 5천 개 기준
+    0.02초라 폴더 제한으로 아낄 것이 없다. 창 밖 기록이 섞여 들어오는 것은
+    parse() 가 줄마다 타임스탬프로 다시 거른다.
+    """
+    out = []
+    cut = start.timestamp()
+    for root, _, names in os.walk(SESSIONS):
+        for name in names:
+            if not name.startswith("rollout-") or not name.endswith(".jsonl"):
+                continue
+            p = os.path.join(root, name)
+            try:
+                if os.path.getmtime(p) >= cut:
+                    out.append(p)
+            except OSError:
+                pass
+    return out
+
+
+def to_kst(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(KST)
+    except ValueError:
+        return None
+
+
+def parse(paths, start):
+    """(토큰 회차, 한도 관측) 를 시간순으로 돌려준다."""
+    turns = []   # (시각, cwd, usage dict)
+    limits = []  # (시각, rate_limits dict)
+    for p in paths:
+        cwd = None
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if '"session_meta"' in line and cwd is None:
+                        try:
+                            cwd = json.loads(line)["payload"].get("cwd")
+                        except Exception:
+                            pass
+                        continue
+                    if '"token_usage_record"' not in line and '"rate_limits"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    when = to_kst(d.get("timestamp"))
+                    if when is None or when < start:
+                        continue
+                    if d.get("type") == "token_usage_record":
+                        u = (d.get("payload") or {}).get("usage") or {}
+                        turns.append((when, cwd or "?", u))
+                        continue
+                    rl = (d.get("payload") or {}).get("rate_limits")
+                    if isinstance(rl, dict):
+                        limits.append((when, rl))
+        except OSError:
+            continue
+    turns.sort(key=lambda t: t[0])
+    limits.sort(key=lambda t: t[0])
+    return turns, limits
+
+
+def windows(limits):
+    """관측 안에 실제로 나온 한도 창 이름을 순서대로 돌려준다."""
+    out = []
+    for _, rl in limits:
+        for key in ("primary", "secondary"):
+            if isinstance(rl.get(key), dict) and key not in out:
+                out.append(key)
+    return out
+
+
+def series(limits, key):
+    """시간대별 (그 시간의 사용률, 관측 수, 그 시간의 소모 %p, 초기화 여부).
+
+    한 시간 안의 대표값은 최대값으로 잡는다. 코덱스 세션이 여러 개 동시에 돌면
+    각자 마지막으로 받은 값을 적어서 1~2%p 뒤처진 값이 섞여 들어오는데,
+    사용률은 창이 초기화될 때 말고는 내려가지 않으므로 최대값이 그 시간의 실제 값이다.
+    창 초기화는 값이 떨어진 것으로 판정하지 않고 초기화 시각(resets_at)이 바뀐 것으로 판정한다.
+    """
+    rows = {}
+    for when, rl in limits:
+        w = rl.get(key)
+        if not isinstance(w, dict):
+            continue
+        pct = w.get("used_percent")
+        if pct is None:
+            continue
+        hour = when.replace(minute=0, second=0, microsecond=0)
+        r = rows.setdefault(hour, {"사용률": pct, "관측": 0, "소모": None,
+                                   "초기화": False, "창": w.get("resets_at")})
+        r["관측"] += 1
+        r["사용률"] = max(r["사용률"], pct)
+        r["창"] = w.get("resets_at")
+
+    prev = None
+    for hour in sorted(rows):
+        r = rows[hour]
+        if prev is None:
+            r["소모"] = None            # 창의 첫 시간은 그 전을 못 봐서 소모를 못 낸다
+        elif r["창"] != prev["창"]:
+            r["초기화"] = True          # 한도 창이 새로 시작됐다
+            r["소모"] = r["사용률"]
+        else:
+            r["소모"] = max(0.0, r["사용률"] - prev["사용률"])
+        prev = r
+    return rows
+
+
+def last_window(limits, key):
+    for when, rl in reversed(limits):
+        w = rl.get(key)
+        if isinstance(w, dict) and w.get("used_percent") is not None:
+            return when, w
+    return None, None
+
+
+def last_plan(limits):
+    for _, rl in reversed(limits):
+        if rl.get("plan_type"):
+            return rl["plan_type"]
+    return "?"
+
+
+def span_hours(limits, key):
+    """그 창의 첫 관측과 마지막 관측 사이 시간."""
+    seen = [when for when, rl in limits if isinstance(rl.get(key), dict)]
+    if len(seen) < 2:
+        return 0.0
+    return (seen[-1] - seen[0]).total_seconds() / 3600
+
+
+def window_label(w):
+    mins = w.get("window_minutes") or 0
+    if mins >= 1440:
+        return f"{mins // 1440}일"
+    if mins >= 60:
+        return f"{mins // 60}시간"
+    return f"{mins}분"
+
+
+def print_percent(limits, key, title):
+    rows = series(limits, key)
+    when, w = last_window(limits, key)
+    print(f"{title}({window_label(w)} 창)")
+    print()
+    if not rows:
+        print("  이 창 안에 관측이 없다 — 그 사이 코덱스를 안 돌렸다는 뜻이다.")
+        print()
+        return
+    print(f"  {'시각':<12}{'사용률':>8}{'남은':>8}{'이 시간 소모':>14}{'관측':>6}")
+    burned = 0.0
+    reset_seen = False
+    for hour, r in sorted(rows.items()):
+        mark = "  창 초기화" if r["초기화"] else ""
+        reset_seen = reset_seen or r["초기화"]
+        if r["소모"] is None:
+            step = f"{'—':>12}"
+        else:
+            burned += r["소모"]
+            step = f"{r['소모']:>11.1f}%p"
+        print(f"  {hour:%m-%d %H시}   {r['사용률']:>7.1f}%{100 - r['사용률']:>7.1f}%"
+              f"{step}{r['관측']:>6}{mark}")
+    print()
+
+    hours = span_hours(limits, key)
+    rate = burned / hours if hours >= 1 else 0.0
+    print(f"  관측 구간 {hours:.1f}시간 동안 {burned:.1f}%p 소모"
+          + (f" · 시간당 평균 {rate:.2f}%p" if rate else ""))
+    if reset_seen:
+        print("  구간 안에서 창이 새로 시작됐다 — 그 시간의 소모는 초기화 뒤에 쓴 몫이다.")
+
+    used = w.get("used_percent")
+    left = 100 - used
+    now = datetime.now(KST)
+    line = f"  지금 {used:.1f}% 사용 · 남은 {left:.1f}%p · 마지막 관측 {when:%m-%d %H:%M}"
+    if w.get("resets_at"):
+        reset_at = datetime.fromtimestamp(w["resets_at"], KST)
+        to_reset = (reset_at - now).total_seconds() / 3600
+        line += f" · 초기화 {reset_at:%m-%d %H:%M}({to_reset:.0f}시간 뒤)"
+        print(line)
+        if rate > 0:
+            to_empty = left / rate
+            if to_empty < to_reset:
+                print(f"  이 속도면 {to_empty:.0f}시간 뒤 소진 — 초기화보다"
+                      f" {to_reset - to_empty:.0f}시간 이르다. 그 전에 줄여야 한다.")
+            else:
+                print(f"  이 속도면 소진까지 {to_empty:.0f}시간이라 초기화가 먼저 온다"
+                      f"(여유 {to_empty - to_reset:.0f}시간).")
+        else:
+            print("  소모 속도를 낼 관측이 모자라 소진 시점은 못 낸다.")
+    else:
+        print(line)
+    print()
+
+
+def bucket(turns):
+    rows = {}
+    for when, cwd, u in turns:
+        key = when.replace(minute=0, second=0, microsecond=0)
+        r = rows.setdefault(key, {"호출": 0, "입력": 0, "캐시입력": 0, "출력": 0,
+                                  "추론": 0, "합계": 0})
+        r["호출"] += 1
+        r["입력"] += u.get("input_tokens", 0)
+        r["캐시입력"] += u.get("cached_input_tokens", 0)
+        r["출력"] += u.get("output_tokens", 0)
+        r["추론"] += u.get("reasoning_output_tokens", 0)
+        r["합계"] += u.get("total_tokens", 0)
+    return rows
+
+
+def print_tokens(turns):
+    rows = bucket(turns)
+    print("토큰 사용량 (한도와 비례하지 않는다 — 참고용)")
+    print()
+    if not rows:
+        print("  이 창 안에 코덱스 호출이 없다.")
+        print()
+        return
+    print(f"  {'시각':<12}{'호출':>5}{'입력':>12}{'출력':>10}{'추론':>10}{'합계':>12}")
+    tot = {"호출": 0, "입력": 0, "캐시입력": 0, "출력": 0, "추론": 0, "합계": 0}
+    for k, v in sorted(rows.items()):
+        print(f"  {k:%m-%d %H시}   {v['호출']:>5}{v['입력']:>12,}{v['출력']:>10,}"
+              f"{v['추론']:>10,}{v['합계']:>12,}")
+        for kk in tot:
+            tot[kk] += v[kk]
+    print(f"  {'합계':<12}{tot['호출']:>5}{tot['입력']:>12,}{tot['출력']:>10,}"
+          f"{tot['추론']:>10,}{tot['합계']:>12,}")
+    share = 100 * (tot["출력"] + tot["추론"]) / max(1, tot["합계"])
+    cached = 100 * tot["캐시입력"] / max(1, tot["입력"])
+    print(f"  입력이 합계의 {100 - share:.1f}% (그 중 캐시 재사용 {cached:.1f}%) · "
+          f"출력+추론은 {share:.1f}%")
+    print()
+    print_by_session(turns, tot["합계"])
+
+
+def by_session(turns):
+    """작업 디렉토리별 (호출 수, 합계 토큰). rollout 의 session_meta.cwd 로 가른다."""
+    rows = {}
+    for _, cwd, u in turns:
+        r = rows.setdefault(cwd, {"호출": 0, "합계": 0})
+        r["호출"] += 1
+        r["합계"] += u.get("total_tokens", 0)
+    return rows
+
+
+# 회차 폴더. 그 아래는 그 회차의 내부 구조라 작업 이름이 아니다.
+RUN_DIR = re.compile(r"^run-\d{8}T\d{6}Z?$")
+
+
+def work_name(cwd):
+    """사람이 읽을 작업 이름. 홈을 떼고, 회차 폴더에서 끊는다.
+
+    잎 폴더 이름으로 고르면 한 작업이 여러 줄로 흩어진다 — 토론은 회차마다 새 폴더를
+    만들고 그 안 arbiter·r2.debater.codex 에서 돌아서 한 토론이 여러 줄이 된다
+    (2026-09-15 옆 기계 관측). 반대로 첫 조각만 쓰면 work/test/session-d 이 work 로
+    뭉개져 어느 작업인지 사라진다. 그래서 경로를 살리되 회차 폴더에서만 끊는다.
+    """
+    home = os.path.expanduser("~")
+    p = cwd.rstrip("/")
+    if p == home:
+        return "홈 디렉토리"
+    if not p.startswith(home + "/"):
+        return p
+    segs = p[len(home) + 1:].split("/")
+    for i, seg in enumerate(segs):
+        if RUN_DIR.match(seg):
+            segs = segs[:i]
+            break
+    return "/".join(segs) or "홈 디렉토리"
+
+
+def print_by_session(turns, grand):
+    """어느 작업이 먹었는지. 한도가 찼을 때 볼 곳이 여기다."""
+    rows = {}
+    for cwd, v in by_session(turns).items():
+        r = rows.setdefault(work_name(cwd), {"호출": 0, "합계": 0})
+        r["호출"] += v["호출"]
+        r["합계"] += v["합계"]
+    if not rows:
+        return
+    print("세션별 (작업 디렉토리 기준)")
+    print()
+    print(f"  {'작업':<26}{'호출':>6}{'합계':>14}{'비중':>8}{'호출당':>10}")
+    for name, v in sorted(rows.items(), key=lambda kv: -kv[1]["합계"]):
+        pct = 100 * v["합계"] / max(1, grand)
+        print(f"  {name[-26:]:<26}{v['호출']:>6}{v['합계']:>14,}{pct:>7.1f}%"
+              f"{v['합계'] // max(1, v['호출']):>10,}")
+    print()
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--hours", type=int, default=24)
+    ap.add_argument("--tokens", action="store_true", help="토큰 사용량 표도 같이 낸다")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    start = datetime.now(KST) - timedelta(hours=a.hours)
+    turns, limits = parse(candidate_files(start), start)
+    keys = windows(limits)
+
+    if a.json:
+        out = {
+            "hours": a.hours,
+            "start_kst": start.isoformat(),
+            "rate_limit": None,
+            "rate_limit_series": {},
+        }
+        for key in keys:
+            when, w = last_window(limits, key)
+            rows = series(limits, key)
+            burned = sum(r["소모"] for r in rows.values() if r["소모"] is not None)
+            hours = span_hours(limits, key)
+            out["rate_limit_series"][key] = {
+                "observed_kst": when.isoformat(),
+                "used_percent": w.get("used_percent"),
+                "remaining_percent": round(100 - w.get("used_percent", 0), 3),
+                "window_minutes": w.get("window_minutes"),
+                "resets_at": w.get("resets_at"),
+                "plan_type": last_plan(limits),
+                "burned_percent_points": round(burned, 3),
+                "observed_span_hours": round(hours, 3),
+                "burn_rate_per_hour": round(burned / hours, 4) if hours >= 1 else None,
+                "hourly": [
+                    {"hour_kst": h.isoformat(), "used_percent": r["사용률"],
+                     "remaining_percent": round(100 - r["사용률"], 3),
+                     "burned_percent_points": (round(r["소모"], 3)
+                                               if r["소모"] is not None else None),
+                     "observations": r["관측"], "window_reset": r["초기화"]}
+                    for h, r in sorted(rows.items())
+                ],
+            }
+        if limits:
+            # 옛 판과 같은 모양으로 둔다 — 홈의 감시가 이 칸을 읽는다.
+            when, rl = limits[-1]
+            out["rate_limit"] = {"observed_kst": when.isoformat(), **rl}
+        rows = bucket(turns)
+        out["hourly"] = [{"hour_kst": k.isoformat(), **v} for k, v in sorted(rows.items())]
+        out["by_session"] = [
+            {"cwd": cwd, "호출": v["호출"], "합계": v["합계"]}
+            for cwd, v in sorted(by_session(turns).items(), key=lambda kv: -kv[1]["합계"])
+        ]
+        json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
+        print()
+        return
+
+    host = os.uname().nodename
+    print(f"코덱스 한도 사용률 — 계정 공용(홈·옆 기계 합산) · 관측 기계 {host}"
+          f" · 최근 {a.hours}시간 (KST)")
+    print()
+    if not keys:
+        print("이 창 안에 한도 관측이 없다 — 그 사이 코덱스를 안 돌렸다는 뜻이다.")
+        return
+    for key in keys:
+        title = "주 한도" if key == "primary" else "보조 한도"
+        print_percent(limits, key, title)
+    print(f"요금제 {last_plan(limits)}")
+    if a.tokens:
+        print()
+        print_tokens(turns)
+
+
+if __name__ == "__main__":
+    main()

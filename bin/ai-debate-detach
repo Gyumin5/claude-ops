@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""ai-debate-detach — 토론을 세션 밖 유닛에서 돌리고, 끝나면 결과 캡슐을 세션에 넣는다.
+
+왜: ai-debate 를 세션이 Bash 도구로 직접 부르면 도구 상한 600초에 걸려 런이 통째로
+유실된다. 라운드 안은 병렬이지만 라운드는 순차라 기본 2라운드+arbiter 는 600초를 넘기기
+쉽다(단일 외부호출 실측 중앙값 176초·p90 342초·최대 495초). 그렇다고 run_in_background
+로 띄우면 세션 소프트 재시작에 자식이 같이 죽어 결과가 조용히 사라진다 — 그건 끊김보다
+나쁘다. 그래서 claude-job-detach 로 세션 밖 systemd 유닛에 맡긴다.
+
+판정 근거: ai-debate run-20260828T145237Z (3의견 전원 "예외 없이 전량 detach").
+비판 역할 셋이 지적한 전달·중복·신선도 문제는 층을 나눠 2층으로 미뤘다 — 지금은
+실패를 조용히 넘기지 않는 것까지만 한다(주입 실패는 rc 4 로 시끄럽게 죽는다).
+
+쓰는 법(세션에서):
+    cat brief.md | ai-debate-detach [--slug <이름>] "<질문>" [ai-debate 옵션...]
+바로 돌아온다. 결과는 끝난 뒤 이 세션으로 주입되고, 원문은 run_dir 에 남는다.
+
+내부 모드(사람이 직접 부르지 않는다):
+    ai-debate-detach --run <workdir>
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+SELF = os.path.realpath(__file__)
+CAPSULE_MAX = 1800          # 세션 주입 상한 2,000자 규약 아래로 둔다
+INJECT_FAIL_RC = 4
+
+
+def die(msg, rc=2):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(rc)
+
+
+def slugify(text, fallback="debate"):
+    s = re.sub(r"[^0-9A-Za-z가-힣]+", "-", text or "").strip("-")
+    s = s[:40].strip("-")
+    return s or fallback
+
+
+# ── 바깥 모드: 브리프를 파일로 굳히고 detach 에 넘긴다 ──────────────────────
+def submit(argv):
+    slug = None
+    rest = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--slug":
+            if i + 1 >= len(argv):
+                die("usage: --slug <이름>")
+            slug = argv[i + 1]
+            i += 2
+            continue
+        rest.append(argv[i])
+        i += 1
+
+    if not rest:
+        die('usage: cat brief.md | ai-debate-detach [--slug <이름>] "<질문>" [옵션...]')
+
+    brief = ""
+    if not sys.stdin.isatty():
+        brief = sys.stdin.read()
+
+    task = next((a for a in rest if not a.startswith("-")), "")
+    slug = slugify(slug or task)
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    workdir = os.path.join(os.getcwd(), "state", "ai-debate", "%s-%s" % (stamp, slug))
+    try:
+        os.makedirs(workdir, exist_ok=True)
+        with open(os.path.join(workdir, "brief.md"), "w") as f:
+            f.write(brief)
+        with open(os.path.join(workdir, "args.json"), "w") as f:
+            json.dump({"args": rest, "task": task, "cwd": os.getcwd()}, f, ensure_ascii=False)
+    except OSError as e:
+        die("작업 폴더를 못 만들었다: %s (%s)" % (workdir, e))
+
+    detach = os.path.join(HOME, "dotfiles", "bin", "claude-job-detach")
+    if not os.path.exists(detach):
+        die("claude-job-detach 가 없다: %s" % detach)
+
+    # 성공 알림은 끄고(캡슐은 우리가 직접 넣는다) 실패 알림만 detach 에 맡긴다.
+    cmd = [detach, "--slug", "aidebate-" + slug, "--", SELF, "--run", workdir]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        die("detach 시작 실패 rc=%d — 토론은 안 돌았다." % r.returncode, rc=3)
+
+    print("토론을 세션 밖에서 시작했다. 이번 턴에는 결과가 없다.")
+    print("작업폴더: %s" % workdir)
+    print("끝나면 이 세션으로 요약과 경로가 주입된다. 실패해도 알림이 온다.")
+    return 0
+
+
+# ── 안쪽 모드: 실제로 돌리고 캡슐을 만들어 주입한다 ────────────────────────
+def capsule_from(out, task, dur):
+    run_dir = ""
+    m = re.search(r"^artifacts=(\S+)", out, re.M)
+    if m:
+        run_dir = m.group(1)
+    head = ""
+    m = re.search(r"^rounds=.*$", out, re.M)
+    if m:
+        head = m.group(0)
+    agents = ""
+    m = re.search(r"^agents: .*$", out, re.M)
+    if m:
+        agents = m.group(0)
+
+    # 정본은 run_dir 의 구조화 산출물이다. stdout 정규식은 arbiter 가 없을 때만 쓴다
+    # (성공 콜이 모자라면 ai-debate 가 arbiter 를 건너뛰고 라운드 결과만 남긴다).
+    final = steps = ""
+    if run_dir:
+        try:
+            with open(os.path.join(run_dir, "arbiter.normalized.json")) as f:
+                arb = json.load(f)
+            final = re.sub(r"\s+", " ", str(arb.get("final_decision") or "")).strip()
+            steps = re.sub(r"\s+", " ", str(arb.get("action_steps") or "")).strip()
+        except Exception:
+            pass
+    if not final:
+        m = re.search(r"^FINAL: (.*?)(?=\n\s*(?:rationale|action_steps):)", out, re.M | re.S)
+        if m:
+            final = re.sub(r"\s+", " ", m.group(1)).strip()
+    if not steps:
+        m = re.search(r"^\s*action_steps: (.*?)(?=\n\s*verification_plan:)", out, re.M | re.S)
+        if m:
+            steps = re.sub(r"\s+", " ", m.group(1)).strip()
+
+    # 결손 줄은 ai-debate 가 만든 그 문자열을 그대로 옮긴다. 여기서 다시 만들면
+    # 결론과 주입 요약이 서로 다른 말을 하게 된다. 맨 앞에 두는 이유는 길이 제한이
+    # 꼬리부터 자르기 때문이다 — 잘려도 결손은 남는다.
+    deficit = ""
+    if run_dir:
+        for name in ("final_result.json", "metering.json"):
+            try:
+                with open(os.path.join(run_dir, name)) as f:
+                    deficit = (json.load(f).get("deficit_header") or "").strip()
+            except Exception:
+                continue
+            if deficit:
+                break
+
+    parts = []
+    if deficit:
+        parts.append(deficit)
+    parts.append("[토론 결과] %s (%d초)" % (task[:80] or "제목없음", dur))
+    if head:
+        parts.append(head)
+    if agents:
+        parts.append(agents)
+    if final:
+        parts.append("결론: " + final[:700])
+    if steps:
+        parts.append("다음 행동: " + steps[:400])
+    if run_dir:
+        parts.append("원문: " + run_dir)
+    parts.append("(요약이다. 판단 전에 원문을 읽어라.)")
+
+    cap = "\n".join(parts)
+    if len(cap) > CAPSULE_MAX:
+        cap = cap[:CAPSULE_MAX - 40].rstrip() + "\n… 잘렸다. 원문: " + (run_dir or "run_dir 불명")
+    return cap
+
+
+def inject(text):
+    session = (os.environ.get("CLAUDE_DETACH_ORIGIN_SESSION")
+               or os.environ.get("CLAUDE_SESSION_NAME") or "").strip()
+    if not session:
+        return False, "발신 세션명을 모른다(CLAUDE_DETACH_ORIGIN_SESSION 없음)"
+    send = os.path.join(HOME, "dotfiles", "bin", "claude-userbot-send")
+    if not os.path.exists(send):
+        return False, "claude-userbot-send 가 없다"
+    r = subprocess.run([send, "--session", session, text],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return False, "주입 rc=%d %s" % (r.returncode, (r.stderr or "").strip()[:200])
+    return True, session
+
+
+def run(workdir):
+    try:
+        with open(os.path.join(workdir, "args.json")) as f:
+            meta = json.load(f)
+    except Exception as e:
+        die("작업 폴더를 못 읽었다: %s (%s)" % (workdir, e), rc=3)
+
+    brief_path = os.path.join(workdir, "brief.md")
+    brief = ""
+    if os.path.exists(brief_path):
+        with open(brief_path) as f:
+            brief = f.read()
+
+    started = time.time()
+    r = subprocess.run([os.path.join(HOME, ".local", "bin", "ai-debate")] + meta["args"],
+                       input=brief, capture_output=True, text=True)
+    dur = int(time.time() - started)
+    out = (r.stdout or "") + "\n" + (r.stderr or "")
+    try:
+        with open(os.path.join(workdir, "run.log"), "w") as f:
+            f.write(out)
+    except OSError:
+        pass
+    sys.stdout.write(out)
+
+    if r.returncode != 0:
+        # 실패는 detach 가 알린다 — 여기서 캡슐을 만들지 않는다.
+        return r.returncode
+
+    cap = capsule_from(out, meta.get("task", ""), dur)
+    try:
+        with open(os.path.join(workdir, "capsule.txt"), "w") as f:
+            f.write(cap)
+    except OSError:
+        pass
+
+    ok, why = inject(cap)
+    if not ok:
+        sys.stderr.write("토론은 끝났는데 결과를 세션에 못 넣었다: %s\n"
+                         "캡슐: %s/capsule.txt\n" % (why, workdir))
+        return INJECT_FAIL_RC
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--run":
+        if len(argv) < 2:
+            die("usage(inner): ai-debate-detach --run <workdir>")
+        return run(argv[1])
+    return submit(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

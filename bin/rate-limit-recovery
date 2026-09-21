@@ -1,0 +1,537 @@
+#!/bin/bash
+# rate-limit-recovery: 차단 → 해제 전환 감지 후 알림 (필요 시 userbot trigger).
+# systemd timer가 5분마다 호출.
+#
+# 동작:
+# - rate_limits 조회 (statusline_cache.json)
+# - 이전 상태 (~/.claude/state/rate-limit-blocked.flag) 와 비교
+# - 차단 → 해제 전환이고 큐 파일에 항목 있으면 → 텔레그램 알림 + (TODO: userbot trigger)
+# - userbot 미도입 상태에서는 사용자가 아무 메시지나 보내면 큐 flush됨.
+
+set -uo pipefail
+
+THRESHOLD_5H=90
+THRESHOLD_7D=99
+CACHE=~/.claude/statusline_cache.json
+QUEUE_DIR=~/.claude/state/rate-limit-queue
+STATE_FLAG=~/.claude/state/rate-limit-blocked.flag
+FALLBACK_TELEGRAM_ENV=~/dotfiles/.claude/telegram/.env
+# 고아 큐 가드(2026-07-27 ai-debate run-20260727T094804Z). TTL 을 flush 훅이 아니라
+# "실제 소비 경로"인 여기서 늙힌다 — 대응 세션이 없으면 flush 훅 자체가 영원히 안 돌아
+# 만료 판정이 일어나지 않는다(peer 실측: scratchpad_plugin_ctrl 큐가 14일 생존하며
+# fallback 봇으로 가짜 알림을 계속 냈다). 새 스위퍼·기동 훅은 만들지 않는다.
+QUEUE_TTL_SEC=21600                                        # 6h. flush 훅과 같은 기준.
+QUARANTINE_DIR=~/.claude/state/orphan-queue-quarantine     # 활성 디렉토리 밖(스캔 대상 아님)
+RECOVERY_LOG=~/.claude/state/rate-limit-queue/recovery.log
+# userbot 자동 재개: 큐 있는 세션 봇에 trigger:queue-flush 발송 → prompt-guard 가 큐 처리.
+USERBOT_SEND="$HOME/.local/bin/claude-userbot-send"
+USERBOT_SESSION="$HOME/.claude/userbot/userbot.session"
+# peer 처럼 유저봇이 없는 PC 는 relay.conf 의 USERBOT_HOST 로 home 에 ssh 위임.
+RELAY_CONF="$HOME/.claude/userbot/relay.conf"
+
+[ -f "$CACHE" ] || exit 0
+
+# --- 모름 구간과 실측 프로브 (2026-08-30, ai-debate run-20260829T232742Z 결론 D) ---
+UNKNOWN_SINCE=~/.claude/state/rate-limit-unknown-since
+PROBE_STATE=~/.claude/state/rate-limit-probe-next
+PROBE_MCP=~/.claude/state/rate-limit-probe-mcp.json
+UNKNOWN_ALERT_SEC=$((60 * 60))
+PROBE_BACKOFF_STEPS="600 1200 2400 3600"      # 10 → 20 → 40 → 60분, 60분에서 유지
+
+log_line() {
+    mkdir -p "$(dirname "$RECOVERY_LOG")"
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$RECOVERY_LOG"
+}
+
+# 모름 상태로 큐를 안고 오래 머무는 것을 사람이 알게 한다. 이 사고의 본질은
+# 6시간 동안 아무도 몰랐다는 것이다 — 판정이 무엇이든 이건 보여야 한다.
+note_unknown_with_queue() {
+    local now first
+    now=$(date +%s)
+    if [ ! -f "$UNKNOWN_SINCE" ]; then
+        echo "$now" > "$UNKNOWN_SINCE"
+        return 0
+    fi
+    first=$(cat "$UNKNOWN_SINCE" 2>/dev/null || echo "$now")
+    [ $((now - first)) -lt "$UNKNOWN_ALERT_SEC" ] && return 0
+    [ -f "${UNKNOWN_SINCE}.alerted" ] && return 0
+    local env_file="$FALLBACK_TELEGRAM_ENV"
+    if [ -f "$env_file" ]; then
+        # shellcheck disable=SC1090
+        . "$env_file"
+        if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+                --data-urlencode "text=[$(hostname)] 한도 상태를 $((( now - first ) / 60))분째 모른 채 큐가 남아 있다. 사용량 캐시가 낡아 수치를 못 믿고, 실측 호출도 아직 성공하지 못했다. 스스로 못 풀면 사람이 볼 자리다. 로그: ${RECOVERY_LOG}" \
+                >/dev/null 2>&1
+            touch "${UNKNOWN_SINCE}.alerted"
+        fi
+    fi
+    log_line "unknown-with-queue $(((now - first) / 60))분 — 사람에게 알림"
+}
+
+# 낡은 수치로는 해제를 확정할 수 없다. 계정이 실제로 응답하는지 한 번 찔러본다.
+# 성공(rc=0 + 비어있지 않은 응답)만 해제의 양성 증거다. 429·인증오류·타임아웃·빈
+# 응답은 전부 실패로 본다. 실패하면 10→20→40→60분으로 늘리며 재시도한다.
+probe_release() {
+    local now next step rc out
+    now=$(date +%s)
+    next=0; step=0
+    if [ -f "$PROBE_STATE" ]; then
+        next=$(cut -d' ' -f1 "$PROBE_STATE" 2>/dev/null || echo 0)
+        step=$(cut -d' ' -f2 "$PROBE_STATE" 2>/dev/null || echo 0)
+    fi
+    [ "$now" -lt "$next" ] 2>/dev/null && return 1     # 백오프 중
+    local cli="$HOME/.local/bin/claude"
+    [ -x "$cli" ] || { log_line "probe 건너뜀 — claude 없음"; return 1; }
+    # 부모 세션 MCP 를 안 건드리는 격리 호출(빈 mcp 강제). 도구를 안 쓰는 한 줄 질의다.
+    echo '{"mcpServers":{}}' > "$PROBE_MCP"
+    out=$(cd "$HOME" && CLAUDE_AUTOMATED=1 timeout 120 "$cli" \
+        --strict-mcp-config --mcp-config "$PROBE_MCP" -p "pong" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -eq 0 ] && [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
+        rm -f "$PROBE_STATE"
+        log_line "probe 성공 — 해제 확정(캐시는 $QUOTA_STATUS)"
+        return 0
+    fi
+    # 실패. 다음 시각을 뒤로 민다.
+    local i=0 wait=600
+    for s in $PROBE_BACKOFF_STEPS; do
+        [ "$i" -eq "$step" ] && wait="$s"
+        i=$((i + 1))
+    done
+    [ "$step" -lt 3 ] && step=$((step + 1))
+    echo "$((now + wait)) $step" > "$PROBE_STATE"
+    log_line "probe 실패 rc=$rc — $((wait / 60))분 뒤 재시도"
+    return 1
+}
+
+# rate-limits 조회 — 판정 규칙은 lib 한 벌(claude-quota-observe)에 있다.
+# 옛 방식은 이 계산을 여기·rate-limit-guard.sh·rate-limit-prompt-guard.sh 에 복제해
+# 뒀고 셋 다 cached_at 을 안 봤다. 그 계산은 resets_at 이 지난 창만 0 으로 만드는데,
+# 얼어붙은 캐시의 7일 창은 리셋이 아직 미래라 얼어붙은 99% 가 그대로 살아남는다.
+# 그래서 한도가 실제로 풀린 뒤에도 CURRENTLY_BLOCKED 이 유지돼 큐가 안 비워졌다
+# (2026-08-28 옆 기계 6시간). ai-debate run-20260829T232742Z 결론 D.
+OBSERVE="$(dirname "$(realpath "$0")")/claude-quota-observe"
+[ -x "$OBSERVE" ] || OBSERVE="$HOME/.local/bin/claude-quota-observe"
+eval "$("$OBSERVE" --sh 2>/dev/null)"
+# 관측 자체가 실패하면 아무것도 하지 않는다(플래그 보존). 다음 tick 에서 다시 본다.
+[ -z "${QUOTA_STATUS:-}" ] && exit 0
+PCT_5H="${QUOTA_FH_PCT:--1}"
+PCT_7D="${QUOTA_SD_PCT:--1}"
+
+has_pending_queue() {
+    [ -d "$QUEUE_DIR" ] || return 1
+    for f in "$QUEUE_DIR"/*.jsonl; do
+        # <proj>.flushed.jsonl 은 처리 완료 보관본 — 대기 큐가 아니다.
+        case "$f" in *.flushed.jsonl) continue ;; esac
+        [ -f "$f" ] && [ -s "$f" ] && return 0
+    done
+    return 1
+}
+
+WAS_BLOCKED=false
+[ -f "$STATE_FLAG" ] && WAS_BLOCKED=true
+
+mkdir -p "$(dirname "$STATE_FLAG")"
+
+# 신선한 관측이 임계를 넘었다 = 확실히 차단이다.
+if [ "$QUOTA_BLOCKED" = "true" ]; then
+    touch "$STATE_FLAG"
+    rm -f "$UNKNOWN_SINCE" "${UNKNOWN_SINCE}.alerted"   # 모름 구간이 아니다
+    exit 0
+fi
+
+# 관측이 신선하지 않다 = 모른다. 낡은 수치는 차단의 근거도 해제의 근거도 아니다.
+# 큐가 없으면 해제를 확정할 이유가 없으니 그냥 둔다(플래그 보존).
+# 큐가 있으면 누군가 막혀 있었다는 뜻이고, 그건 스스로 못 빠져나오는 순환이다
+# (막혀서 턴이 없고 → 턴이 없어서 캐시가 안 갱신되고 → 낡은 수치로 계속 막힌다).
+# 그때만 격리 헤드리스 호출로 실측해서 해제를 확정한다.
+if [ "$QUOTA_STATUS" != "fresh" ]; then
+    has_pending_queue || exit 0
+    note_unknown_with_queue
+    probe_release || exit 0
+fi
+rm -f "$UNKNOWN_SINCE" "${UNKNOWN_SINCE}.alerted"
+
+# 현재 안 차단됨. 이전에도 안 차단됐으면 보통 할 일 없음 — 단, 잔여 큐가 있으면
+# (이전 flush 시도가 실패/미소비된 경우) trigger_flush만 조용히 재시도한다.
+# 알림 발송·bypass flag 자동정리는 아래에서 전환 tick(IS_RETRY_ONLY=false)에서만 실행.
+# (2026-07-09: 전환 순간 1회만 시도하고 실패하면 영영 재시도 안 하던 버그 수정 —
+#  peer-dotfiles 큐 8개가 이걸로 stuck됐던 사고. peer 쪽 session-a 사고의 자체
+#  ai-debate run-20260709T012629Z 도 동일 결론 — level-triggered 재시도 + per-project
+#  cooldown/backoff로 전환.)
+IS_RETRY_ONLY=false
+if [ "$WAS_BLOCKED" = false ]; then
+    has_pending_queue || exit 0
+    IS_RETRY_ONLY=true
+fi
+
+CLEARED_BYPASS=""
+if [ "$IS_RETRY_ONLY" = false ]; then
+    # 차단 → 해제 전환. flag 제거.
+    rm -f "$STATE_FLAG"
+    # bypass flag 자동 정리는 "진짜 리셋"(임계보다 충분히 아래로 회복)인 경우에만.
+    # % 일시적 하락(92→89)에선 bypass 유지 — 사용자가 켜둔 의도가 살아있음.
+    # (구버전은 ==0 만 인정했으나, 리셋돼도 세션이 즉시 소량 소비해 정확히 0이 안 돼
+    #  bypass flag가 영영 안 풀리는 버그. 2026-06-29: 5h<50% 또는 7d<90% 면 진짜 리셋.
+    #  PCT=-1 은 statusline 읽기 실패이므로 리셋으로 보지 않음(보수적).)
+    TRUE_RESET=false
+    if [ "$PCT_5H" -ge 0 ] 2>/dev/null && [ "$PCT_5H" -lt 50 ] 2>/dev/null; then TRUE_RESET=true; fi
+    if [ "$PCT_7D" -ge 0 ] 2>/dev/null && [ "$PCT_7D" -lt 90 ] 2>/dev/null; then TRUE_RESET=true; fi
+    if [ "$TRUE_RESET" = true ]; then
+        for bf in ~/.claude/state/rate-limit-bypass.flag ~/.claude/state/rate-limit-bypass-*.flag; do
+            [ -f "$bf" ] || continue
+            rm -f "$bf"
+            CLEARED_BYPASS="${CLEARED_BYPASS}$(basename "$bf") "
+        done
+    fi
+fi
+
+# 프로젝트의 telegram .env 경로를 fallback 없이 해석. 못 찾으면 빈 문자열.
+# trigger 발송처럼 "틀리면 남의 봇으로 오배송"되는 경로는 반드시 이걸 써야 한다
+# (peer 실측 발견: FALLBACK_TELEGRAM_ENV 로 떨어져 leg_imu_learned_estimator 의
+#  trigger 가 peer-dotfiles 자기 봇으로 새던 실회귀, 2026-07-09 — fail-closed 원칙
+#  위반이었음).
+resolve_env_file_strict() {
+    # fail-closed 라우팅 해석. 신뢰 원천은 세션 자신의 systemd WorkingDirectory 하나뿐.
+    # 큐의 .cwd 는 stale·교차오염될 수 있어(실측: peer.cwd 가 session-a 하위를 가리킴) 라우팅
+    # 근거로 신뢰하지 않는다 — cwd 부모탐색으로 남의 세션 트리 .env 를 주우면 오배송이 된다.
+    # proj(=큐 키=세션명) → claude-<proj>.service 의 WorkingDirectory 에 있는 .env 만 채택.
+    # WD 없음/= $HOME/파일없음/symlink 탈출은 전부 빈값(스킵). 이름추측 fallback(~/proj 등) 제거.
+    # (2026-07-14 ai-debate run-20260714T100636Z: 명시적 세션 루트 바인딩. cwd 인자는 미사용.)
+    local proj="$1" cwd="$2" wd="" real="" env_file=""
+    [ -n "$proj" ] || { echo ""; return; }
+    wd=$(systemctl --user show "claude-${proj}.service" -p WorkingDirectory 2>/dev/null | sed 's/^WorkingDirectory=//')
+    [ -n "$wd" ] || { echo ""; return; }
+    wd=$(realpath -e "$wd" 2>/dev/null) || { echo ""; return; }
+    { [ "$wd" != "/" ] && [ "$wd" != "$HOME" ]; } || { echo ""; return; }
+    env_file="${wd}/.claude/telegram/.env"
+    [ -f "$env_file" ] || { echo ""; return; }
+    real=$(realpath -e "$env_file" 2>/dev/null) || { echo ""; return; }
+    case "$real" in
+        "$wd"/*) echo "$env_file" ;;   # env 실경로가 세션 루트 하위일 때만 채택
+        *) echo "" ;;                    # symlink 이 루트 밖으로 탈출 → 거부
+    esac
+}
+
+# 큐 소유자 판정. no-unit(대응 유닛 자체가 없음=진짜 고아) / unit-no-env(유닛은 있는데
+# 전용 .env 해석 실패=일시적·설정 문제) / ok. 둘을 구분하는 게 중요하다 — 유닛이 살아있는데
+# systemd 응답이 일시적으로 비었다고 큐를 격리하면 사용자 실제 메시지를 잃는다.
+queue_owner_state() {
+    local proj="$1" cwd="$2" load=""
+    load=$(systemctl --user show "claude-${proj}.service" -p LoadState --value 2>/dev/null)
+    if [ -z "$load" ] || [ "$load" = "not-found" ]; then echo "no-unit"; return; fi
+    if [ -z "$(resolve_env_file_strict "$proj" "$cwd")" ]; then echo "unit-no-env"; return; fi
+    echo "ok"
+}
+
+# 만료·malformed 레코드를 큐에서 제거(원자적). stdout: "<유효생존> <만료> <malformed>".
+# 호출자는 반드시 <proj>.lock 을 flock 으로 잡은 상태여야 한다(flush 훅과 같은 락).
+queue_prune() {
+    local f="$1" ttl="$2"
+    python3 - "$f" "$ttl" <<'PY' 2>/dev/null || echo "-1 0 0"
+import json, os, sys, time
+path, ttl = sys.argv[1], int(sys.argv[2])
+now = int(time.time())
+keep, expired, malformed = [], 0, 0
+try:
+    with open(path, errors="replace") as fh:
+        lines = fh.read().splitlines()
+except OSError:
+    print("-1 0 0"); raise SystemExit(0)
+for line in lines:
+    if not line.strip():
+        continue
+    try:
+        d = json.loads(line)
+        if not isinstance(d, dict) or "prompt" not in d:
+            malformed += 1; continue
+        ts = int(d.get("ts_unix") or 0)
+    except Exception:
+        malformed += 1; continue
+    if ts <= 0 or now - ts > ttl:
+        expired += 1; continue
+    keep.append(line)
+tmp = path + ".tmp.%d" % os.getpid()
+with open(tmp, "w") as fh:
+    for line in keep:
+        fh.write(line + "\n")
+os.replace(tmp, path)
+print("%d %d %d" % (len(keep), expired, malformed))
+PY
+}
+
+# 큐 일가족을 활성 디렉토리 밖으로 격리(증거 보존). 인플레이스 개명(.orphan.bak)은
+# 스캔 제외가 보장되지 않아 쓰지 않는다. .lock 은 fd 를 잡고 있어 그대로 둔다(0바이트).
+quarantine_queue() {
+    local proj="$1" reason="$2" ts dst
+    ts=$(date +%Y%m%dT%H%M%S)
+    dst="$QUARANTINE_DIR/${proj}.${ts}"
+    mkdir -p "$dst" 2>/dev/null || return 1
+    chmod 700 "$QUARANTINE_DIR" "$dst" 2>/dev/null || true
+    {
+        echo "quarantined_at=$(date -Iseconds)"
+        echo "proj=$proj"
+        echo "reason=$reason"
+        echo "host=$(uname -n)"
+    } > "$dst/meta.txt"
+    local moved=0 src
+    for suffix in .jsonl .cwd .recovery-state.json; do
+        src="$QUEUE_DIR/${proj}${suffix}"
+        [ -f "$src" ] || continue
+        printf 'file=%s size=%s mtime=%s sha256=%s\n' "${proj}${suffix}" \
+            "$(stat -c %s "$src" 2>/dev/null)" "$(stat -c %y "$src" 2>/dev/null)" \
+            "$(sha256sum "$src" 2>/dev/null | cut -d' ' -f1)" >> "$dst/meta.txt"
+        mv -f "$src" "$dst/" 2>/dev/null && moved=$((moved + 1))
+    done
+    echo "$(date -Iseconds) proj=${proj} action=quarantine reason=${reason} moved=${moved} dst=${dst}" \
+        >> "$RECOVERY_LOG" 2>/dev/null
+    return 0
+}
+
+# 프로젝트의 telegram .env 경로 해석, 못 찾으면 fallback. 사람에게 보이는 "알림"
+# 전용(어떤 채널로든 사람이 보기만 하면 되므로 fallback 이 안전) — trigger 발송에는
+# 쓰지 말 것(위 strict 버전 사용).
+resolve_env_file() {
+    local env_file
+    env_file=$(resolve_env_file_strict "$1" "$2")
+    [ -f "$env_file" ] || env_file="$FALLBACK_TELEGRAM_ENV"
+    echo "$env_file"
+}
+
+# 해당 봇의 @username 을 getMe 로 조회 (토큰은 이 PC 에 머물고 username 만 반환).
+resolve_bot_username() {
+    local env_file="$1"
+    [ -f "$env_file" ] || return 1
+    ( . "$env_file"
+      [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || exit 1
+      curl -s --max-time 8 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" \
+        | python3 -c 'import json,sys
+try:
+  u=json.load(sys.stdin)["result"]["username"]
+  print("@"+u)
+except: sys.exit(1)' ) 2>/dev/null
+}
+
+# 큐 자동 재개 trigger 발송. 성공 0, 실패 1.
+# 세션 이름이 아니라 그 PC 가 자기 .env 에서 알아낸 봇 @username 으로 보냄
+# → home/peer 세션 이름 충돌(둘 다 'dotfiles') 원천 차단.
+# 1) 로컬 유저봇 (home) → claude-userbot-send <@bot> 직접.
+# 2) 유저봇 없는 PC (peer) → relay.conf USERBOT_HOST 로 home 유저봇에 ssh 위임.
+trigger_flush() {
+    local env_file="$1" botuser=""
+    botuser=$(resolve_bot_username "$env_file")
+    [ -n "$botuser" ] || return 1
+    # --delete-after 600(10분): 세션 전용 봇 채팅이라 노이즈보다 유실복구·사후감사 가치가 큼
+    # (기존 8초는 delivery window가 너무 짧아 유실 시 원인 추적 불가 — ai-debate
+    #  run-20260709T012629Z action_step 8, 2026-07-09 변경).
+    if [ -x "$USERBOT_SEND" ] && [ -f "$USERBOT_SESSION" ]; then
+        "$USERBOT_SEND" --no-origin --delete-after 600 "$botuser" "trigger:queue-flush" >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    if [ -f "$RELAY_CONF" ]; then
+        # shellcheck disable=SC1090
+        . "$RELAY_CONF"
+        if [ -n "${USERBOT_HOST:-}" ]; then
+            # 비대화형 ssh 는 ~/.local/bin 이 PATH 에 없으므로 절대경로(~remote 확장).
+            ssh -o BatchMode=yes -o ConnectTimeout=20 "$USERBOT_HOST" \
+                "~/.local/bin/claude-userbot-send --no-origin --delete-after 600 '${botuser}' 'trigger:queue-flush'" >/dev/null 2>&1 && return 0
+        fi
+    fi
+    return 1
+}
+
+# 알림은 각 프로젝트 봇 채팅으로 송신 (사용자: 각 세션 알림은 그 세션 봇으로).
+send_project_alert() {
+    local proj="$1" env_file="$2" qcount="$3" triggered="${4:-false}"
+    [ -f "$env_file" ] || return 0
+    ( . "$env_file"
+      if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+          local bypass_note=""
+          [ -n "$CLEARED_BYPASS" ] && bypass_note=" (bypass flag 자동 해제: ${CLEARED_BYPASS})"
+          if [ "$qcount" -gt 0 ] && [ "$triggered" = true ]; then
+              msg="rate-limit 해제 (5h ${PCT_5H}%, 7d ${PCT_7D}%)${bypass_note}. 큐 ${qcount}개 자동 재개 중 (유저봇 trigger 발송)."
+          elif [ "$qcount" -gt 0 ]; then
+              msg="rate-limit 해제 (5h ${PCT_5H}%, 7d ${PCT_7D}%)${bypass_note}. 큐 ${qcount}개 대기. 아무 메시지나 보내면 자동 처리됨."
+          else
+              msg="rate-limit 해제 (5h ${PCT_5H}%, 7d ${PCT_7D}%)${bypass_note}. 큐 비어있음."
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+              --data-urlencode "text=${msg}" >/dev/null 2>&1
+      fi
+    )
+}
+
+# 프로젝트별 재시도 상태(큐 signature + backoff): $QUEUE_DIR/<proj>.recovery-state.json
+# signature 가 바뀌면(새 큐 내용) attempts 리셋 + 즉시 재시도. 같으면(이전 시도 실패,
+# 큐 그대로) next_due_at 전까지 조용히 skip, 실패 반복시 10/20/40/60분 backoff(상한 유지,
+# 완전 중단은 안 함). ai-debate run-20260709T012629Z action_steps 4-6.
+recovery_queue_signature() {
+    python3 -c '
+import os, sys
+qfile = sys.argv[1]
+try:
+    st = os.stat(qfile)
+    n = sum(1 for _ in open(qfile))
+    print("{}:{}:{}".format(st.st_size, int(st.st_mtime), n))
+except Exception:
+    print("")
+' "$1"
+}
+
+recovery_state_due() {
+    # $1=state_file $2=signature → stdout "DUE" 또는 "WAIT"
+    python3 -c '
+import json, sys, time
+state_file, sig = sys.argv[1], sys.argv[2]
+try:
+    st = json.load(open(state_file))
+except Exception:
+    st = {}
+if st.get("signature") != sig:
+    print("DUE")
+else:
+    print("DUE" if time.time() >= st.get("next_due_at", 0) else "WAIT")
+' "$1" "$2"
+}
+
+recovery_state_record() {
+    # $1=state_file $2=signature $3=success(true/false, 로깅 전용) $4=error(optional)
+    # backoff 은 "trigger_flush 가 성공했는가"가 아니라 "큐 내용이 그대로인가"로 결정한다.
+    # send 는 성공해도 대상 세션이 죽어있으면 아무도 소비 안 해 signature 가 그대로임 —
+    # 그 경우 success=true 로 매번 attempts 리셋하면 영원히 5분마다 재발송(수렴 안 함).
+    # (peer 실측검증 run-20260709 발견 갭 수정 — 2026-07-09.)
+    python3 -c '
+import json, sys, time
+state_file, sig, success, err = sys.argv[1], sys.argv[2], sys.argv[3] == "true", sys.argv[4]
+try:
+    st = json.load(open(state_file))
+except Exception:
+    st = {}
+same_content = st.get("signature") == sig
+if same_content:
+    attempts = st.get("attempts", 0) + 1
+    backoff = [600, 1200, 2400, 3600]  # 10/20/40/60분, 이후 60분 유지
+    next_due = time.time() + backoff[min(attempts - 1, len(backoff) - 1)]
+else:
+    attempts = 0
+    next_due = 0
+json.dump({"signature": sig, "attempts": attempts, "next_due_at": next_due,
+           "last_exit_code": 0 if success else 1, "last_error": err,
+           "last_trigger_at": time.time()}, open(state_file, "w"))
+' "$1" "$2" "$3" "$4"
+}
+
+NOTIFIED=false
+if [ -d "$QUEUE_DIR" ]; then
+    # 큐 있는 프로젝트 우선
+    for f in "$QUEUE_DIR"/*.jsonl; do
+        [ -f "$f" ] || continue
+        # <proj>.flushed.jsonl 은 처리 완료 보관본 — 대기 큐로 세면 proj 가
+        # "<세션>.flushed" 가 되어 유닛 해석이 깨지고 가짜 알림이 fallback 봇으로 쏟아진다.
+        case "$f" in *.flushed.jsonl) continue ;; esac
+        proj=$(basename "$f" .jsonl)
+        cwd_file="$QUEUE_DIR/${proj}.cwd"
+        cwd=""
+        [ -f "$cwd_file" ] && cwd=$(cat "$cwd_file")
+
+        # ---- 고아 큐 가드 (flush 훅과 같은 락 안에서 판정) ----
+        # 락을 못 잡으면 그 세션이 지금 flush 중이므로 이번 라운드는 건드리지 않는다.
+        exec 201>"$QUEUE_DIR/${proj}.lock" 2>/dev/null || true
+        if ! flock -w 2 -x 201 2>/dev/null; then
+            exec 201>&- 2>/dev/null || true
+            continue
+        fi
+        PRUNE=$(queue_prune "$f" "$QUEUE_TTL_SEC")
+        n=$(echo "$PRUNE" | awk '{print $1}')
+        n_exp=$(echo "$PRUNE" | awk '{print $2}')
+        n_bad=$(echo "$PRUNE" | awk '{print $3}')
+        case "${n:-x}" in ''|*[!0-9-]*) n=-1 ;; esac
+        OWNER=$(queue_owner_state "$proj" "$cwd")
+        if [ "$n" = "-1" ]; then
+            # 파싱 자체가 실패 — 조용히 넘기지 않고 격리(증거 보존) 후 로그.
+            quarantine_queue "$proj" "queue-unreadable"
+            flock -u 201 2>/dev/null || true; exec 201>&- 2>/dev/null || true
+            continue
+        fi
+        if [ "${n_exp:-0}" -gt 0 ] || [ "${n_bad:-0}" -gt 0 ]; then
+            echo "$(date -Iseconds) proj=${proj} action=prune kept=${n} expired=${n_exp} malformed=${n_bad} owner=${OWNER}" \
+                >> "$RECOVERY_LOG" 2>/dev/null
+        fi
+        if [ "$n" -eq 0 ]; then
+            # 살아있는 레코드가 없다. malformed 가 있었다면 증거로 격리, 아니면 조용히 종료.
+            if [ "${n_bad:-0}" -gt 0 ]; then
+                quarantine_queue "$proj" "only-malformed-records"
+            fi
+            flock -u 201 2>/dev/null || true; exec 201>&- 2>/dev/null || true
+            continue
+        fi
+        if [ "$OWNER" = "no-unit" ]; then
+            # 대응 세션 유닛이 아예 없다 = 진짜 고아. fallback 봇으로 알리지 않고 격리한다.
+            # (이게 peer scratchpad_plugin_ctrl 이 14일간 가짜 알림을 낸 경로다.)
+            quarantine_queue "$proj" "no-owner-unit(live=${n})"
+            flock -u 201 2>/dev/null || true; exec 201>&- 2>/dev/null || true
+            continue
+        fi
+        if [ "$OWNER" = "unit-no-env" ]; then
+            # 유닛은 있는데 전용 .env 해석 실패. 일시적일 수 있어 격리하지 않는다.
+            # 다만 fallback 봇 알림도 보내지 않는다 — 그게 오배송·알림홍수의 원인이었다.
+            echo "$(date -Iseconds) proj=${proj} action=skip-notify reason=unit-no-env queue=${n}" \
+                >> "$RECOVERY_LOG" 2>/dev/null
+            flock -u 201 2>/dev/null || true; exec 201>&- 2>/dev/null || true
+            continue
+        fi
+        flock -u 201 2>/dev/null || true; exec 201>&- 2>/dev/null || true
+        # ---- 가드 끝. 여기 온 큐 = 살아있는 레코드 + 소유자 검증됨 ----
+
+        if [ "$n" -gt 0 ]; then
+            STATE_FILE="$QUEUE_DIR/${proj}.recovery-state.json"
+            SIG=$(recovery_queue_signature "$f")
+            DUE=$(recovery_state_due "$STATE_FILE" "$SIG")
+            if [ "$DUE" != "DUE" ]; then
+                continue
+            fi
+            # trigger 발송은 fail-closed(strict) — 프로젝트 전용 .env 못 찾으면
+            # 남의 봇으로 보내지 말고 스킵. 알림(사람용)은 fallback 허용.
+            strict_env_file=$(resolve_env_file_strict "$proj" "$cwd")
+            env_file=$(resolve_env_file "$proj" "$cwd")
+            TRIGGERED=false
+            ERRMSG=""
+            if [ -z "$strict_env_file" ]; then
+                ERRMSG="env 매핑 실패(프로젝트 전용 .env 없음 — trigger 스킵, 오배송 방지)"
+            elif trigger_flush "$strict_env_file"; then
+                TRIGGERED=true
+            else
+                ERRMSG="trigger_flush 실패(username 매핑누락 또는 userbot/ssh 전송실패)"
+            fi
+            recovery_state_record "$STATE_FILE" "$SIG" "$TRIGGERED" "$ERRMSG"
+            echo "$(date -Iseconds) proj=${proj} queue=${n} triggered=${TRIGGERED} sig=${SIG} err=${ERRMSG:-none}" >> "$RECOVERY_LOG" 2>/dev/null
+            if [ "$IS_RETRY_ONLY" = false ]; then
+                send_project_alert "$proj" "$env_file" "$n" "$TRIGGERED"
+                NOTIFIED=true
+            fi
+        fi
+    done
+fi
+
+# 큐 비어있어도 해제 사실은 컨트롤봇 한 채팅에 1회 표시 (모든 프로젝트 알림 분산되어
+# 어디서도 안 받으면 사용자가 해제 시각 모를 수 있음). 큐 있는 프로젝트별 알림과 별개.
+CONTROL_BOT_ENV=~/.claude/control-bot/.env
+if [ "$NOTIFIED" = false ] && [ "$IS_RETRY_ONLY" = false ] && [ -f "$CONTROL_BOT_ENV" ]; then
+    . "$CONTROL_BOT_ENV"
+    if [ -n "${CONTROL_BOT_TOKEN:-}" ]; then
+        msg="rate-limit 해제 (5h ${PCT_5H}%, 7d ${PCT_7D}%). 큐 비어있음."
+        curl -s -X POST "https://api.telegram.org/bot${CONTROL_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+            --data-urlencode "text=${msg}" >/dev/null 2>&1
+    fi
+fi
+
+# userbot 자동 재개는 위 큐 루프의 trigger_flush() 로 처리됨 (2026-06-02).
+# - home: claude-userbot-send --session <proj> "trigger:queue-flush" 직접.
+# - peer: relay.conf USERBOT_HOST 로 home 에 ssh 위임.
+# trigger 실패 시(유저봇 미설치/세션 만료) 기존 폴백 — 사용자 다음 메시지가 트리거.
+
+exit 0

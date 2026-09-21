@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""claude-turn-audit — 턴이 무엇을 하고 있는지 오프라인 실측.
+
+목적(2026-07-27 ai-debate run-20260727T105325Z 결론 A): quota 의 실질 레버가 턴 수로
+측정됐지만, 그 턴을 그냥 깎으면 연구 속도를 깎는다. 그래서 "생산 없는 턴"과 "낭비되는
+왕복"을 먼저 분리한다. 이 스크립트는 transcript JSONL 만 읽으므로 Claude quota 를 쓰지 않는다.
+
+측정 항목(세션별):
+  turns          main-chain assistant 턴 수
+  out_tok        출력 토큰
+  nudge_idle%    nudge 로 깨어난 턴 중 산출 이벤트가 없던 비율 (임계 15%)
+  dup_read%      같은 파일을 짧은 간격(기본 10분)에 다시 읽은 Read 호출 비율 (임계 20%)
+  tr_p50/p90/p99 tool_result 크기 분포(문자)
+  turns/job      detach job 결과 주입 1건당 소비한 assistant 턴 수
+  산출 이벤트    Write/Edit(파일변경), job 제출, 텔레그램 보고, git commit
+
+사용법: claude-turn-audit [일수] [--dup-window 초] [--json]
+분모 없는 절감은 착시다 — 산출 이벤트를 같이 본다.
+"""
+import json, os, sys, glob, re, time, calendar
+from collections import defaultdict
+
+DAYS = 7
+DUP_WINDOW = 600
+AS_JSON = False
+args = sys.argv[1:]
+while args:
+    a = args.pop(0)
+    if a == "--dup-window":
+        DUP_WINDOW = int(args.pop(0))
+    elif a == "--json":
+        AS_JSON = True
+    elif a.isdigit():
+        DAYS = int(a)
+cutoff = time.time() - DAYS * 86400
+root = os.path.expanduser("~/.claude/projects")
+
+# nudge 로 깨어난 턴 식별 — claude-session-nudge 의 기본 메시지 앞부분.
+NUDGE_PAT = re.compile(r"진행상황\s*report해줘|하던 작업 계속 진행해")
+# detach job 결과 주입 식별 — claude-job-detach 가 보내는 보고의 공통 머리말.
+JOB_PAT = re.compile(r"claude-job-|detach|잡 (완료|실패)", re.I)
+
+
+def new_rec():
+    return dict(turns=0, out=0, nudge=0, nudge_idle=0, reads=0, dup_reads=0,
+                cmds=0, dup_cmds=0, tools=0,
+                tr=[], jobs=0, writes=0, submits=0, reports=0, commits=0)
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if isinstance(b, dict):
+                if isinstance(b.get("text"), str):
+                    out.append(b["text"])
+                elif isinstance(b.get("content"), str):
+                    out.append(b["content"])
+                elif isinstance(b.get("content"), list):
+                    out.append(text_of(b["content"]))
+        return "\n".join(out)
+    return ""
+
+
+agg = defaultdict(new_rec)
+
+for d in sorted(glob.glob(root + "/*")):
+    if not os.path.isdir(d) or "/archive" in d:
+        continue
+    name = os.path.basename(d)
+    r = agg[name]
+    for f in sorted(glob.glob(d + "/*.jsonl")):
+        if os.path.getmtime(f) < cutoff:
+            continue
+        last_read = {}          # file_path -> 마지막 read 시각(epoch)
+        last_cmd = {}           # bash command -> 마지막 실행 시각(epoch)
+        pending_nudge = False   # 직전 user 턴이 nudge 였는가
+        nudge_produced = False  # 그 nudge 구간에서 산출 이벤트가 있었는가
+        try:
+            fh = open(f, errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if '"type"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("isSidechain"):
+                    continue
+                ts = o.get("timestamp") or ""
+                try:
+                    # transcript timestamp 는 UTC(Z). mktime 은 로컬로 해석해 9시간 어긋나므로 timegm.
+                    epoch = calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
+                except Exception:
+                    epoch = 0
+                # 파일 mtime 만으로 걸러내면 장수 세션의 단일 jsonl 이 통째로 들어와
+                # 3일/7일 비교가 무의미해진다 — 엔트리 단위로도 자른다.
+                if epoch and epoch < cutoff:
+                    continue
+                typ = o.get("type")
+                msg = o.get("message") or {}
+
+                if typ == "user":
+                    body = text_of(msg.get("content"))
+                    if NUDGE_PAT.search(body):
+                        # 앞 구간 정산 후 새 nudge 구간 시작
+                        if pending_nudge and not nudge_produced:
+                            r["nudge_idle"] += 1
+                        pending_nudge, nudge_produced = True, False
+                        r["nudge"] += 1
+                    elif JOB_PAT.search(body) and "trigger:queue-flush" not in body:
+                        r["jobs"] += 1
+                    # tool_result 크기
+                    for b in (msg.get("content") if isinstance(msg.get("content"), list) else []):
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            r["tr"].append(len(text_of(b.get("content"))))
+                    continue
+
+                if typ != "assistant":
+                    continue
+                r["turns"] += 1
+                u = msg.get("usage") or {}
+                r["out"] += u.get("output_tokens", 0) or 0
+                for b in (msg.get("content") if isinstance(msg.get("content"), list) else []):
+                    if not isinstance(b, dict) or b.get("type") != "tool_use":
+                        continue
+                    tname = b.get("name") or ""
+                    inp = b.get("input") or {}
+                    r["tools"] += 1
+                    if tname == "Read":
+                        r["reads"] += 1
+                        # offset/limit 이 다르면 같은 파일이라도 페이징(정당한 분할읽기)이다.
+                        # 완전히 같은 범위를 다시 읽은 것만 낭비로 센다.
+                        p = str(inp.get("file_path") or "")
+                        key = (p, inp.get("offset"), inp.get("limit"), inp.get("pages"))
+                        if p and epoch and 0 < epoch - last_read.get(key, 0) <= DUP_WINDOW:
+                            r["dup_reads"] += 1
+                        if p:
+                            last_read[key] = epoch
+                    elif tname in ("Write", "Edit", "NotebookEdit"):
+                        r["writes"] += 1; nudge_produced = True
+                    elif tname == "Bash":
+                        cmd = str(inp.get("command") or "")
+                        r["cmds"] += 1
+                        # Read 보다 Bash 왕복이 압도적으로 많은 세션이 있어 같은 창을 명령에도 적용.
+                        if cmd and epoch and 0 < epoch - last_cmd.get(cmd, 0) <= DUP_WINDOW:
+                            r["dup_cmds"] += 1
+                        if cmd:
+                            last_cmd[cmd] = epoch
+                        if "claude-job-detach" in cmd:
+                            r["submits"] += 1; nudge_produced = True
+                        if re.search(r"git commit", cmd):
+                            r["commits"] += 1; nudge_produced = True
+                    elif "reply" in tname:
+                        r["reports"] += 1; nudge_produced = True
+        if pending_nudge and not nudge_produced:
+            r["nudge_idle"] += 1
+
+agg = {k: v for k, v in agg.items() if v["turns"]}
+
+
+def pct(a, b):
+    return (100.0 * a / b) if b else 0.0
+
+
+def pctl(vals, q):
+    if not vals:
+        return 0
+    s = sorted(vals)
+    return s[min(len(s) - 1, int(q * len(s)))]
+
+
+if AS_JSON:
+    out = {}
+    for k, v in agg.items():
+        out[k] = dict(turns=v["turns"], out_tok=v["out"], nudge=v["nudge"],
+                      nudge_idle=v["nudge_idle"], nudge_idle_pct=round(pct(v["nudge_idle"], v["nudge"]), 1),
+                      reads=v["reads"], dup_read_pct=round(pct(v["dup_reads"], v["reads"]), 1),
+                      tools=v["tools"], cmds=v["cmds"],
+                      dup_cmd_pct=round(pct(v["dup_cmds"], v["cmds"]), 1),
+                      tools_per_turn=round(v["tools"] / v["turns"], 2) if v["turns"] else 0,
+                      tr_p50=pctl(v["tr"], .5), tr_p90=pctl(v["tr"], .9), tr_p99=pctl(v["tr"], .99),
+                      jobs=v["jobs"], writes=v["writes"], submits=v["submits"],
+                      reports=v["reports"], commits=v["commits"])
+    print(json.dumps({"days": DAYS, "dup_window_sec": DUP_WINDOW, "sessions": out},
+                     ensure_ascii=False, indent=1))
+    sys.exit(0)
+
+print(f"최근 {DAYS}일 / 중복 read 판정창 {DUP_WINDOW}초 / main-chain 만, sidechain 제외")
+HDR = (f"{'세션':<30}{'턴':>7}{'출력k':>10}{'도구/턴':>8}{'read':>6}{'중복%':>7}"
+       f"{'bash':>6}{'중복%':>7}{'tr_p90':>7}{'tr_p99':>8}{'nudge':>6}{'무산출%':>8}"
+       f"{'턴/job':>7}{'산출W/S/R/C':>15}")
+print(HDR)
+
+
+def row(label, v, tpj_blank=False):
+    tpj = "" if tpj_blank else f"{(v['turns'] / v['jobs']) if v['jobs'] else 0:.1f}"
+    print(f"{label:<30}{v['turns']:>7}{v['out']/1000:>10.1f}"
+          f"{(v['tools']/v['turns'] if v['turns'] else 0):>8.2f}"
+          f"{v['reads']:>6}{pct(v['dup_reads'], v['reads']):>7.1f}"
+          f"{v['cmds']:>6}{pct(v['dup_cmds'], v['cmds']):>7.1f}"
+          f"{pctl(v['tr'], .9):>7}{pctl(v['tr'], .99):>8}"
+          f"{v['nudge']:>6}{pct(v['nudge_idle'], v['nudge']):>8.1f}{tpj:>7}"
+          f"  {v['writes']}/{v['submits']}/{v['reports']}/{v['commits']}")
+
+
+tot = new_rec()
+for k, v in sorted(agg.items(), key=lambda x: -x[1]["turns"]):
+    row(k, v)
+    for f_ in ("turns", "out", "nudge", "nudge_idle", "reads", "dup_reads", "cmds",
+               "dup_cmds", "tools", "jobs", "writes", "submits", "reports", "commits"):
+        tot[f_] += v[f_]
+    tot["tr"] += v["tr"]
+print("-" * len(HDR))
+row("합계", tot, tpj_blank=True)
+print()
+print("행동 임계(ai-debate run-20260727T105325Z):")
+print(f"  nudge 무산출 {pct(tot['nudge_idle'], tot['nudge']):.1f}% (표본 {tot['nudge']}건) — 15% 이상이면 nudge 간격 60분 또는 job 완료 이벤트 기반. 표본 20건 미만이면 판단 보류.")
+print(f"  중복 read {pct(tot['dup_reads'], tot['reads']):.1f}% ({tot['reads']}건) / 중복 bash {pct(tot['dup_cmds'], tot['cmds']):.1f}% ({tot['cmds']}건) — 20% 이상이면 그 패턴만 축소")
+print(f"  tool_result p99 {pctl(tot['tr'], .99)}자 — 특정 명령에 몰리면 head/tail·요약파일화")
+print("  전부 임계 이하면 개입하지 않고 경보+관측 2주 유지. 산출(W=파일변경/S=job제출/R=보고/C=커밋)이 분모다.")

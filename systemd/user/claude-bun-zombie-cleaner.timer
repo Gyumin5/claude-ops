@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll claude-bun-zombie-cleaner every 60s
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=claude-bun-zombie-cleaner.service
+
+[Install]
+WantedBy=timers.target

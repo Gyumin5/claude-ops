@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""claude-usage-daily-report — 매일 09:00 KST 어제 일자 5h/7d 사용량 추이 리포트.
+
+데이터 소스: ~/.claude/state/usage-history/YYYY-MM.jsonl (statusline.py가 누적)
+출력: 컨트롤봇 한 채팅으로 한국어 평문 한 덩어리.
+"""
+import json
+import os
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import urllib.parse
+import urllib.request
+
+KST = timezone(timedelta(hours=9))
+HISTORY_DIR = Path.home() / ".claude" / "state" / "usage-history"
+CONTROL_BOT_ENV = Path.home() / ".claude" / "control-bot" / ".env"
+CONTROL_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+
+def load_token():
+    if not CONTROL_BOT_ENV.is_file():
+        return None
+    for line in CONTROL_BOT_ENV.read_text().splitlines():
+        if "=" in line and not line.strip().startswith("#"):
+            k, v = line.split("=", 1)
+            if k.strip() == "CONTROL_BOT_TOKEN":
+                return v.strip().strip('"').strip("'")
+    return None
+
+
+def telegram_send(token, text):
+    if not token:
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": CONTROL_CHAT_ID, "text": text}).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=8).read()
+        return True
+    except Exception:
+        return False
+
+
+def load_records_for(day_kst):
+    """day_kst: date object in KST. Return list of records with ts in that day."""
+    recs = []
+    ym = day_kst.strftime("%Y-%m")
+    f = HISTORY_DIR / f"{ym}.jsonl"
+    files = [f]
+    # 월 경계 처리
+    prev = (day_kst - timedelta(days=1)).strftime("%Y-%m")
+    if prev != ym:
+        files.append(HISTORY_DIR / f"{prev}.jsonl")
+    start = datetime.combine(day_kst, datetime.min.time(), tzinfo=KST).timestamp()
+    end = start + 86400
+    for path in files:
+        if not path.is_file():
+            continue
+        try:
+            for line in path.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                ts = r.get("ts")
+                if not isinstance(ts, (int, float)):
+                    continue
+                if start <= ts < end:
+                    recs.append(r)
+        except Exception:
+            continue
+    recs.sort(key=lambda r: r.get("ts", 0))
+    return recs
+
+
+def fmt_kst(ts):
+    return datetime.fromtimestamp(ts, tz=KST).strftime("%H:%M")
+
+
+def summarize(recs):
+    if not recs:
+        return None
+    fh = [r for r in recs if isinstance(r.get("fh_pct"), (int, float))]
+    sd = [r for r in recs if isinstance(r.get("sd_pct"), (int, float))]
+    out = {}
+    if fh:
+        max_fh = max(fh, key=lambda r: r["fh_pct"])
+        min_fh = min(fh, key=lambda r: r["fh_pct"])
+        out["fh_max"] = (max_fh["fh_pct"], fmt_kst(max_fh["ts"]))
+        out["fh_min"] = (min_fh["fh_pct"], fmt_kst(min_fh["ts"]))
+        out["fh_first"] = (fh[0]["fh_pct"], fmt_kst(fh[0]["ts"]))
+        out["fh_last"] = (fh[-1]["fh_pct"], fmt_kst(fh[-1]["ts"]))
+    if sd:
+        max_sd = max(sd, key=lambda r: r["sd_pct"])
+        min_sd = min(sd, key=lambda r: r["sd_pct"])
+        out["sd_max"] = (max_sd["sd_pct"], fmt_kst(max_sd["ts"]))
+        out["sd_min"] = (min_sd["sd_pct"], fmt_kst(min_sd["ts"]))
+        out["sd_first"] = (sd[0]["sd_pct"], fmt_kst(sd[0]["ts"]))
+        out["sd_last"] = (sd[-1]["sd_pct"], fmt_kst(sd[-1]["ts"]))
+    # 5h reset 이벤트: resets_at 값이 바뀌는 지점 카운트
+    fh_resets = 0
+    last_reset = None
+    for r in fh:
+        cur = r.get("fh_reset")
+        if last_reset is not None and cur != last_reset:
+            fh_resets += 1
+        last_reset = cur
+    out["fh_reset_count"] = fh_resets
+    # 7d reset (예상치 못한 큰 감소: 같은 sd_reset 안에서 sd_pct 가 >=20pp 떨어짐)
+    sd_anomaly = 0
+    prev = None
+    for r in sd:
+        if prev is not None and r.get("sd_reset") == prev.get("sd_reset"):
+            drop = (prev.get("sd_pct") or 0) - (r.get("sd_pct") or 0)
+            if drop >= 20:
+                sd_anomaly += 1
+        prev = r
+    out["sd_anomaly_count"] = sd_anomaly
+    out["sample_count"] = len(recs)
+    return out
+
+
+def main():
+    yesterday = (datetime.now(tz=KST) - timedelta(days=1)).date()
+    recs = load_records_for(yesterday)
+    summary = summarize(recs)
+    if not summary:
+        msg = f"[usage-daily] {yesterday.strftime('%Y-%m-%d')} 어제 사용량 기록 없음 (statusline 미렌더 또는 세션 미사용)."
+    else:
+        ymd = yesterday.strftime("%Y-%m-%d")
+        lines = [f"[usage-daily] {ymd} 어제 사용량 리포트", ""]
+        if "fh_first" in summary:
+            lines.append(
+                f"5h: 시작 {round(summary['fh_first'][0], 1)}% ({summary['fh_first'][1]}) → 종료 {round(summary['fh_last'][0], 1)}% ({summary['fh_last'][1]})"
+            )
+            lines.append(
+                f"     피크 {round(summary['fh_max'][0], 1)}% ({summary['fh_max'][1]}), 최저 {round(summary['fh_min'][0], 1)}% ({summary['fh_min'][1]})"
+            )
+            lines.append(f"     5h 윈도우 reset 감지: {summary['fh_reset_count']}회")
+        if "sd_first" in summary:
+            lines.append(
+                f"7d: 시작 {round(summary['sd_first'][0], 1)}% ({summary['sd_first'][1]}) → 종료 {round(summary['sd_last'][0], 1)}% ({summary['sd_last'][1]})"
+            )
+            lines.append(
+                f"     피크 {round(summary['sd_max'][0], 1)}% ({summary['sd_max'][1]}), 최저 {round(summary['sd_min'][0], 1)}% ({summary['sd_min'][1]})"
+            )
+            if summary["sd_anomaly_count"]:
+                lines.append(
+                    f"     7d 이상 감소(>=20pp, reset_at 동일): {summary['sd_anomaly_count']}회"
+                )
+        lines.append(f"     샘플 {summary['sample_count']}개")
+        msg = "\n".join(lines)
+
+    token = load_token()
+    if not telegram_send(token, msg):
+        print(msg)
+
+
+if __name__ == "__main__":
+    main()

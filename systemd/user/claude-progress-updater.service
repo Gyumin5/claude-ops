@@ -1,0 +1,10 @@
+[Unit]
+Description=Claude Progress Updater (all cs-managed projects)
+
+[Service]
+Type=oneshot
+Environment="PATH=%h/.bun/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="UPDATER_AUTO_MERGE=1"
+ExecStart=%h/.local/bin/claude-progress-updater-all
+StandardOutput=append:%h/.claude/logs/progress-updater.svc.log
+StandardError=append:%h/.claude/logs/progress-updater.svc.log

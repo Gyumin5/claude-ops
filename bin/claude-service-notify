@@ -1,0 +1,31 @@
+#!/bin/bash
+# claude-service-notify: systemd claude-*.service의 ExecStartPost/ExecStopPost에서 호출.
+# 사용자 결정 (2026-05-02): 시작/종료 알림은 프로젝트 봇으로 발송하지 않는다.
+# 컨트롤봇 Status 메뉴에서 세션/봇 생사를 직접 확인 가능 → 별도 알림 불필요.
+exit 0
+
+set -uo pipefail
+
+EVENT="${1:-start}"
+SVC="${2:-claude}"
+CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID:-}}"
+
+STATE_DIR="${TELEGRAM_STATE_DIR:-}"
+[ -z "$STATE_DIR" ] && exit 0
+[ -f "$STATE_DIR/.env" ] || exit 0
+
+# shellcheck disable=SC1090
+. "$STATE_DIR/.env"
+TOKEN="${TELEGRAM_BOT_TOKEN:-${BOT_TOKEN:-}}"
+[ -z "$TOKEN" ] && exit 0
+
+case "$EVENT" in
+    start) TEXT="✅ $SVC 기동됨 ($(date '+%H:%M:%S'))" ;;
+    stop)  TEXT="⏹ $SVC 종료됨 ($(date '+%H:%M:%S'))" ;;
+    *)     TEXT="$SVC event=$EVENT ($(date '+%H:%M:%S'))" ;;
+esac
+
+curl -s -m 5 -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${CHAT_ID}" \
+    --data-urlencode "text=${TEXT}" > /dev/null 2>&1 || true
+exit 0

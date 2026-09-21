@@ -1,0 +1,323 @@
+{
+  "respectGitignore": true,
+  "env": {
+    "ENABLE_PROMPT_CACHING_1H": "1"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "NotebookEdit",
+      "Skill",
+      "Monitor",
+      "mcp__plugin_telegram_telegram__reply",
+      "mcp__plugin_telegram_telegram__react",
+      "mcp__plugin_telegram_telegram__edit_message",
+      "mcp__plugin_telegram_telegram__download_attachment",
+      "mcp__claude_ai_Microsoft_365__outlook_email_search",
+      "mcp__claude_ai_Microsoft_365__chat_message_search",
+      "mcp__claude_ai_Microsoft_365__read_resource",
+      "mcp__claude_ai_Microsoft_365__sharepoint_search",
+      "mcp__claude_ai_Microsoft_365__sharepoint_folder_search",
+      "mcp__claude_ai_Microsoft_365__teams_list_chats",
+      "mcp__claude_ai_Microsoft_365__get_me",
+      "mcp__claude_ai_Gmail__search_threads",
+      "mcp__claude_ai_Gmail__get_thread",
+      "mcp__claude_ai_Gmail__get_message"
+    ],
+    "deny": [
+      "Read(**/.env*)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(**/*.p12)",
+      "Read(**/*.jks)",
+      "Read(**/.ssh/**)",
+      "Read(**/.aws/**)",
+      "Read(**/.gnupg/**)",
+      "Read(**/.kube/config)",
+      "Read(**/.docker/config.json)",
+      "Read(**/.config/gh/hosts.yml)",
+      "Read(**/.npmrc)",
+      "Read(**/.netrc)",
+      "Read(**/credentials*)",
+      "Read(**/secrets/**)",
+      "Read(**/*_history)",
+      "Edit(**/.env*)",
+      "Edit(**/*.pem)",
+      "Edit(**/*.key)",
+      "Edit(**/.ssh/**)",
+      "Edit(**/.aws/**)",
+      "Edit(**/.gnupg/**)",
+      "Edit(**/.npmrc)",
+      "Edit(**/.netrc)",
+      "Edit(**/credentials*)",
+      "Edit(**/secrets/**)",
+      "Edit(**/*_history)",
+      "Edit(**/*.p12)",
+      "Edit(**/*.jks)",
+      "Edit(**/.kube/config)",
+      "Edit(**/.docker/config.json)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~/*)",
+      "Bash(sudo *)",
+      "Bash(curl * | bash)",
+      "Bash(curl * | sh)",
+      "Bash(wget * | bash)",
+      "Bash(wget * | sh)",
+      "Bash(dd *)",
+      "Bash(mkfs*)",
+      "Bash(chmod -R 777 *)"
+    ],
+    "additionalDirectories": [
+      "~"
+    ]
+  },
+  "model": "opus[1m]",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/rate-limit-guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/block-ai-after-compact.sh"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/secrets-scan-guard.sh"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/bg-longjob-guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/large-read-guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/progress-md-path-guard.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/auto-verify.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/html-charset-inject.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/tool-latency.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/skill-call-log.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/progress-delta.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/progress-backup.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/git-commit-post.sh"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/precompact-guard.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/precompact_snapshot.sh"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/postcompact-mark.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/dotfiles/claude/hooks/soft-restart-guard.sh"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/prompt-length-guard.sh"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/rate-limit-prompt-guard.sh"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/postcompact-warn.sh"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/inject-briefing.sh"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/telegram-reply-injector.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/session-start-context.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/session_start_rehydrate_topicsonly.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/dotfiles/claude/hooks/session-resume-notify.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/telegram-reply-enforcer.sh"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/completion-notify.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/stop_memory_capture.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/dotfiles/claude/hooks/stop-scratchpad-selfclean.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "python3 ~/.claude/statusline.py"
+  },
+  "enabledPlugins": {
+    "clangd-lsp@claude-plugins-official": false,
+    "code-review@claude-plugins-official": true,
+    "skill-creator@claude-plugins-official": true,
+    "pyright-lsp@claude-plugins-official": true,
+    "telegram@claude-plugins-official": true,
+    "typescript-lsp@claude-plugins-official": false
+  },
+  "effortLevel": "high",
+  "autoCompactWindow": 300000,
+  "awaySummaryEnabled": true,
+  "tui": "default",
+  "theme": "dark"
+}

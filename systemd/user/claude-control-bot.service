@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Control Bot (Telegram → cs commands)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=%h/.local/bin/claude-control-bot
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:%h/.claude/logs/claude-control-bot.log
+StandardError=append:%h/.claude/logs/claude-control-bot.log
+
+[Install]
+WantedBy=default.target

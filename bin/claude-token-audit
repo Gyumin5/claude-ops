@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""세션 transcript JSONL 의 usage 필드를 집계해 토큰 비용 소재를 실측한다.
+목적: CLAUDE.md(상주 프롬프트) 반복 과금이 실제로 얼마인지, cache miss 빈도가 얼마인지.
+"""
+import json, os, sys, glob, time
+from collections import defaultdict
+
+DAYS = int(sys.argv[1]) if len(sys.argv) > 1 else 7
+cutoff = time.time() - DAYS * 86400
+root = os.path.expanduser("~/.claude/projects")
+
+agg = defaultdict(lambda: dict(turns=0, miss=0, hit=0, cc=0, cr=0, inp=0, out=0))
+
+for d in sorted(glob.glob(root + "/*")):
+    if not os.path.isdir(d) or "/archive" in d:
+        continue
+    name = os.path.basename(d)
+    for f in glob.glob(d + "/*.jsonl"):
+        if os.path.getmtime(f) < cutoff:
+            continue
+        with open(f, errors="replace") as fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("type") != "assistant" or o.get("isSidechain"):
+                    continue
+                ts = o.get("timestamp", "")
+                if ts and ts < time.strftime("%Y-%m-%dT", time.gmtime(cutoff)):
+                    continue
+                u = (o.get("message") or {}).get("usage") or {}
+                if not u:
+                    continue
+                a = agg[name]
+                a["turns"] += 1
+                cr = u.get("cache_read_input_tokens", 0) or 0
+                cc = u.get("cache_creation_input_tokens", 0) or 0
+                a["cr"] += cr
+                a["cc"] += cc
+                a["inp"] += u.get("input_tokens", 0) or 0
+                a["out"] += u.get("output_tokens", 0) or 0
+                # cache miss 판정: 캐시 읽기 0 인데 캐시 생성이 크면 새 접두사 = 전액 과금
+                if cr == 0 and cc > 0:
+                    a["miss"] += 1
+                elif cr > 0:
+                    a["hit"] += 1
+
+tot = dict(turns=0, miss=0, hit=0, cc=0, cr=0, inp=0, out=0)
+print(f"최근 {DAYS}일, main-chain assistant 턴만 (sidechain 제외)")
+print(f"{'세션':<34}{'턴':>6}{'캐시생성(k)':>12}{'캐시읽기(k)':>12}{'비캐시입력(k)':>13}{'출력(k)':>9}{'미스턴':>7}")
+for k, a in sorted(agg.items(), key=lambda x: -x[1]["cc"]):
+    if a["turns"] == 0:
+        continue
+    print(f"{k:<34}{a['turns']:>6}{a['cc']/1000:>12.1f}{a['cr']/1000:>12.1f}{a['inp']/1000:>13.1f}{a['out']/1000:>9.1f}{a['miss']:>7}")
+    for f in tot:
+        tot[f] += a[f]
+print("-" * 93)
+print(f"{'합계':<34}{tot['turns']:>6}{tot['cc']/1000:>12.1f}{tot['cr']/1000:>12.1f}{tot['inp']/1000:>13.1f}{tot['out']/1000:>9.1f}{tot['miss']:>7}")
+if tot["turns"]:
+    print()
+    print(f"캐시 생성(= 전액 과금 쓰기) 총 {tot['cc']/1000:.0f}k, 캐시 읽기 {tot['cr']/1000:.0f}k")
+    print(f"캐시 미스 턴 {tot['miss']} / {tot['turns']} = {100*tot['miss']/tot['turns']:.1f}%")
+    print(f"턴당 평균 캐시생성 {tot['cc']/tot['turns']:.0f} tok, 턴당 평균 캐시읽기 {tot['cr']/tot['turns']:.0f} tok")
+    # CLAUDE.md 상당 토큰(약 10k)이 캐시 생성분에서 차지할 수 있는 최대 비중
+    print(f"참고: CLAUDE.md 약 10k 토큰 기준, 캐시 생성 총량의 {100*10000*max(tot['miss'],1)/max(tot['cc'],1):.1f}% 가 미스턴 재작성분 상한")

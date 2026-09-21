@@ -1,0 +1,24 @@
+*.bak.*
+__pycache__/
+*.pyc
+
+# 세션이 자기 작업 디렉토리에 만드는 운영 파일. 기계마다 내용이 달라서 추적하면
+# 다른 기계의 사본과 부딪혀 pull 자체가 거부된다.
+/progress.md
+/history.md
+/history/
+/handoff.md
+/handoff.archived
+/.claude/
+/cache/
+
+# 세션 작업 산출물(임시 스크립트·로그·검증물). 커밋 대상이 아니다.
+state/
+
+# 이 기계가 켤 세션 목록. 예시 파일만 추적한다.
+/machines/*.list
+
+# 자격증명은 암호문이라도 들어오면 안 된다.
+*.tar.gz.gpg
+*.age
+secrets/*.key

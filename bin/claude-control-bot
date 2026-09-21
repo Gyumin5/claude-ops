@@ -1,0 +1,1250 @@
+#!/usr/bin/env python3
+"""
+claude-control-bot: 텔레그램 봇으로 claude-sessions (cs) 명령 원격 실행.
+Long-polling 기반, 단일 계정 화이트리스트, Inline Keyboard UX.
+
+env 파일: ~/.claude/control-bot/.env
+  CONTROL_BOT_TOKEN=...
+  ALLOWED_USER_ID=...
+
+systemd user service로 상시 실행.
+"""
+import http.client
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import urllib.parse
+from pathlib import Path
+
+# login_relay 는 같은 bin/ 디렉토리에 있음 (symlink 실행 대비 realpath 로 해석).
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import login_relay
+
+# 저장소 뿌리를 이 파일 위치에서 찾는다. 예전엔 홈 아래 고정 경로였는데,
+# 그러면 다른 자리에 받은 사람은 그대로 못 돌린다.
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+ENV_PATH = Path.home() / ".claude" / "control-bot" / ".env"
+
+
+def load_env():
+    env = {}
+    if ENV_PATH.exists():
+        for line in ENV_PATH.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+    return env
+
+
+env = load_env()
+TOKEN = env.get("CONTROL_BOT_TOKEN", "")
+ALLOWED_USER = int(env.get("ALLOWED_USER_ID", "0"))
+if not TOKEN or not ALLOWED_USER:
+    raise SystemExit("CONTROL_BOT_TOKEN / ALLOWED_USER_ID missing in .env")
+
+API = f"https://api.telegram.org/bot{TOKEN}"
+_API_HOST = "api.telegram.org"
+_API_PREFIX = f"/bot{TOKEN}"
+# 소켓 타임아웃: getUpdates 롱폴(telegram timeout=30)을 여유 있게 덮도록 60s (기존 urlopen과 동일).
+_API_TIMEOUT = 60
+# 재시도 대상 예외: DNS 실패(gaierror는 OSError 하위, EAI_AGAIN 포함)/커넥션 리셋/타임아웃/HTTP 프로토콜 오류.
+_RETRIABLE_EXC = (http.client.HTTPException, OSError)
+# 읽기 전용/멱등 호출만 재시도한다. sendMessage/editMessageText/answerCallbackQuery 등
+# 쓰기성(비멱등) 호출은 재시도하지 않는다 — 요청이 텔레그램에 이미 도달·처리됐는데
+# 응답 수신만 실패한 경우 재시도하면 메시지 중복 발송·콜백 중복 응답이 생길 수 있다
+# (ai-debate 세컨드오피니언 지적, 2026-07-03. run-20260703T114659Z).
+_IDEMPOTENT_READ_METHODS = {"getUpdates", "getWebhookInfo", "getMe"}
+# 읽기 계열 최대 시도 2회(최초+재시도 1회)로 제한 — getUpdates 소켓타임아웃(60s)과 곱해지는
+# 최악 블로킹 시간을 낮춘다(4회면 최대 ~4분, 2회면 최대 ~2분).
+_MAX_READ_ATTEMPTS = 2
+
+# keep-alive 커넥션은 스레드별로 보관한다. api()는 메인 getUpdates 루프뿐 아니라
+# login_relay 백그라운드 스레드(send 콜백)에서도 호출되므로, 단일 전역 커넥션을
+# 공유하면 롱폴이 락을 최대 30s 점유해 상대 스레드를 굶긴다. thread-local 이면
+# 락 없이 안전하고, 정작 DNS 장애가 잦은 hot path(메인 폴링 루프)에서 커넥션을
+# 재사용해 매 호출 새 DNS 조회+TLS 핸드셰이크를 없앤다.
+_tls = threading.local()
+
+
+def _api_conn():
+    c = getattr(_tls, "conn", None)
+    if c is None:
+        c = http.client.HTTPSConnection(_API_HOST, timeout=_API_TIMEOUT)
+        _tls.conn = c
+    return c
+
+
+def _api_drop_conn():
+    c = getattr(_tls, "conn", None)
+    if c is not None:
+        try:
+            c.close()
+        except Exception:
+            pass
+        _tls.conn = None
+
+
+def _parse_api_body(raw, status):
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return {"ok": False, "description": f"HTTP {status}"}
+    # 429 등 retry_after 는 자동 대기하지 않되(별도 정책), 값은 보존해 호출부가 볼 수 있게 한다.
+    ra = (d.get("parameters") or {}).get("retry_after") if isinstance(d, dict) else None
+    if ra is not None:
+        d["_retry_after"] = ra
+    return d
+
+
+def api(method, **params):
+    body = urllib.parse.urlencode(
+        {k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in params.items()}
+    ).encode()
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    path = f"{_API_PREFIX}/{method}"
+    max_attempts = _MAX_READ_ATTEMPTS if method in _IDEMPOTENT_READ_METHODS else 1
+    delay = 1.0
+    for attempt in range(max_attempts):
+        try:
+            conn = _api_conn()
+            conn.request("POST", path, body=body, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()  # keep-alive 재사용 위해 반드시 본문 소진
+            status = resp.status
+            if status >= 500 and max_attempts > 1:
+                # 서버측 일시 장애(502/503 등) → 읽기 계열만 재시도 대상.
+                raise OSError(f"HTTP {status}")
+            if status >= 400:
+                # 4xx(예: 만료된 콜백 400) 또는 재시도 대상 아닌 5xx는 즉시 실패 반환.
+                print(f"[api {method}] HTTP {status}", flush=True)
+                return _parse_api_body(raw, status)
+            return _parse_api_body(raw, status)
+        except _RETRIABLE_EXC as e:
+            # 커넥션이 깨졌을 수 있으니 버리고 다음 시도에서 새로 연결(=새 DNS 조회).
+            _api_drop_conn()
+            if attempt < max_attempts - 1:
+                # 첫 실패는 stale keep-alive 커넥션일 가능성이 높으니 즉시 1회 재연결(지연 없음).
+                # 그 다음 실패부터만 백오프(1s, 2s, ...)를 붙인다.
+                if attempt == 0:
+                    print(f"[api {method}] {e} (즉시 재연결)", flush=True)
+                else:
+                    sleep_s = delay + random.uniform(0, 0.3 * delay)  # 약간의 지터
+                    print(f"[api {method}] {e} (retry {attempt + 1}/{max_attempts - 1} in {sleep_s:.1f}s)", flush=True)
+                    time.sleep(sleep_s)
+                    delay *= 2
+                continue
+            print(f"[api {method}] {e}", flush=True)
+            return {"ok": False, "description": str(e)}
+        except Exception as e:
+            # 비네트워크 예외(예: json 파싱)는 재시도 안 함.
+            _api_drop_conn()
+            print(f"[api {method}] {e}", flush=True)
+            return {"ok": False, "description": str(e)}
+
+
+def list_sessions():
+    """enabled claude-*.service 목록에서 세션 이름 추출"""
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "--user", "list-unit-files", "claude-*.service", "--state=enabled", "--no-legend"],
+            text=True, timeout=5,
+        )
+        names = []
+        for line in out.splitlines():
+            unit = line.strip().split()[0] if line.strip() else ""
+            if not unit:
+                continue
+            if unit in ("claude-watchdog.service", "claude-control-bot.service",
+                        "claude-progress-updater.service", "claude-progress-updater-all.service",
+                        "claude-rate-limit-recovery.service", "claude-daily-research.service"):
+                continue
+            # claude-*.service 중 Claude Code 세션이 아닌 보조 서비스 제외
+            if unit.startswith("claude-progress") or unit.startswith("claude-rate-limit") or unit.startswith("claude-daily"):
+                continue
+            # 템플릿 인스턴스 유닛(claude-xxx@yyy.service)은 세션이 아님.
+            # 예: claude-session-nudge@<세션> — 넛지 발송 데몬이 세션 목록에 섞여 보이던 버그(2026-07-25).
+            if "@" in unit:
+                continue
+            # claude-<name>.service → <name>
+            name = unit[len("claude-"):-len(".service")]
+            names.append(name)
+        return sorted(names)
+    except Exception as e:
+        print(f"[list_sessions] {e}", flush=True)
+        return []
+
+
+def run_cs(*args, timeout=30):
+    """cs (claude-sessions) 실행. stdout 반환."""
+    try:
+        out = subprocess.check_output(
+            [os.path.expanduser("~/.local/bin/claude-sessions"), *args],
+            text=True, stderr=subprocess.STDOUT, timeout=timeout,
+        )
+        return out.strip()[:3500]  # Telegram 4096 제한 여유
+    except subprocess.TimeoutExpired:
+        return "[timeout]"
+    except subprocess.CalledProcessError as e:
+        return f"[error exit {e.returncode}]\n{e.output[:3000]}"
+    except Exception as e:
+        return f"[exception] {e}"
+
+
+STOPPED_MARKER_DIR = Path.home() / ".claude" / "state" / "control-bot-stopped"
+
+
+def is_intentionally_stopped(name):
+    """컨트롤봇 끄기 버튼으로 의도적으로 정지된 세션인지. watchdog은 이미
+    inactive를 안 건드리지만(is-active != active 시 skip), 컨트롤봇 자신의
+    restart/forcerotate 버튼은 그런 구분 없이 systemctl restart/cs restart 를
+    그대로 실행해 정지된 세션을 되살려버린다(2026-07-09 session-k 실사고:
+    끄기→재시작 눌렀더니 살아남). 이 마커로 restart/forcerotate 를 막는다."""
+    return (STOPPED_MARKER_DIR / name).exists()
+
+
+def systemctl_session(action, name, timeout=20):
+    """세션 유닛 stop/start. list_sessions() 는 claude-control-bot.service 를
+    이미 제외하므로 이 경로로는 컨트롤봇 자기 자신을 못 끈다(자기발등 방지).
+    stop 성공 시 '의도적 정지' 마커를 남기고, start 성공 시 지운다 — restart/
+    forcerotate 버튼이 이 마커를 보고 의도치 않은 복구를 막는다."""
+    unit = f"claude-{name}.service"
+    try:
+        r = subprocess.run(["systemctl", "--user", action, unit],
+                            capture_output=True, text=True, timeout=timeout)
+        if r.returncode == 0:
+            if action == "stop":
+                STOPPED_MARKER_DIR.mkdir(parents=True, exist_ok=True)
+                (STOPPED_MARKER_DIR / name).touch()
+            elif action == "start":
+                (STOPPED_MARKER_DIR / name).unlink(missing_ok=True)
+            return f"{unit}: {action} OK"
+        return f"{unit}: {action} 실패 (exit {r.returncode})\n{r.stderr.strip()}"
+    except Exception as e:
+        return f"{unit}: {action} 예외 — {e}"
+
+
+def restart_all_active_only(timeout=60):
+    """cs restart-all 은 list_services() 전체를 무조건 재시작해 의도적으로 꺼둔
+    세션까지 되살린다 — 여기서는 그 목록에서 정지 마커 있는 세션을 빼고 개별
+    restart 한다(cmd_restart_all과 동일하게 reset-failed 후 restart, 병렬 실행)."""
+    names = list_sessions()
+    targets = [n for n in names if not is_intentionally_stopped(n)]
+    skipped = [n for n in names if is_intentionally_stopped(n)]
+    procs = []
+    for name in targets:
+        unit = f"claude-{name}.service"
+        subprocess.run(["systemctl", "--user", "reset-failed", unit],
+                       capture_output=True, timeout=10)
+        procs.append((name, subprocess.Popen(["systemctl", "--user", "restart", unit])))
+    lines = []
+    for name, p in procs:
+        rc = p.wait(timeout=timeout)
+        lines.append(f"{name}: {'OK' if rc == 0 else f'실패(exit {rc})'}")
+    if skipped:
+        lines.append(f"⏸️ 건너뜀(의도적 정지): {', '.join(skipped)}")
+    return "\n".join(lines) if lines else "재시작할 세션 없음"
+
+
+ACCOUNT_SWITCH_BIN = os.path.expanduser("~/.local/bin/claude-account-switch")
+
+# 로그인 릴레이 싱글톤 (단일 진행). 계정 구분 없이 재로그인 → fresh creds 적용.
+_RELAY = login_relay.LoginRelay()
+
+
+def start_relay(chat_id):
+    """컨트롤봇에서 로그인 릴레이 시작. send/on_done 를 telegram 에 바인딩.
+    계정 구분 없음 — 방금 로그인한 fresh creds 를 그대로 live 에 적용."""
+    def send(text):
+        api("sendMessage", chat_id=chat_id, text=text[:3500])
+
+    def on_done(_tgt, success, cred_path, detail):
+        if success and cred_path:
+            out = run_account_switch("--apply-login", cred_path)
+            if out.startswith(("[error", "[timeout", "[exception")):
+                api("sendMessage", chat_id=chat_id,
+                    text=f"⚠️ 재로그인은 됐는데 적용 실패:\n{out}",
+                    reply_markup=main_menu_markup())
+            else:
+                api("sendMessage", chat_id=chat_id,
+                    text=f"✅ 재로그인·적용 완료.\n{out}",
+                    reply_markup=main_menu_markup())
+        elif success:
+            api("sendMessage", chat_id=chat_id,
+                text="⚠️ 로그인 성공 신호인데 creds 파일을 못 찾음. 수동 확인 필요.",
+                reply_markup=main_menu_markup())
+        else:
+            api("sendMessage", chat_id=chat_id,
+                text=f"❌ 재로그인 실패/취소: {detail}",
+                reply_markup=main_menu_markup())
+
+    ok, msg = _RELAY.start("login", send, on_done)
+    api("sendMessage", chat_id=chat_id, text=msg)
+
+
+def run_account_switch(*args, timeout=90):
+    try:
+        out = subprocess.check_output(
+            [ACCOUNT_SWITCH_BIN, *args],
+            text=True, stderr=subprocess.STDOUT, timeout=timeout,
+        )
+        return out.strip()[:3500]
+    except subprocess.TimeoutExpired:
+        return "[timeout]"
+    except subprocess.CalledProcessError as e:
+        return f"[error exit {e.returncode}]\n{e.output[:3000]}"
+    except Exception as e:
+        return f"[exception] {e}"
+
+
+def main_menu_markup():
+    # 계정 구분 폐지 (2026-06-24) — 순수 재로그인 버튼 하나만. 모든 머신 공통.
+    rows = [
+        [{"text": "📊 Status", "callback_data": "status"},
+         {"text": "💻 Resources", "callback_data": "resources"}],
+        [{"text": "🚧 Bypass…", "callback_data": "menu:bypass"},
+         {"text": "📜 Recent…", "callback_data": "menu:recent"}],
+        [{"text": "🔄 Restart…", "callback_data": "menu:restart"}],
+        [{"text": "⏰ 넛지…", "callback_data": "nudge:menu"}],
+        [{"text": "🔑 재로그인", "callback_data": "relogin-confirm"}],
+    ]
+    return {"inline_keyboard": rows}
+
+
+# ── 넛지 토글 ────────────────────────────────────────────────────────────────
+# 채팅으로 "밤새 돌려" 라고 거는 대신 버튼으로 켜고 끈다. 상태 정본은
+# claude-session-nudge 가 쓰는 <session>.json 이고, 봇은 읽기만 하고 변경은
+# 반드시 CLI 를 통한다 — 상태파일을 봇이 직접 쓰면 유닛과 갈린다.
+NUDGE_DIR = Path.home() / ".claude" / "state" / "session-nudge"
+# 유닛(claude-session-nudge@.service)이 부르는 경로와 같은 것을 쓴다.
+NUDGE_BIN = os.path.join(REPO, "bin/claude-session-nudge")
+NUDGE_HOURS = [("6h", 6), ("12h", 12), ("24h", 24), ("3d", 72), ("7d", 168)]
+
+
+def _nudge_active_units():
+    """지금 active 인 claude-session-nudge@<name>.service 의 <name> 집합.
+    세션마다 systemctl 을 부르지 않으려고 한 번에 읽는다."""
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "--user", "list-units", "claude-session-nudge@*.service",
+             "--state=active", "--no-legend", "--plain"],
+            text=True, timeout=5,
+        )
+    except Exception as e:
+        print(f"[nudge units] {e}", flush=True)
+        return set()
+    names = set()
+    for line in out.splitlines():
+        unit = line.strip().split()[0] if line.strip() else ""
+        if unit.startswith("claude-session-nudge@") and unit.endswith(".service"):
+            names.add(unit[len("claude-session-nudge@"):-len(".service")])
+    return names
+
+
+def nudge_state(name, active=None):
+    """(on, remain_h, suspended). 상태파일 없거나 깨졌으면 (False, 0.0, False).
+    active 는 _nudge_active_units() 결과 — 목록을 그릴 때 한 번만 조회해 넘긴다."""
+    if active is None:
+        active = _nudge_active_units()
+    f = NUDGE_DIR / f"{name}.json"
+    try:
+        d = json.loads(f.read_text())
+    except Exception:
+        return False, 0.0, False
+    remain = (int(d.get("end_ts") or 0) - time.time()) / 3600.0
+    # 켜짐 판정은 세 조건 모두 — 상태파일만 보면 유닛이 죽은 걸 켜졌다고 표시한다.
+    on = bool(d.get("enabled")) and remain > 0 and name in active
+    return on, remain, bool(d.get("suspended"))
+
+
+def nudge_sessions():
+    """세션 목록 ∪ 상태파일만 남은 이름. 지워진 세션의 잔여 넛지도 끌 수 있어야 한다."""
+    names = set(list_sessions())
+    try:
+        names |= {p.stem for p in NUDGE_DIR.glob("*.json")}
+    except Exception:
+        pass
+    return sorted(names)
+
+
+def nudge_menu_text(note=""):
+    head = ("⏰ 넛지 — 켜면 그 세션에 주기적으로 '진행상황 보고하고 계속' 을 보낸다.\n"
+            "🟢=켜짐(남은시간) ⚪=꺼짐 🟡=무응답 감지로 중단됨(세션이 응답하면 자동 재개).\n"
+            "세션을 누르면 켜기·시간 재등록(시간 선택)/끄기.\n")
+    return head + (f"\n{note}\n" if note else "")
+
+
+def nudge_menu_markup():
+    # active 유닛 조회는 목록당 한 번만 (세션 수만큼 systemctl 을 부르지 않는다).
+    active = _nudge_active_units()
+    names = nudge_sessions()
+    rows, row = [], []
+    for name in names:
+        on, remain, susp = nudge_state(name, active)
+        if susp:
+            label = f"🟡 {name} {remain:.1f}h"
+        elif on:
+            label = f"🟢 {name} {remain:.1f}h"
+        else:
+            label = f"⚪ {name}"
+        row.append({"text": label, "callback_data": f"nudge:s:{name}"})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "⬅ Back", "callback_data": "menu:main"}])
+    return {"inline_keyboard": rows}
+
+
+def nudge_session_markup(name, on):
+    # 켜져 있어도 시간 버튼을 같이 낸다 — 끄고 다시 켜지 않고 종료시각만 새로 등록할 수
+    # 있어야 한다(2026-08-20 사용자 요청). 켜진 세션에 --start 를 그대로 써도 되는 이유는
+    # 데몬이 매 회차 상태파일을 다시 읽어서다(run_daemon 루프). 재등록은 무응답 추적을
+    # 지우지 않는다 — write_session 이 suspended·alert_msg_id 를 보존한다.
+    rows = [[{"text": t, "callback_data": f"nudge:on:{name}:{h}"} for t, h in NUDGE_HOURS]]
+    if on:
+        rows.append([{"text": "🔴 끄기(확인)", "callback_data": f"nudge:offc:{name}"}])
+    rows.append([{"text": "⬅ Back", "callback_data": "nudge:menu"}])
+    return {"inline_keyboard": rows}
+
+
+def run_nudge(*args, timeout=60):
+    """(rc, 출력). rc!=0 은 삼키지 않고 그대로 올린다 — 조용한 실패가 이 기능의 사고였다."""
+    try:
+        p = subprocess.run([NUDGE_BIN, *args], capture_output=True, text=True, timeout=timeout)
+        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()[:1500]
+    except subprocess.TimeoutExpired:
+        return -1, "[timeout]"
+    except Exception as e:
+        return -1, f"[exception] {e}"
+
+
+def _fmt_gb(b):
+    return f"{b/1024/1024/1024:.1f}G"
+
+
+def _pct_emoji(pct, warn, danger):
+    if pct >= danger: return "🔴"
+    if pct >= warn: return "⚠️"
+    return "✅"
+
+
+def read_resources():
+    """단일 화면(≤20줄) 리소스 요약. 사고 조기 신호 우선.
+    포함: uptime, load, CPU%, MEM, swap, disk(/, /mnt/Data), 9세션 active/RSS,
+    bun 누락, 1h OOM, 1h restart."""
+    lines = []
+    try:
+        # uptime + load
+        with open("/proc/uptime") as f:
+            up_sec = int(float(f.read().split()[0]))
+        d, rem = divmod(up_sec, 86400); h, rem = divmod(rem, 3600); m, _ = divmod(rem, 60)
+        with open("/proc/loadavg") as f:
+            la = f.read().split()[:3]
+        ncpu = os.cpu_count() or 1
+        la_em = _pct_emoji(float(la[0]) / ncpu * 100, 70, 100)
+        lines.append(f"⏱ up {d}d{h}h{m}m | load {la_em} {la[0]}/{la[1]}/{la[2]} (cpu={ncpu})")
+
+        # CPU% (1초 샘플)
+        def _cpu():
+            with open("/proc/stat") as f:
+                p = f.readline().split()[1:8]
+            t = list(map(int, p)); return sum(t), t[3]
+        t1, i1 = _cpu(); time.sleep(0.5); t2, i2 = _cpu()
+        cpu_pct = int(round((1 - (i2-i1)/max(1, t2-t1)) * 100))
+        lines.append(f"{_pct_emoji(cpu_pct, 70, 90)} CPU {cpu_pct}%")
+
+        # MEM / swap
+        mi = {}
+        with open("/proc/meminfo") as f:
+            for ln in f:
+                k, v = ln.split(":", 1)
+                mi[k] = int(v.strip().split()[0]) * 1024
+        used = mi["MemTotal"] - mi["MemAvailable"]
+        mem_pct = int(round(used / mi["MemTotal"] * 100))
+        swap_used = mi.get("SwapTotal", 0) - mi.get("SwapFree", 0)
+        swap_pct = int(round(swap_used / mi["SwapTotal"] * 100)) if mi.get("SwapTotal") else 0
+        sw_em = _pct_emoji(swap_pct, 30, 60)
+        lines.append(f"{_pct_emoji(mem_pct, 70, 85)} MEM {mem_pct}% ({_fmt_gb(used)}/{_fmt_gb(mi['MemTotal'])}) | {sw_em} swap {swap_pct}% ({_fmt_gb(swap_used)})")
+
+        # Disk
+        for mp, label in [("/", "/"), ("/mnt/Data", "/mnt/Data")]:
+            try:
+                st = os.statvfs(mp)
+                total = st.f_blocks * st.f_frsize
+                free = st.f_bavail * st.f_frsize
+                used_p = int(round((1 - free/total) * 100))
+                lines.append(f"{_pct_emoji(used_p, 80, 90)} disk {label} {used_p}% (free {_fmt_gb(free)})")
+            except Exception:
+                pass
+
+        # Claude services
+        names = list_sessions()
+        active = failed = bun_missing = 0
+        rss_list = []
+        hp = sessions_health_parallel(names)
+        for n in names:
+            ok, bun = hp[n]
+            if ok: active += 1
+            else: failed += 1
+            if ok and not bun: bun_missing += 1
+            # RSS (cgroup memory.current 우선)
+            # cgroup 경로에 들어가는 번호는 이 기계의 사용자 번호다. 1000 으로 박아
+            # 두면 다른 사용자 번호를 쓰는 기계에서 조용히 빈 값이 된다.
+            _uid = os.getuid()
+            for cp in (f"/sys/fs/cgroup/user.slice/user-{_uid}.slice/"
+                       f"user@{_uid}.service/claude-{n}.service/memory.current",):
+                try:
+                    rss_list.append((n, int(open(cp).read().strip())))
+                    break
+                except Exception:
+                    pass
+        rss_total = sum(r for _, r in rss_list)
+        svc_em = "🔴" if failed else ("⚠️" if bun_missing else "✅")
+        lines.append(f"{svc_em} claude svc {active}/{len(names)} active, failed={failed}, bun_missing={bun_missing}")
+        if rss_list:
+            top = sorted(rss_list, key=lambda x: -x[1])[:3]
+            top_s = " ".join(f"{n}={_fmt_gb(r)}" for n, r in top)
+            lines.append(f"  RSS total {_fmt_gb(rss_total)} | top: {top_s}")
+
+        # 1h OOM + restart
+        try:
+            oom_out = subprocess.run(
+                ["journalctl", "--user", "--since", "1 hour ago", "-q"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+            oom = sum(1 for ln in oom_out.splitlines() if "oom-killer" in ln.lower() or "out of memory" in ln.lower())
+            restart = sum(1 for ln in oom_out.splitlines() if "claude-" in ln and "Started" in ln)
+            oom_em = "🔴" if oom else "✅"
+            rs_em = "⚠️" if restart > 2 else "✅"
+            lines.append(f"{oom_em} 1h OOM={oom} | {rs_em} restart={restart}")
+        except Exception:
+            pass
+
+        lines.append(f"\n_{time.strftime('%Y-%m-%d %H:%M:%S KST')}_")
+    except Exception as e:
+        lines.append(f"[resources error] {e}")
+    return "\n".join(lines)
+
+
+BYPASS_DIR = Path.home() / ".claude" / "state"
+BYPASS_GLOBAL = BYPASS_DIR / "rate-limit-bypass.flag"
+
+
+def bypass_proj_flag(name):
+    # 세션 키 = systemd unit의 CLAUDE_SESSION_NAME (=서비스 이름의 'claude-' 접두 제거).
+    # 모든 hook도 같은 키 사용 → cwd 변경/cd 들어가도 일관성.
+    return BYPASS_DIR / f"rate-limit-bypass-{name}.flag", name
+
+
+THRESHOLD_5H = 90
+THRESHOLD_7D = 99
+
+
+def current_rate_limits():
+    """statusline_cache 기반 (5h%, 7d%, 5h_reset_str, 7d_reset_str, blocked_now)"""
+    try:
+        from datetime import datetime, timezone, timedelta
+        kst = timezone(timedelta(hours=9))
+        path = Path.home() / ".claude" / "statusline_cache.json"
+        d = json.loads(path.read_text())
+        rl = d.get("rate_limits", {})
+        fh = rl.get("five_hour", {}) or {}
+        sd = rl.get("seven_day", {}) or {}
+        now = time.time()
+        def eff(w):
+            rt = w.get("resets_at")
+            if rt and now > rt:
+                return 0
+            v = w.get("used_percentage")
+            return int(round(v)) if isinstance(v, (int, float)) else -1
+        p5, p7 = eff(fh), eff(sd)
+        r5 = _fmt_reset(datetime.fromtimestamp(fh.get("resets_at", 0), tz=kst)) if fh.get("resets_at") else "?"
+        r7 = _fmt_reset(datetime.fromtimestamp(sd.get("resets_at", 0), tz=kst)) if sd.get("resets_at") else "?"
+        blocked = (p5 >= THRESHOLD_5H) or (p7 >= THRESHOLD_7D)
+        return p5, p7, r5, r7, blocked
+    except Exception:
+        return -1, -1, "?", "?", False
+
+
+def bypass_menu_text():
+    p5, p7, r5, r7, blocked = current_rate_limits()
+    head = (
+        f"5h: {p5}% (리셋 {r5}) | 7d: {p7}% (리셋 {r7})\n"
+        f"현재 가드 발동: {'🚫 YES' if blocked else '✅ NO'}\n\n"
+        "각 세션 90% 가드 bypass 토글 (🟢=우회중, ⚪=가드 적용).\n"
+        "리셋되면 bypass flag 자동 삭제됨.\n"
+    )
+    return head
+
+
+def bypass_menu_markup():
+    BYPASS_DIR.mkdir(parents=True, exist_ok=True)
+    rows = []
+    g_on = BYPASS_GLOBAL.exists()
+    rows.append([{
+        "text": f"{'🟢' if g_on else '⚪'} GLOBAL (전체)",
+        "callback_data": "bypass-toggle:__global__",
+    }])
+    for name in list_sessions():
+        info = bypass_proj_flag(name)
+        if info is None:
+            continue
+        flag, proj = info
+        on = flag.exists()
+        rows.append([{
+            "text": f"{'🟢' if on else '⚪'} {name} ({proj})",
+            "callback_data": f"bypass-toggle:{name}",
+        }])
+    rows.append([{"text": "⬅ Back", "callback_data": "menu:main"}])
+    return {"inline_keyboard": rows}
+
+
+def service_workdir(name):
+    """claude-<name>.service의 WorkingDirectory 읽기"""
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "--user", "show", f"claude-{name}.service", "-p", "WorkingDirectory", "--value"],
+            text=True, timeout=5,
+        ).strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def project_key(workdir):
+    """cwd → ~/.claude/projects/<key> 변환 (/와 _ 를 -로). Claude Code 명명 규칙과 일치."""
+    return workdir.replace("/", "-").replace("_", "-")
+
+
+# --- 세션별 모델/effort 설정 (~/.config/claude-models.json) ---
+# claude-service-exec 가 launch 시 읽어 --model/--effort 플래그로 적용.
+# 저장만 하고 자동 restart 안 함 (적용=해당 세션 Restart).
+MODELS_JSON = Path.home() / ".config" / "claude-models.json"
+MODEL_CHOICES = [("Opus 4.8", "claude-opus-4-8"), ("Sonnet 4.6", "claude-sonnet-4-6"),
+                 ("Haiku 4.5", "claude-haiku-4-5-20251001"), ("Fable 5", "claude-fable-5")]
+EFFORT_CHOICES = ["low", "mid", "high", "xhigh", "max"]  # mid 는 저장 시 medium 으로 매핑 (CLI 지원: low/medium/high/xhigh/max)
+
+
+def load_models():
+    try:
+        d = json.loads(MODELS_JSON.read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_models(cfg):
+    MODELS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MODELS_JSON.with_name(MODELS_JSON.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(MODELS_JSON)
+
+
+def session_proj_key(name):
+    wd = service_workdir(name)
+    return project_key(wd) if wd else None
+
+
+def actual_model(name):
+    """실행 중 프로세스의 --model 플래그 우선(실시간), 없으면 jsonl tail (재시작 직후 stale 가능)."""
+    try:
+        pid = subprocess.check_output(
+            ["systemctl", "--user", "show", f"claude-{name}.service", "-p", "MainPID", "--value"],
+            text=True, timeout=3,
+        ).strip()
+        if pid and pid != "0":
+            cmd = open(f"/proc/{pid}/cmdline", "rb").read().decode(errors="ignore").replace("\0", " ")
+            m = re.search(r"--model\s+(\S+)", cmd)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    try:
+        wd = service_workdir(name)
+        if not wd:
+            return "?"
+        proj = Path.home() / ".claude" / "projects" / project_key(wd)
+        jsonls = sorted(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not jsonls:
+            return "-"
+        size = jsonls[0].stat().st_size
+        with open(jsonls[0], "rb") as f:
+            f.seek(max(0, size - 65536))
+            tail = f.read().decode(errors="ignore")
+        ms = [m for m in re.findall(r'"model":"([^"]+)"', tail) if m != "<synthetic>"]
+        return ms[-1] if ms else "-"
+    except Exception:
+        return "?"
+
+
+def model_menu_text():
+    cfg = load_models()
+    lines = ["🧠 세션별 모델/effort", ""]
+    for name in list_sessions():
+        key = session_proj_key(name)
+        e = cfg.get(key, {}) if key else {}
+        setting = f"{e.get('model', '-')}/{e.get('effort', '-')}" if e else "(미설정)"
+        lines.append(f"{name}\n  실제: {actual_model(name)} | 설정: {setting}")
+    lines.append("")
+    lines.append("저장만 됨 — 적용하려면 해당 세션 Restart 필요.")
+    return "\n".join(lines)
+
+
+def model_menu_markup():
+    sessions = list_sessions()
+    rows = []
+    for i in range(0, len(sessions), 2):
+        rows.append([{"text": n, "callback_data": f"model_s:{n}"} for n in sessions[i:i + 2]])
+    rows.append([{"text": "🌐 전체 동시 설정", "callback_data": "model_s:*"}])
+    rows.append([{"text": "⬅ Back", "callback_data": "menu:main"}])
+    return {"inline_keyboard": rows}
+
+
+def read_recent(name, max_turns=6, max_chars=3000):
+    """세션의 최신 jsonl에서 마지막 user/assistant 텍스트 메시지 추출"""
+    wd = service_workdir(name)
+    if not wd:
+        return f"[{name}] WorkingDirectory 못 찾음"
+    proj = Path(f"{Path.home()}/.claude/projects/{project_key(wd)}")
+    jsonls = sorted(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not jsonls:
+        return f"[{name}] jsonl 없음 (proj={proj})"
+    latest = jsonls[0]
+    age = int(time.time() - latest.stat().st_mtime)
+    # tail 200 lines
+    try:
+        with latest.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 400_000))
+            raw = f.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        return f"[{name}] read error: {e}"
+
+    turns = []
+    for line in raw.splitlines():
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        t = d.get("type")
+        ts = (d.get("timestamp", "") or "")[:19]
+        msg = d.get("message", {}) or {}
+        if t == "user":
+            c = msg.get("content", "")
+            if isinstance(c, str) and c.strip():
+                turns.append(("U", ts, c.strip()))
+        elif t == "assistant":
+            c = msg.get("content", [])
+            if isinstance(c, list):
+                for item in c:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        txt = (item.get("text") or "").strip()
+                        if txt:
+                            turns.append(("A", ts, txt))
+
+    turns = turns[-max_turns:]
+    if not turns:
+        return f"[{name}] 텍스트 턴 없음 (tool_use만?)\n마지막 활동: {age}s 전"
+
+    lines = [f"[{name}] 마지막 활동: {age}s 전"]
+    for role, ts, txt in turns:
+        # 텔레그램 채널 태그 제거 간소화
+        if "<channel " in txt:
+            import re
+            txt = re.sub(r"<channel [^>]+>", "", txt).replace("</channel>", "").strip()
+        lines.append(f"\n{role}[{ts}]:\n{txt[:500]}")
+
+    result = "\n".join(lines)
+    return result[:max_chars]
+
+
+_WD = ["월", "화", "수", "목", "금", "토", "일"]
+def _fmt_reset(dt):
+    return dt.strftime(f"%m/%d({_WD[dt.weekday()]}) %H:%M")
+
+
+def _pct_to_int(v):
+    """소수점 잡음(55.00000000000001 같은 부동소수) 제거. 항상 0~100 정수로."""
+    if isinstance(v, (int, float)):
+        return int(round(v))
+    return None
+
+
+def read_statusline():
+    """rate-limit + 세션별 health 표시. ctx/cost/cache는 숨김."""
+    try:
+        path = Path.home() / ".claude" / "statusline_cache.json"
+        d = json.loads(path.read_text())
+        from datetime import datetime, timezone, timedelta
+        kst = timezone(timedelta(hours=9))
+        now = time.time()
+        rl5 = d.get("rate_limits", {}).get("five_hour", {}) or {}
+        rl7 = d.get("rate_limits", {}).get("seven_day", {}) or {}
+
+        def eff_pct(w):
+            rt = w.get("resets_at")
+            if rt and now > rt:
+                return 0
+            return _pct_to_int(w.get("used_percentage"))
+
+        p5, p7 = eff_pct(rl5), eff_pct(rl7)
+        r5 = _fmt_reset(datetime.fromtimestamp(rl5.get("resets_at", 0), tz=kst)) if rl5.get("resets_at") else "?"
+        r7 = _fmt_reset(datetime.fromtimestamp(rl7.get("resets_at", 0), tz=kst)) if rl7.get("resets_at") else "?"
+        usage_lines = [
+            f"5h: {p5 if p5 is not None else '?'}% (리셋 {r5})",
+            f"7d: {p7 if p7 is not None else '?'}% (리셋 {r7})",
+        ]
+
+        health_lines = ["", "세션 / 텔레그램봇:"]
+        names = list_sessions()
+        hp = sessions_health_parallel(names)
+        for name in names:
+            s_ok, bot_ok = hp[name]
+            if not s_ok and is_intentionally_stopped(name):
+                health_lines.append(f"⏸️ {name}  bot:⏸️ (의도적 정지)")
+                continue
+            s_icon = "🟢" if s_ok else "🔴"
+            bot_icon = "🟢" if bot_ok else ("⚪" if s_ok else "🔴")
+            health_lines.append(f"{s_icon} {name}  bot:{bot_icon}")
+        return "\n".join(usage_lines + health_lines)
+    except Exception as e:
+        return f"[statusline read error] {e}"
+
+
+def _session_bot_token(name):
+    """세션별 텔레그램 봇 토큰. 세션 WorkingDirectory 의 .claude/telegram/.env 에서."""
+    unit = f"claude-{name}.service"
+    try:
+        wd = subprocess.check_output(
+            ["systemctl", "--user", "show", "-p", "WorkingDirectory", "--value", unit],
+            text=True, timeout=3,
+        ).strip()
+    except Exception:
+        wd = ""
+    if not wd:
+        return None
+    env = Path(wd) / ".claude" / "telegram" / ".env"
+    try:
+        for line in env.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            for key in ("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"):
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        return None
+    return None
+
+
+# getWebhookInfo 결과 짧은 TTL 캐시. 메뉴를 렌더할 때마다 세션 수만큼(9+) 새 TLS
+# 커넥션을 동시에 여는 버스트가 리졸버를 흔들면 실패가 증폭되므로, 수초 내 재렌더는
+# 캐시로 흡수해 재조회를 막는다. dict 갱신은 GIL 하 원자적이라 스레드풀에서 안전
+# (드문 경합은 중복 조회 한 번뿐, 무해).
+_PENDING_TTL = 8.0
+_pending_cache = {}  # name -> (value, ts)
+
+
+def _telegram_pending(name):
+    """봇의 미소비 업데이트 수(getWebhookInfo). None=확인 불가.
+    getUpdates 를 건드리지 않아 세션 폴링을 방해하지 않음(비침습)."""
+    now = time.time()
+    hit = _pending_cache.get(name)
+    if hit is not None and now - hit[1] < _PENDING_TTL:
+        return hit[0]
+    tok = _session_bot_token(name)
+    if not tok:
+        return None
+    try:
+        url = f"https://api.telegram.org/bot{tok}/getWebhookInfo"
+        with urllib.request.urlopen(url, timeout=5) as r:
+            d = json.loads(r.read())
+        if not d.get("ok"):
+            return None
+        val = d.get("result", {}).get("pending_update_count")
+        _pending_cache[name] = (val, now)
+        return val
+    except Exception:
+        return None
+
+
+def session_health(name):
+    """(service_active, telegram_ok) tuple.
+
+    채널(experimental) 텔레그램은 세션 프로세스 in-process 로 getUpdates 를 폴링한다
+    (별도 bun/MCP 상주 프로세스 없음 — 구버전 bun 검사는 항상 false 라 폐기).
+    각 세션이 자기 봇을 직접 폴링하므로, 봇에 미소비 업데이트가 쌓이면(=세션이
+    폴링 못 함) 비정상. getWebhookInfo 의 pending_update_count 로 비침습 판정한다.
+    근거: 중단된 세션 봇은 pending 이 쌓이고(예 1+), 정상 세션은 0 으로 관측됨."""
+    unit = f"claude-{name}.service"
+    try:
+        active = subprocess.check_output(
+            ["systemctl", "--user", "is-active", unit], text=True, timeout=3,
+        ).strip() == "active"
+    except Exception:
+        active = False
+    if not active:
+        return False, False
+    pending = _telegram_pending(name)
+    if pending is None:
+        # 확인 불가(토큰/네트워크) → 프로세스 살아있으면 ok 로 간주(가짜 ⚪ 방지)
+        telegram_ok = True
+    else:
+        # 소량 transient(막 도착, 폴링 직전)은 허용, 누적은 비정상
+        telegram_ok = pending < 3
+    return active, telegram_ok
+
+
+def sessions_health_parallel(names):
+    """session_health 를 병렬 실행 (세션당 getWebhookInfo HTTP가 직렬이면 9세션 ~8s → 병렬 ~1s)."""
+    from concurrent.futures import ThreadPoolExecutor
+    # 동시 신규 TLS 커넥션 버스트 완화: 10→5. 대부분은 _telegram_pending TTL 캐시로
+    # 흡수되고, 미스가 몰려도 최대 5개만 동시에 새로 연결한다(리졸버 부담 절반).
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        results = list(ex.map(session_health, names))
+    return dict(zip(names, results))
+
+
+def session_menu_markup(action):
+    """action: 'restart' (confirm 거침) 또는 'recent' (바로 실행)"""
+    sessions = list_sessions()
+    rows = []
+    for i in range(0, len(sessions), 2):
+        row = []
+        for name in sessions[i:i+2]:
+            if action == "restart":
+                row.append({"text": name, "callback_data": f"sess:{name}"})
+            else:
+                row.append({"text": name, "callback_data": f"{action}:{name}"})
+        rows.append(row)
+    if action == "restart":
+        rows.append([{"text": "⚡ 전세션 하드 재시작(확인)", "callback_data": "confirm:restart-all"}])
+    rows.append([{"text": "⬅ Back", "callback_data": "menu:main"}])
+    return {"inline_keyboard": rows}
+
+
+def session_action_markup(name):
+    """세션별 재구동/전원. 재시작·rotate·끄기는 확인다이얼로그 거침(소프트 경로는 2026-07-07 폐기).
+    켜기는 되돌리기 쉬워서(그냥 다시 뜨는 것) 확인 없이 즉시 실행."""
+    return {"inline_keyboard": [
+        [{"text": "⚡ 하드 재시작(확인)", "callback_data": f"confirm:restart:{name}"}],
+        [{"text": "⚠️ 강제 rotate(확인)", "callback_data": f"confirm:forcerotate:{name}"}],
+        [{"text": "🔴 끄기(확인)", "callback_data": f"confirm:stop:{name}"}],
+        [{"text": "🟢 켜기", "callback_data": f"start:{name}"}],
+        [{"text": "⬅ Back", "callback_data": "menu:restart"}],
+    ]}
+
+
+def confirm_markup(action_data, label):
+    """확인/취소 키보드. action_data가 확정 시 실행될 callback_data."""
+    return {"inline_keyboard": [
+        [{"text": f"✅ Yes ({label})", "callback_data": action_data},
+         {"text": "❌ No", "callback_data": "menu:main"}],
+    ]}
+
+
+def show_main(chat_id, message_id=None):
+    text = "Claude Session Control\n\n선택해주세요."
+    if message_id:
+        api("editMessageText", chat_id=chat_id, message_id=message_id, text=text, reply_markup=main_menu_markup())
+    else:
+        api("sendMessage", chat_id=chat_id, text=text, reply_markup=main_menu_markup())
+
+
+def send_result_and_menu(chat_id, text):
+    """실행 결과 텍스트 + 메인 메뉴 한꺼번에 전송"""
+    api("sendMessage", chat_id=chat_id, text=text[:3500], reply_markup=main_menu_markup())
+
+
+def handle_callback(cb):
+    user_id = cb.get("from", {}).get("id", 0)
+    if user_id != ALLOWED_USER:
+        api("answerCallbackQuery", callback_query_id=cb["id"], text="unauthorized")
+        return
+
+    data = cb.get("data", "")
+    msg = cb.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+
+    api("answerCallbackQuery", callback_query_id=cb["id"])
+
+    if data == "list":
+        out = run_cs("list")
+        send_result_and_menu(chat_id, f"```\n{out}\n```")
+    elif data == "status":
+        out = read_statusline()
+        send_result_and_menu(chat_id, out)
+    elif data == "resources":
+        out = read_resources()
+        send_result_and_menu(chat_id, out)
+    elif data == "restart-all":
+        out = restart_all_active_only()
+        send_result_and_menu(chat_id, f"restart-all:\n{out}")
+    elif data == "confirm:restart-all":
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text="⚠️ 모든 세션 재시작. 확실합니까?",
+            reply_markup=confirm_markup("restart-all", "Restart All"))
+    elif data.startswith("confirm:restart:"):
+        name = data[len("confirm:restart:"):]
+        if is_intentionally_stopped(name):
+            api("editMessageText", chat_id=chat_id, message_id=message_id,
+                text=f"⏸️ {name} 은 컨트롤봇으로 의도적으로 꺼져 있음 — 재시작으로는 안 살림. "
+                     f"켜려면 세션 메뉴에서 🟢 켜기를 눌러.",
+                reply_markup=session_action_markup(name))
+        else:
+            api("editMessageText", chat_id=chat_id, message_id=message_id,
+                text=f"⚠️ {name} 재시작. 확실합니까?",
+                reply_markup=confirm_markup(f"restart:{name}", f"Restart {name}"))
+    elif data == "menu:main":
+        show_main(chat_id, message_id)
+    elif data == "menu:restart":
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text="Restart할 세션 선택:", reply_markup=session_menu_markup("restart"))
+    elif data == "menu:recent":
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text="최신 대화 볼 세션 선택:", reply_markup=session_menu_markup("recent"))
+    elif data == "menu:model" or data.startswith(("model_s:", "model_m:", "model_e:")):
+        # 모델 선택 기능 비활성화 (2026-07-03, 사용자 요청). 세션 모델은 관리자가 claude-models.json
+        # 으로 직접 관리(현재 전 세션 claude-sonnet-5 고정). 스테일 버튼이 설정 덮어쓰지 못하도록
+        # write 경로(model_m/model_e) 포함 전부 무력화.
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text="🧠 모델 선택 기능은 꺼져 있어요.\n세션 모델은 관리자가 직접 설정합니다 (현재 전 세션 claude-sonnet-5).",
+            reply_markup=main_menu_markup())
+    elif data == "relogin-confirm":
+        if _RELAY.is_active():
+            send_result_and_menu(chat_id, "이미 진행 중인 로그인이 있어요. 끝난 뒤 다시.")
+        else:
+            api("editMessageText", chat_id=chat_id, message_id=message_id,
+                text="🔑 재로그인. 봇이 URL을 주면 브라우저서 로그인·승인 후 "
+                     "받은 코드를 그대로 이 채팅에 보내면 돼 (취소: /login_cancel). 시작?",
+                reply_markup=confirm_markup("relogin", "재로그인"))
+    elif data == "relogin":
+        if _RELAY.is_active():
+            send_result_and_menu(chat_id, "이미 진행 중인 로그인이 있어요.")
+        else:
+            start_relay(chat_id)
+    elif data == "menu:bypass":
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text=bypass_menu_text(), reply_markup=bypass_menu_markup())
+    elif data.startswith("bypass-toggle:"):
+        target = data[len("bypass-toggle:"):]
+        BYPASS_DIR.mkdir(parents=True, exist_ok=True)
+        if target == "__global__":
+            if BYPASS_GLOBAL.exists():
+                BYPASS_GLOBAL.unlink()
+            else:
+                BYPASS_GLOBAL.touch()
+        else:
+            info = bypass_proj_flag(target)
+            if info is not None:
+                flag, _ = info
+                if flag.exists():
+                    flag.unlink()
+                else:
+                    flag.touch()
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text=bypass_menu_text(), reply_markup=bypass_menu_markup())
+    elif data == "nudge:menu":
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text=nudge_menu_text(), reply_markup=nudge_menu_markup())
+    elif data.startswith("nudge:s:"):
+        name = data[len("nudge:s:"):]
+        on, remain, susp = nudge_state(name)
+        if susp:
+            body = (f"🟡 {name} — 넛지가 무응답 감지로 중단된 상태(남은 {remain:.1f}h). "
+                    f"세션이 다시 응답하면 자동 재개된다. 지금 끄면 재개도 안 한다.\n"
+                    f"시간을 누르면 종료시각만 새로 등록한다 — 중단 상태는 그대로다"
+                    f"(막힌 세션에 넛지를 다시 쏘지 않는다).")
+        elif on:
+            body = (f"🟢 {name} — 넛지 켜짐, {remain:.1f}시간 남음.\n"
+                    f"시간을 누르면 끄지 않고 종료시각을 그 값으로 새로 등록한다"
+                    f"(지금부터 다시 센다).")
+        else:
+            body = f"⚪ {name} — 넛지 꺼짐. 몇 시간 동안 걸까?"
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text=body, reply_markup=nudge_session_markup(name, on or susp))
+    elif data.startswith("nudge:on:"):
+        rest = data[len("nudge:on:"):]
+        name, _, hours = rest.rpartition(":")
+        # 재등록인지 새로 켜는 건지는 누르기 전 상태로 가른다 — 실행 뒤에 보면 둘 다
+        # 켜짐이라 사용자가 방금 무슨 일이 일어났는지 못 읽는다.
+        was_on, _, was_susp = nudge_state(name)
+        rc, out = run_nudge("--start", "--sessions", name, "--hours", hours)
+        if rc != 0:
+            note = f"⚠️ {name} 켜기 실패 rc={rc}\n{out}"
+        elif was_susp:
+            note = f"🟡 {name} 종료시각을 {hours}시간 뒤로 재등록. 중단 상태는 유지(응답하면 자동 재개)."
+        elif was_on:
+            note = f"🟢 {name} 종료시각을 지금부터 {hours}시간 뒤로 재등록."
+        else:
+            note = f"🟢 {name} {hours}시간 넛지 시작."
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text=nudge_menu_text(note), reply_markup=nudge_menu_markup())
+    elif data.startswith("nudge:offc:"):
+        name = data[len("nudge:offc:"):]
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text=f"🔴 {name} 넛지 끄기 — 남은 시간을 버리고 즉시 중지. 확실합니까?",
+            reply_markup=confirm_markup(f"nudge:off:{name}", f"Nudge off {name}"))
+    elif data.startswith("nudge:off:"):
+        name = data[len("nudge:off:"):]
+        # --stop 은 위치인자 전용. --sessions 를 주면 rc=2 로 거절된다(2026-07-31 사고:
+        # 그 전엔 성공을 찍고 아무것도 안 껐다). 여기서 문법을 헷갈리지 말 것.
+        rc, out = run_nudge("--stop", name)
+        note = f"⚪ {name} 넛지 중지." if rc == 0 else f"⚠️ {name} 끄기 실패 rc={rc}\n{out}"
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text=nudge_menu_text(note), reply_markup=nudge_menu_markup())
+    elif data.startswith("recent:"):
+        name = data[len("recent:"):]
+        out = read_recent(name)
+        send_result_and_menu(chat_id, out)
+    elif data.startswith("sess:"):
+        name = data[len("sess:"):]
+        stopped_note = "\n\n⏸️ 현재 의도적으로 꺼져 있음 — 재시작/rotate로 안 살아남." if is_intentionally_stopped(name) else ""
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text=f"{name} 재구동:\n⚡ 하드 재시작 = 즉시 강제 재시작(맥락 유지, resume).\n⚠️ 강제 rotate = handoff 없이 즉시 새 세션(맥락 버려짐).{stopped_note}",
+            reply_markup=session_action_markup(name))
+    elif data.startswith("confirm:forcerotate:"):
+        name = data[len("confirm:forcerotate:"):]
+        if is_intentionally_stopped(name):
+            api("editMessageText", chat_id=chat_id, message_id=message_id,
+                text=f"⏸️ {name} 은 컨트롤봇으로 의도적으로 꺼져 있음 — rotate로는 안 살림. "
+                     f"켜려면 세션 메뉴에서 🟢 켜기를 눌러.",
+                reply_markup=session_action_markup(name))
+        else:
+            api("editMessageText", chat_id=chat_id, message_id=message_id,
+                text=f"⚠️ {name} 강제 rotate — handoff 없이 즉시 새 세션(진행중 맥락 버려짐). 확실합니까?",
+                reply_markup=confirm_markup(f"forcerotate:{name}", f"Force rotate {name}"))
+    elif data.startswith("forcerotate:"):
+        name = data[len("forcerotate:"):]
+        out = run_cs("rotate", name, "--force", timeout=60)
+        send_result_and_menu(chat_id, f"force rotate {name}:\n{out}")
+    elif data.startswith("restart:"):
+        name = data[len("restart:"):]
+        out = run_cs("restart", name)
+        send_result_and_menu(chat_id, f"restart {name}:\n{out}")
+    elif data.startswith("confirm:stop:"):
+        name = data[len("confirm:stop:"):]
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text=f"🔴 {name} 세션 끄기 — 꺼지면 그 세션 봇으로도 텔레그램 응답 못 받음. "
+                 f"다시 켜려면 이 컨트롤봇 메뉴에서 켜기를 눌러야 함. 확실합니까?",
+            reply_markup=confirm_markup(f"stop:{name}", f"Stop {name}"))
+    elif data.startswith("stop:"):
+        name = data[len("stop:"):]
+        out = systemctl_session("stop", name)
+        send_result_and_menu(chat_id, out)
+    elif data.startswith("start:"):
+        name = data[len("start:"):]
+        out = systemctl_session("start", name)
+        send_result_and_menu(chat_id, out)
+    else:
+        send_result_and_menu(chat_id, f"unknown: {data}")
+
+
+def handle_message(msg):
+    user_id = msg.get("from", {}).get("id", 0)
+    if user_id != ALLOWED_USER:
+        api("sendMessage", chat_id=msg.get("chat", {}).get("id"), text="unauthorized")
+        return
+
+    chat_id = msg.get("chat", {}).get("id")
+    text = (msg.get("text") or "").strip()
+
+    # 로그인 취소
+    if text == "/login_cancel":
+        api("sendMessage", chat_id=chat_id,
+            text="로그인 취소됨." if _RELAY.cancel() else "진행 중인 로그인이 없어요.")
+        return
+    # 로그인 릴레이가 코드 대기 중이면, 명령이 아닌 입력은 인증 코드로 처리 (코드는 로그 안 함).
+    st = _RELAY.status()
+    if st and st.get("state") == "WAITING_CODE" and not text.startswith("/"):
+        if _RELAY.submit_code(text):
+            api("sendMessage", chat_id=chat_id, text="코드 받음 — 주입 중…")
+        else:
+            api("sendMessage", chat_id=chat_id, text="지금은 코드를 받을 상태가 아니에요.")
+        return
+
+    if text in ("/start", "/menu", "menu", "메뉴"):
+        show_main(chat_id)
+    elif text == "/login":
+        # 셀프 재로그인 진입 (계정 구분 없음 — 방금 로그인한 creds 를 그대로 적용).
+        if _RELAY.is_active():
+            send_result_and_menu(chat_id, "이미 진행 중인 로그인이 있어요. 끝난 뒤 다시.")
+        else:
+            api("sendMessage", chat_id=chat_id,
+                text="🔑 재로그인. 봇이 URL을 주면 브라우저서 로그인·승인 후 "
+                     "받은 코드를 그대로 이 채팅에 보내면 돼 (취소: /login_cancel). 시작?",
+                reply_markup=confirm_markup("relogin", "재로그인"))
+    elif text == "/status":
+        out = read_statusline()
+        send_result_and_menu(chat_id, out)
+    elif text == "/resources":
+        out = read_resources()
+        send_result_and_menu(chat_id, out)
+    elif text == "/list":
+        out = run_cs("list")
+        send_result_and_menu(chat_id, f"```\n{out}\n```")
+    elif text == "/restart_all":
+        out = run_cs("restart-all", timeout=60)
+        send_result_and_menu(chat_id, f"restart-all:\n{out}")
+    elif text.startswith("/restart_"):
+        name = text[len("/restart_"):].replace("_", "-")
+        out = run_cs("restart", name)
+        send_result_and_menu(chat_id, f"restart {name}:\n{out}")
+    else:
+        # 기본은 메뉴 표시
+        show_main(chat_id)
+
+
+def setup_commands():
+    """텔레그램 채팅창 하단 / 버튼에 뜨는 명령어 등록"""
+    commands = [
+        {"command": "menu", "description": "메인 메뉴"},
+        {"command": "list", "description": "모든 세션 상태"},
+        {"command": "status", "description": "토큰 사용량/리셋 타임"},
+        {"command": "resources", "description": "시스템 리소스 (CPU/MEM/디스크/세션)"},
+        {"command": "restart_all", "description": "모든 세션 재시작"},
+        {"command": "login", "description": "claude.ai 계정 재로그인"},
+    ]
+    # 각 세션별 restart 명령도 자동 등록
+    for name in list_sessions():
+        cmd_name = name.replace("-", "_")
+        commands.append({"command": f"restart_{cmd_name}", "description": f"{name} 재시작"})
+    api("setMyCommands", commands=commands)
+
+
+def main():
+    print(f"[control-bot] start. allowed_user={ALLOWED_USER}", flush=True)
+    setup_commands()
+
+    offset = 0
+    while True:
+        try:
+            r = api("getUpdates", offset=offset, timeout=30, allowed_updates=["message", "callback_query"])
+            if not r.get("ok"):
+                time.sleep(5)
+                continue
+            for upd in r.get("result", []):
+                offset = upd["update_id"] + 1
+                if "callback_query" in upd:
+                    handle_callback(upd["callback_query"])
+                elif "message" in upd:
+                    handle_message(upd["message"])
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"[loop] {e}", flush=True)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()

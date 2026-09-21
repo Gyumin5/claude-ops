@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""claude-stall-guard — rate-limit 해제 후에도 안 깨어난 세션을 찾아 주입으로 깨운다.
+
+배경: 세션이 5h 한도에 걸리면 CLI 가 "You've hit your session limit · resets HH:MM"
+합성 메시지를 남기고, 그 뒤 들어오는 텔레그램 메시지는 queue-operation 으로만 쌓인다.
+정상 경로는 rate-limit-recovery 가 해제를 감지해 trigger:queue-flush 를 주입하는 것.
+그 주입이 실패하면 세션은 큐를 안고 무한정 조용히 서 있는다(실측 최장 913분).
+
+판정(전부 충족해야 정체로 본다 — 하나라도 못 확인하면 발동 안 함, fail-silent):
+  1. 마지막 한도 공지 이후 한도공지가 아닌 assistant 레코드가 하나도 없다(=진행 0)
+  2. 그 뒤로 queue-operation 이 1건 이상 쌓였다(=처리 못 한 사용자 입력이 있다)
+  3. 공지에 적힌 reset 시각을 OVERSHOOT_MIN 분 넘겼다(=기다림이 더는 정상이 아니다)
+  4. 지금 다시 한도에 걸린 상태가 아니다(statusline 5h < 90%)
+  5. 유닛이 active 이고 CLAUDE_SESSION_NAME 과 프로젝트 디렉토리가 둘 다 확인된다
+
+3번이 핵심이다. 한도 대기 중의 정체는 정상이라 그것까지 세면 오탐이 25건 이상 나온다
+(2026-07-30 실측: 3번 조건 없으면 32건, 있으면 9건 — 홈 2건, peer 7건, 약 3건/월).
+
+조치는 주입 한 가지뿐이다. 세션 재시작은 의도적으로 구현하지 않았다 — 자식 프로세스
+점유 확인(장시간 도구 실행 중인 세션을 정체로 오판하면 작업 유실) 없이는 비가역이고,
+주입만으로 복구되는지 먼저 관측한다. 사람에게 텔레그램 알림도 안 보낸다(사용자 요청).
+모든 판단은 stall-guard.log 에 남으므로 사후 분석은 파일로 한다. 단 정상 경로는
+로그를 안 쓰므로(조용한 게 정상) 실행 여부는 stall-guard.heartbeat 의 mtime 으로 본다.
+
+★안 잡는 것(2026-08-03 session-b 사고로 확인된 범위 밖): 이 가드는 "한도 공지"가
+있는 정체만 본다(판정 1번). 한도와 무관하게 생성이 그냥 끊긴 경우 — fusion 은 정상
+tool_result 를 0.6초 만에 받은 뒤 18시간 34분간 assistant 레코드 0, 그 사이 넛지 37건
+전송·텔레그램 48건 큐 적재, 유닛 재기동으로만 깨어남 — 은 limit_ts 가 없어 곧바로
+"no-limit-notice" 로 빠진다. 이 클래스를 덮으려면 별도 판정(인바운드 대비 무응답)이
+필요하고, 그건 오탐 시 작업 중인 세션을 건드리므로 따로 설계해야 한다.
+
+kill switch: CLAUDE_STALL_GUARD_OFF=1 또는 ~/.claude/state/stall-guard.off
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".claude", "state")
+STATE_FILE = os.path.join(STATE_DIR, "stall-guard.json")
+LOG_FILE = os.path.join(STATE_DIR, "stall-guard.log")
+# 매 실행마다 덮어쓴다. 정상 경로는 로그를 안 남기므로 로그가 비어 있는 것과
+# 데몬이 아예 안 도는 것을 구분할 수 없었다(2026-08-03 fusion 조사에서 실제로
+# 그 혼동이 났다 — ~/.claude/logs/stall-guard.log 라는 옛 0바이트 파일까지 남아
+# 있어 더 헷갈렸다). mtime 만 보면 "돌았다"가 증명된다.
+HEARTBEAT = os.path.join(STATE_DIR, "stall-guard.heartbeat")
+OFF_FLAG = os.path.join(STATE_DIR, "stall-guard.off")
+PROJECTS = os.path.join(HOME, ".claude", "projects")
+STATUSLINE_CACHE = os.path.join(HOME, ".claude", "statusline_cache.json")
+USERBOT_SEND = os.path.join(HOME, ".local", "bin", "claude-userbot-send")
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import claude_session_lib as csl   # noqa: E402  (transcript 선택 규칙 단일 출처)
+
+STALL_MIN = 20           # 한도 공지 이후 무진행 최소 시간
+OVERSHOOT_MIN = 20       # reset 시각 초과 최소 시간
+CONFIRM_TICKS = 2        # 연속 확인 횟수(단발 오탐 방지)
+COOLDOWN_SEC = 30 * 60   # 세션당 주입 최소 간격
+MAX_INJECT_PER_HOUR = 2  # 세션당 시간당 주입 상한
+QUOTA_BLOCK_PCT = 90     # 이 이상이면 지금 다시 한도 — 정체 아님
+TAIL_BYTES = 4 * 1024 * 1024
+UNIT_RE = re.compile(r"^claude-[A-Za-z0-9][A-Za-z0-9._-]*\.service$")
+# 세션이 아닌 상시 유닛만. 세션 이름과 겹치면 그 세션이 영구 사각지대가 되므로
+# 새 이름을 넣기 전에 ~/.claude/userbot/targets.json 과 대조할 것
+# (claude-api-5xx-watcher 의 SKIP 에서 "resume" 가 실제로 그 사고를 냈다).
+NON_SESSION = {"control-bot"}
+LIMIT_RE = re.compile(r"You've hit your (?:session|usage) limit")
+RESET_RE = re.compile(r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", re.I)
+
+INJECT_TEXT = (
+    "trigger:stall-recovery — rate-limit 해제 후에도 이 세션이 {mins}분간 진행이 없고 "
+    "처리 안 된 입력 {q}건이 큐에 남아 있어서 stall-guard 가 깨웠다. "
+    "밀린 요청을 순서대로 확인해 이어서 처리하고, 뭘 놓쳤는지 사용자에게 한 줄로 알려라."
+)
+
+
+def log(line):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(LOG_FILE, "a") as fh:
+            fh.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), line))
+    except OSError:
+        pass
+
+
+_ONCE_FILE = os.path.join(STATE_DIR, "stall-guard.once.json")
+
+
+def log_once(line, key, every=3600):
+    """같은 사유를 5분마다 로그에 쏟지 않는다. 키당 every 초에 한 번."""
+    try:
+        with open(_ONCE_FILE) as fh:
+            seen = json.load(fh)
+        if not isinstance(seen, dict):
+            seen = {}
+    except Exception:
+        seen = {}
+    now = int(time.time())
+    if now - int(seen.get(key) or 0) < every:
+        return
+    seen[key] = now
+    log(line)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = _ONCE_FILE + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as fh:
+            json.dump(seen, fh)
+        os.replace(tmp, _ONCE_FILE)
+    except OSError:
+        pass
+
+
+def beat(summary):
+    """실행 흔적을 남긴다(덮어쓰기). 정상 경로가 조용해도 mtime 으로 확인 가능."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = HEARTBEAT + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as fh:
+            fh.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), summary))
+        os.replace(tmp, HEARTBEAT)
+    except OSError:
+        pass
+
+
+utc_epoch = csl.utc_epoch
+
+
+def quota_5h():
+    return csl.quota_5h(STATUSLINE_CACHE)
+
+
+def live_sessions():
+    """(session_name, project_dir) 목록. 유닛 active + 세션명 + 디렉토리 전부 확인된 것만."""
+    out = []
+    try:
+        raw = subprocess.run(
+            ["systemctl", "--user", "list-units", "--plain", "--no-legend",
+             "--type=service", "--state=active", "claude-*.service"],
+            capture_output=True, text=True, timeout=20).stdout
+    except Exception as e:
+        log("error stage=list-units err=%s" % e)
+        return out
+    for line in raw.splitlines():
+        unit = line.split()[0] if line.split() else ""
+        if not UNIT_RE.match(unit):
+            continue
+        try:
+            show = subprocess.run(
+                ["systemctl", "--user", "show", unit,
+                 "-p", "WorkingDirectory", "-p", "Environment", "-p", "ActiveState",
+                 "-p", "Transient"],
+                capture_output=True, text=True, timeout=20).stdout
+        except Exception:
+            continue
+        wd = name = ""
+        active = transient = False
+        for ln in show.splitlines():
+            if ln.startswith("WorkingDirectory="):
+                wd = ln.split("=", 1)[1]
+            elif ln.startswith("ActiveState="):
+                active = ln.split("=", 1)[1] == "active"
+            elif ln.startswith("Transient="):
+                transient = ln.split("=", 1)[1] == "yes"
+            elif ln.startswith("Environment="):
+                for tok in ln.split("=", 1)[1].split():
+                    if tok.startswith("CLAUDE_SESSION_NAME="):
+                        name = tok.split("=", 1)[1]
+        if not active:
+            continue
+        # systemd-run 일회성 유닛(claude-job-* 등)은 세션이 아니다 — 조용히 뺀다.
+        if transient:
+            continue
+        proj = unit[len("claude-"):-len(".service")]
+        if proj in NON_SESSION:
+            continue
+        if not name:
+            # 이름이 없으면 목록에서 빠지는데, 예전에는 그게 조용히 일어났다.
+            # peer session-a 가 도입 이후 내내 감시 밖이었고 아무도 몰랐다
+            # (2026-08-03 발견). 유닛에 CLAUDE_SESSION_NAME 을 넣어야 잡힌다.
+            log_once("no-session-name unit=%s wd=%s — 이 세션은 감시되지 않는다 "
+                     "(유닛 Environment 에 CLAUDE_SESSION_NAME 추가 필요)" % (unit, wd),
+                     key="name:" + unit)
+            continue
+        if not wd:
+            log_once("no-workingdir unit=%s — 이 세션은 감시되지 않는다" % unit,
+                     key="wd:" + unit)
+            continue
+        pdir = project_dir(wd)
+        if pdir:
+            out.append((name, pdir))
+        else:
+            log("skip session=%s reason=no-project-dir wd=%s" % (name, wd))
+    return out
+
+
+def project_dir(wd):
+    return csl.project_dir(wd, PROJECTS, on_fallback=log)
+
+
+recorded_cwd = csl.recorded_cwd
+transcript_kind = csl.transcript_kind
+
+
+def newest_transcript(pdir):
+    return csl.session_transcript(pdir, on_fallback=log)
+
+
+def msg_text(obj):
+    m = obj.get("message")
+    if not isinstance(m, dict):
+        return ""
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+    return ""
+
+
+def reset_epoch(notice, base):
+    """공지에 적힌 reset 시각 → epoch. 표기는 로컬(KST) 기준. 못 읽으면 None."""
+    m = RESET_RE.search(notice)
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2) or 0)
+    ap = (m.group(3) or "").lower()
+    if ap == "pm" and h != 12:
+        h += 12
+    if ap == "am" and h == 12:
+        h = 0
+    if not (0 <= h <= 23):
+        return None
+    lt = time.localtime(base)
+    cand = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, mi, 0, 0, 0, -1))
+    if cand < base:
+        cand += 86400  # 자정 넘는 reset
+    return cand
+
+
+def inspect(path):
+    """(정체 여부, 상세). 조건을 하나라도 확인 못 하면 정체 아님으로 판정한다."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, errors="replace") as fh:
+            if size > TAIL_BYTES:
+                fh.seek(size - TAIL_BYTES)
+                fh.readline()  # 잘린 첫 줄 버림
+            lines = fh.readlines()
+    except OSError as e:
+        return False, {"reason": "read-fail", "err": str(e)}
+
+    last_assistant = 0      # 한도공지가 아닌 assistant
+    limit_ts, limit_txt = 0, ""
+    queue_after = 0
+    for line in lines:
+        if '"type"' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        t = o.get("type")
+        e = utc_epoch(o.get("timestamp"))
+        if not e:
+            continue
+        if t == "assistant":
+            txt = msg_text(o)
+            if LIMIT_RE.search(txt):
+                if e >= limit_ts:
+                    limit_ts, limit_txt, queue_after = e, txt, 0
+            else:
+                last_assistant = max(last_assistant, e)
+        elif t == "queue-operation" and limit_ts:
+            queue_after += 1
+
+    if not limit_ts:
+        return False, {"reason": "no-limit-notice"}
+    if last_assistant > limit_ts:
+        return False, {"reason": "progressed-after-limit"}
+    if queue_after < 1:
+        return False, {"reason": "no-queued-input"}
+    now = time.time()
+    stall_min = int((now - limit_ts) / 60)
+    if stall_min < STALL_MIN:
+        return False, {"reason": "too-fresh", "stall_min": stall_min}
+    reset = reset_epoch(limit_txt, limit_ts)
+    if reset is None:
+        return False, {"reason": "reset-unparsed"}
+    over_min = int((now - reset) / 60)
+    if over_min < OVERSHOOT_MIN:
+        return False, {"reason": "still-waiting-reset", "over_min": over_min}
+    return True, {"stall_min": stall_min, "over_min": over_min, "queued": queue_after}
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATE_FILE + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as fh:
+            json.dump(st, fh)
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        log("error stage=save-state err=%s" % e)
+
+
+def inject(session, det):
+    text = INJECT_TEXT.format(mins=det["stall_min"], q=det["queued"])
+    if not os.access(USERBOT_SEND, os.X_OK):
+        log("inject-fail session=%s reason=no-userbot-send" % session)
+        return False
+    try:
+        r = subprocess.run([USERBOT_SEND, "--session", session, text],
+                           capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        log("inject-fail session=%s reason=exec err=%s" % (session, e))
+        return False
+    if r.returncode != 0:
+        log("inject-fail session=%s rc=%d err=%s"
+            % (session, r.returncode, (r.stderr or "").strip()[:200]))
+        return False
+    log("inject-ok session=%s stall_min=%d over_min=%d queued=%d"
+        % (session, det["stall_min"], det["over_min"], det["queued"]))
+    return True
+
+
+def main():
+    dry = "--dry-run" in sys.argv
+    verbose = dry or "--verbose" in sys.argv
+
+    if os.environ.get("CLAUDE_STALL_GUARD_OFF") == "1" or os.path.exists(OFF_FLAG):
+        if verbose:
+            print("kill switch 켜져 있음 — 아무것도 안 함")
+        beat("off=kill-switch")
+        return 0
+
+    pct = quota_5h()
+    if pct < 0:
+        # 한도 상태 불명. 아무것도 안 한다(#072 와 같은 규칙 — 불명을 "해제"로 흘리지 않음).
+        if verbose:
+            print("statusline 읽기 실패 — 판정 보류")
+        log("skip-all reason=quota-unknown")
+        beat("skip=quota-unknown")
+        return 0
+    if pct >= QUOTA_BLOCK_PCT:
+        if verbose:
+            print("지금 다시 한도 근처(5h %.0f%%) — 정체 판정 보류" % pct)
+        log("skip-all reason=quota-blocked pct=%s" % pct)
+        beat("skip=quota-blocked pct=%s" % pct)
+        return 0
+
+    st = load_state()
+    now = int(time.time())
+    changed = False
+    seen, stalled_now = [], []
+
+    for session, pdir in live_sessions():
+        path = newest_transcript(pdir)
+        if not path:
+            continue
+        stalled, det = inspect(path)
+        seen.append("%s:%s" % (session, "stall" if stalled else det.get("reason", "?")))
+        if stalled:
+            stalled_now.append(session)
+        rec = st.get(session) or {}
+        if not stalled:
+            if rec.get("confirm"):
+                rec["confirm"] = 0
+                st[session] = rec
+                changed = True
+            if verbose:
+                print("정상  %-22s %s" % (session, det.get("reason", "")))
+            continue
+
+        confirm = int(rec.get("confirm") or 0) + 1
+        rec["confirm"] = confirm
+        rec["last_detect"] = now
+        st[session] = rec
+        changed = True
+        if verbose:
+            print("정체?  %-22s 무진행 %d분 / reset 초과 %d분 / 큐 %d건 / 확인 %d회"
+                  % (session, det["stall_min"], det["over_min"], det["queued"], confirm))
+        if confirm < CONFIRM_TICKS:
+            log("detect session=%s confirm=%d/%d stall_min=%d over_min=%d queued=%d"
+                % (session, confirm, CONFIRM_TICKS, det["stall_min"], det["over_min"],
+                   det["queued"]))
+            continue
+
+        recent = [t for t in (rec.get("injects") or []) if now - int(t) < 3600]
+        if len(recent) >= MAX_INJECT_PER_HOUR:
+            log("hold session=%s reason=hourly-cap injects=%d" % (session, len(recent)))
+            continue
+        if recent and now - max(int(t) for t in recent) < COOLDOWN_SEC:
+            log("hold session=%s reason=cooldown" % session)
+            continue
+        if dry:
+            print("      → 주입 대상(dry-run, 실제로는 안 보냄)")
+            continue
+        if inject(session, det):
+            recent.append(now)
+            rec["injects"] = recent
+            rec["confirm"] = 0
+            st[session] = rec
+            changed = True
+
+    if changed and not dry:
+        save_state(st)
+    if not dry:
+        beat("checked=%d stalled=%d %s"
+             % (len(seen), len(stalled_now), " ".join(seen)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

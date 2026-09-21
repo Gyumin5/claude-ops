@@ -1,0 +1,517 @@
+#!/bin/bash
+# claude-session-nudge: 지정 세션들에게 주기적으로 "진행상황 보고 + 계속 진행"
+# 메시지를 텔레그램(userbot)으로 주입. "밤새/N시간 계속해"를 줘도 세션이
+# ScheduleWakeup 자기판단에 실패해 도중에 멈추는 문제의 외부 결정론적 대체재.
+#
+# 재설계(2026-07-24): 세션별 독립 설정 + 세션별 지속 데몬(systemd 템플릿 유닛).
+#  - 상태: 세션별 파일 ~/.claude/state/session-nudge/<session>.json (원자적, 상호 비간섭).
+#  - 유닛: claude-session-nudge@<session>.service (Type=simple, Restart=on-failure,
+#          내부 while 루프. end_ts 도달/enabled=false 면 정상 exit 0 → Restart 안 됨.
+#          크래시(exit!=0)만 부활 → 침묵사망 방지).
+#  - 한 세션 등록/중단이 다른 세션에 영향 없음(구 단일 상태파일 통째 덮어쓰기 버그 해소).
+#
+# 사용:
+#   claude-session-nudge --start --sessions peer,session-a --hours 8 [--interval 30] [--message TEXT]
+#   claude-session-nudge --start --sessions peer --until 09:00
+#   claude-session-nudge --stop [<session>]      # 세션 지정: 그 세션만, 생략: 전체
+#   claude-session-nudge --status
+#   claude-session-nudge --refresh-defaults      # 등록분의 문구·간격을 지금 기본값으로
+#   claude-session-nudge --daemon <session>      # systemd 템플릿 유닛이 호출하는 데몬 모드
+
+set -uo pipefail
+
+STATE_DIR="${CLAUDE_NUDGE_STATE_DIR:-$HOME/.claude/state}"
+NUDGE_DIR="$STATE_DIR/session-nudge"          # 세션별 <session>.json 디렉토리
+LEGACY_STATE="$STATE_DIR/session-nudge.json"  # 구 단일 상태파일(마이그레이션 후 .bak)
+LOG_FILE="$HOME/.claude/logs/session-nudge.log"
+SEND="${CLAUDE_NUDGE_SEND:-$HOME/.local/bin/claude-userbot-send}"
+PROBE="${CLAUDE_NUDGE_PROBE:-$HOME/.local/bin/claude-session-probe}"
+# 운영자 알림용 dotfiles 봇. 파일이 없으면 tg() 가 조용히 아무것도 안 한다.
+TG_ENV="${CLAUDE_NUDGE_TG_ENV:-$HOME/dotfiles/.claude/telegram/.env}"
+TG_CHAT="${TELEGRAM_CHAT_ID:-}"
+# 회차 간격(분). 2026-09-04 운영자 지시로 30 → 60.
+DEFAULT_INTERVAL=60
+NO_RESP_MAX=2            # 연속 무응답 이 횟수면 넛지 중단 + 사용자 알림(기본 간격이면 2시간)
+# 도구가 이 분수 이상 열려 있으면 "도는 중"이 아니라 막힌 것으로 본다. 권한 승인 대기가
+# 대표적이다(요청이 transcript 에 안 남아 직접은 못 본다). 정상 도구가 이만큼 걸리는
+# 경우는 거의 없다 — ai-debate 가 최대 10분, run_in_background 는 즉시 결과가 돌아온다.
+PENDING_STUCK_MIN="${CLAUDE_NUDGE_PENDING_STUCK_MIN:-30}"
+UNIT_SRC="$HOME/dotfiles/systemd/user/claude-session-nudge@.service"
+UNIT_LINK="$HOME/.config/systemd/user/claude-session-nudge@.service"
+# 대기 중이라고만 답하면 사람이 그걸 보고 아무 판단도 못 한다. 멈춰 있으면 무엇을
+# 정해야 하는지까지 받아야 그 자리에서 답을 줄 수 있다(2026-08-14 사용자 요청).
+# 후보가 여럿이면 고르지 말고 되도록 다 해본다 — 토론은 선택기가 아니라
+# 명백히 불필요한 후보를 덜어내는 데 쓴다(2026-08-18 사용자 요청).
+# 그리고 판단 지점은 사람에게 오기 전에 먼저 토론을 거친다 — 되돌릴 수 있는 건 토론이
+# 정하고 사람에게는 토론으로도 안 닫히는 것만 남긴다(2026-08-18 사용자 요청).
+# 목록 순서는 다시 정하되 그 재조정에 토론을 걸지는 않는다 — 순서 정하기에 ai-debate 를
+# 물리면 매 넛지마다 수 분짜리 3자 호출이 붙는데, 그건 어느 항목을 먼저 하느냐에 비해
+# 비싸다. 세션이 직접 정하고 넘어간다(2026-08-23 사용자 요청).
+# 자원은 재보고 쓰는 것이다 — 세션이 자기 판단으로 보수적인 병렬도에 머물면 머신이
+# 논다. 관측값을 근거로 올리고 내리게 한다(2026-08-15 사용자 요청).
+# 스왑은 그 관측값에서 뺀다 — 리눅스는 메모리가 남아도 안 쓰는 페이지를 스왑에 내려두므로
+# 스왑 사용량은 압박의 증거가 아니다. 그걸 신호로 두면 실제로는 남는 머신에서 병렬도를
+# 못 올린다. 판단은 available 메모리로 한다(2026-08-25 사용자 지시).
+# 문구는 짧게 유지한다 — 넛지는 사람 화면에도 그대로 뜬다. 위 주석이 각 조항의 근거를
+# 들고 있으니 본문에는 지시만 남긴다(2026-08-25 사용자 지시: 777자가 너무 길다).
+# 순서 재정렬만 시키면 목록은 계속 자란다 — 끝난 것을 내리고 겹치는 것을 합치는 일은
+# 아무도 안 하면 안 일어난다. 회차마다 같이 시킨다(2026-08-28 사용자 지시).
+# 넛지는 보고를 요구하지 않는다(2026-09-04 운영자 지시). 회차마다 진행상황 보고가
+# 텔레그램에 쌓이는데 운영자가 요청한 적 없는 글이다. 넛지는 세션을 다시 굴리는
+# 입력이지 질문이 아니므로 답장도 받지 않는다 — 무응답 판정은 텔레그램이 아니라
+# claude-session-probe 가 transcript 의 assistant 레코드로 하므로 답장을 없애도
+# 감시는 그대로 돈다.
+DEFAULT_MSG="이어서 진행해. 이건 자동 넛지다 — 텔레그램 답장하지 말고 작업만 이어가라. 판단은 사람한테 넘기기 전에 ai-debate 로 닫아 - 되돌릴 수 있으면 집행 후 보고, 갈리거나 비가역이면 근거와 함께 남겨. 후보가 여럿이면 고르지 말고 다 해봐. 태스크 목록도 정리해 — 끝난 건 완료(최근)로 내리고, 겹치거나 없어진 건 합치거나 지우고, 순서는 토론 없이 네가 다시 정하고 번호는 구멍 없이 다시 매겨. 독립 작업 둘 이상이면 병렬로. nproc·load·free -g 로 자원 재고 여유만큼 돌려(available 기준, 스왑 무시)."
+
+
+mkdir -p "$NUDGE_DIR" "$(dirname "$LOG_FILE")" "$HOME/.config/systemd/user"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S KST')] $1" >> "$LOG_FILE"; }
+
+usage() {
+    echo "Usage: claude-session-nudge --start --sessions a,b --hours N|--until HH:MM [--interval MIN] [--message TEXT]" >&2
+    echo "       claude-session-nudge --stop [<session>]" >&2
+    echo "       claude-session-nudge --status" >&2
+    echo "       claude-session-nudge --refresh-defaults  # 등록분의 문구·간격을 지금 기본값으로" >&2
+    echo "       claude-session-nudge --daemon <session>" >&2
+    exit 1
+}
+
+ensure_unit_link() {
+    # 템플릿 유닛 심링크 보장(dotfiles 소스 → ~/.config/systemd/user).
+    [ -e "$UNIT_LINK" ] || ln -sf "$UNIT_SRC" "$UNIT_LINK"
+}
+
+session_file() { echo "$NUDGE_DIR/$1.json"; }
+
+write_session() {
+    # $1=session $2=interval_min $3=end_ts $4=message
+    # 이미 상태파일이 있으면 무응답 추적 필드를 보존한다. 새 dict 로 통째 덮으면
+    # alert_msg_id 를 잃어서 고정된 텔레그램 알림을 아무도 못 푼다 — clear_alert 는 그
+    # id 로만 푼다. suspended 도 그대로 둔다: 종료시각을 새로 등록하는 건 "세션이 다시
+    # 응답한다"는 뜻이 아니고, 응답이 관측되면 tick 이 알아서 풀고 재개한다. 여기서
+    # 억지로 풀면 권한 승인 대기로 막힌 세션에 넛지를 다시 쏘게 되고, 그게 이 중단
+    # 장치를 만든 원인(fusion 18시간 34분)이다.
+    local s="$1" interval="$2" end_ts="$3" message="$4"
+    local f; f="$(session_file "$s")"
+    local tmp="$f.tmp.$$"
+    S="$s" INTERVAL="$interval" END_TS="$end_ts" MESSAGE="$message" F="$f" python3 -c "
+import json, os
+d = {
+    'session': os.environ['S'],
+    'interval_min': int(os.environ['INTERVAL']),
+    'end_ts': int(os.environ['END_TS']),
+    'message': os.environ['MESSAGE'],
+    'enabled': True,
+}
+try:
+    old = json.load(open(os.environ['F']))
+except Exception:
+    old = {}
+for k in ('suspended', 'alert_msg_id', 'no_response', 'last_assistant', 'last_send_ok'):
+    if k in old:
+        d[k] = old[k]
+json.dump(d, open('$tmp','w'), ensure_ascii=False, indent=2)
+"
+    mv -f "$tmp" "$f"
+}
+
+cmd_start() {
+    local sessions="" hours="" until_hhmm="" interval="$DEFAULT_INTERVAL" message="$DEFAULT_MSG"
+    while [[ "${1:-}" == --* ]]; do
+        case "$1" in
+            --sessions) sessions="$2"; shift 2 ;;
+            --hours) hours="$2"; shift 2 ;;
+            --until) until_hhmm="$2"; shift 2 ;;
+            --interval) interval="$2"; shift 2 ;;
+            --message) message="$2"; shift 2 ;;
+            *) usage ;;
+        esac
+    done
+    [ -n "$sessions" ] || usage
+    [ -n "$hours" ] || [ -n "$until_hhmm" ] || usage
+
+    local end_ts
+    if [ -n "$until_hhmm" ]; then
+        end_ts=$(date -d "$until_hhmm" +%s)
+        if [ "$end_ts" -le "$(date +%s)" ]; then
+            end_ts=$(date -d "tomorrow $until_hhmm" +%s)
+        fi
+    else
+        end_ts=$(( $(date +%s) + hours * 3600 ))
+    fi
+
+    ensure_unit_link
+    systemctl --user daemon-reload
+    local IFS=','
+    for s in $sessions; do
+        [ -n "$s" ] || continue
+        write_session "$s" "$interval" "$end_ts" "$message"
+        systemctl --user enable --now "claude-session-nudge@${s}.service" 2>/dev/null || \
+            systemctl --user restart "claude-session-nudge@${s}.service"
+        log "시작: $s interval=${interval}min end=$(date -d @$end_ts '+%Y-%m-%d %H:%M KST')"
+    done
+    echo "시작됨. $(date -d @$end_ts '+%Y-%m-%d %H:%M KST') 까지 ${interval}분마다 [$sessions] 각 세션에 넛지 전송."
+}
+
+cmd_stop() {
+    local target="${1:-}"
+    # --stop 은 위치인자만 받는다. --start 문법(--sessions <이름>)을 그대로 옮기면
+    # target 이 "--sessions" 가 되어 존재하지 않는 유닛을 끄고도 성공을 찍었다
+    # (2026-07-31 session-f 제보). 플래그처럼 생긴 인자는 거절한다.
+    if [[ "$target" == --* ]]; then
+        echo "claude-session-nudge --stop 은 위치인자만 받는다: --stop <세션>" >&2
+        echo "  받은 인자: $target  (--start 의 --sessions 문법은 --stop 에 없다)" >&2
+        exit 2
+    fi
+    if [ -n "$target" ]; then
+        local unit="claude-session-nudge@${target}.service"
+        local f; f="$(session_file "$target")"
+        # 끌 대상이 실재하는지 먼저 본다. 유닛도 상태파일도 없으면 오타이지
+        # 성공이 아니다 — 조용히 넘기면 사용자는 껐다고 믿는다.
+        local unit_known=0
+        [ "$(systemctl --user is-active "$unit" 2>/dev/null)" = "active" ] && unit_known=1
+        [ "$(systemctl --user is-enabled "$unit" 2>/dev/null)" = "enabled" ] && unit_known=1
+        if [ "$unit_known" = 0 ] && [ ! -f "$f" ]; then
+            echo "끌 넛지가 없다: $target (유닛 비활성 + 상태파일 없음)" >&2
+            echo "  등록된 세션은 claude-session-nudge --status 로 확인." >&2
+            exit 3
+        fi
+        systemctl --user disable --now "$unit" 2>/dev/null || true
+        [ -f "$f" ] && S="$target" python3 -c "
+import json
+f='$f'
+d=json.load(open(f)); d['enabled']=False
+json.dump(d, open(f,'w'), ensure_ascii=False, indent=2)
+"
+        # 사후조건 확인 — disable 이 돌았다고 꺼진 게 아니다.
+        local still; still="$(systemctl --user is-active "$unit" 2>/dev/null)"
+        if [ "$still" = "active" ]; then
+            echo "중지 실패: $target 유닛이 아직 active 다 (systemctl --user status $unit)" >&2
+            log "중지 실패(여전히 active): $target"
+            exit 4
+        fi
+        log "중지: $target"
+        echo "중지됨: $target"
+    else
+        shopt -s nullglob
+        for f in "$NUDGE_DIR"/*.json; do
+            local s; s="$(basename "$f" .json)"
+            systemctl --user disable --now "claude-session-nudge@${s}.service" 2>/dev/null || true
+            # 단일 세션 --stop 과 동일하게 상태파일도 꺼야 한다. 유닛만 내리면
+            # --status 가 enabled=True 로 계속 보고하고, 누가 유닛을 다시 켜면
+            # 사용자가 끈 넛지가 되살아난다(2026-07-27 발견).
+            F="$f" python3 -c "
+import json, os
+f=os.environ['F']
+d=json.load(open(f)); d['enabled']=False
+json.dump(d, open(f,'w'), ensure_ascii=False, indent=2)
+"
+        done
+        log "중지: 전체"
+        echo "전체 중지됨."
+    fi
+}
+
+cmd_status() {
+    shopt -s nullglob
+    local any=0
+    for f in "$NUDGE_DIR"/*.json; do
+        any=1
+        local s; s="$(basename "$f" .json)"
+        local active; active="$(systemctl --user is-active "claude-session-nudge@${s}.service" 2>/dev/null)"; [ -n "$active" ] || active="unknown"
+        F="$f" ACTIVE="$active" python3 -c "
+import json, time, os
+d=json.load(open(os.environ['F']))
+remain=(d['end_ts']-time.time())/3600
+extra=''
+if d.get('suspended'):
+    extra=' SUSPENDED(무응답 %s회 — 사용자 알림 고정 중, 세션이 응답하면 자동 재개)' % d.get('no_response')
+elif d.get('no_response'):
+    extra=' 무응답=%s' % d['no_response']
+print(f\"{d['session']}: interval={d['interval_min']}min remain={remain:.1f}h enabled={d['enabled']} unit={os.environ['ACTIVE']}{extra}\")
+"
+    done
+    if [ "$any" = 0 ]; then echo "등록된 세션 없음."; fi
+}
+
+# 한 회차. 보낼지 말지를 판정하고 필요하면 사용자에게 알린다.
+# stdout 한 줄 = 로그 문구.
+#
+# 왜 무작정 안 보내나(2026-08-03 도입): session-b 이 권한 승인 대기로 18시간 34분
+# 멈춰 있는 동안 넛지 37건이 계속 꽂혔고 텔레그램 48건이 큐에만 쌓였다. 아무도
+# 몰랐다. 넛지는 우리가 보낸 입력이므로 "보냈는데 반응이 없다" 를 추측이 아니라
+# 사실로 안다 — 그 사실을 쓰지 않을 이유가 없다.
+tick() {
+    local s="$1" f="$2" message="$3"
+    S="$s" F="$f" MSG="$message" SEND="$SEND" PROBE="$PROBE" \
+    TG_ENV="$TG_ENV" TG_CHAT="$TG_CHAT" NO_RESP_MAX="$NO_RESP_MAX" \
+    PENDING_STUCK_MIN="$PENDING_STUCK_MIN" python3 - <<'PY'
+import json, os, subprocess, sys, time, urllib.parse, urllib.request
+
+s = os.environ["S"]; f = os.environ["F"]; msg = os.environ["MSG"]
+SEND = os.environ["SEND"]; PROBE = os.environ["PROBE"]
+TG_ENV = os.environ["TG_ENV"]; TG_CHAT = os.environ["TG_CHAT"]
+MAX = int(os.environ["NO_RESP_MAX"])
+STUCK = int(os.environ["PENDING_STUCK_MIN"]) * 60
+QUOTA_BLOCK = 90
+
+
+def out(line):
+    print("%s: %s" % (s, line))
+    sys.exit(0)
+
+
+def load():
+    with open(f) as fh:
+        return json.load(fh)
+
+
+def save(d):
+    tmp = f + ".tmp.%d" % os.getpid()
+    with open(tmp, "w") as fh:
+        json.dump(d, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, f)
+
+
+def tg(method, **params):
+    """dotfiles 봇으로 운영자 채팅에 호출. 실패해도 넛지 동작을 막지 않는다."""
+    # 키 이름을 '=' 없이 비교한다. 리터럴에 대입 형태를 쓰면 secrets-scan 훅이
+    # 자격증명 하드코딩으로 오탐한다(2026-08-03 실제로 차단당했다).
+    keys = ("TELEGRAM_BOT_TOKEN", "BOT_TOKEN")
+    tok = ""
+    try:
+        for ln in open(TG_ENV, errors="replace"):
+            k, sep, v = ln.partition("=")
+            if sep and k.strip() in keys:
+                tok = v.strip().strip('"').strip("'")
+    except OSError:
+        return None
+    if not tok:
+        return None
+    params["chat_id"] = TG_CHAT
+    url = "https://api.telegram.org/bot%s/%s" % (tok, method)
+    data = urllib.parse.urlencode(params).encode()
+    try:
+        with urllib.request.urlopen(url, data=data, timeout=10) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+d = load()
+try:
+    p = json.loads(subprocess.run([PROBE, s], capture_output=True, text=True,
+                                  timeout=60).stdout or "{}")
+except Exception as e:
+    out("probe 실패 %s — 이번 회차 건너뜀" % e)
+
+def clear_alert(why):
+    """고정 알림을 해소로 바꾸고 푼다. 사람이 손으로 풀 게 없어야 한다."""
+    mid = d.get("alert_msg_id")
+    if mid:
+        tg("editMessageText", message_id=mid, text="해소됨 — %s %s" % (s, why))
+        tg("unpinChatMessage", message_id=mid)
+    d["suspended"] = False
+    d["alert_msg_id"] = None
+    d["no_response"] = 0
+
+
+def raise_alert(text):
+    """사람에게 한 번만 알리고 고정한다. 고정이 실패해도 상태는 남긴다."""
+    r = tg("sendMessage", text=text)
+    mid = ((r or {}).get("result") or {}).get("message_id")
+    if mid:
+        tg("pinChatMessage", message_id=mid, disable_notification="true")
+    d["suspended"] = True
+    d["alert_msg_id"] = mid
+    return mid
+
+
+# --- 세지 않는 경우들. 무응답이 정상이거나, 애초에 말을 건 적이 없는 경우다.
+if not p.get("unit_active"):
+    # probe 가 "없음(이름 어긋남)" 과 "꺼짐" 을 구분해 준다 — 그대로 옮긴다.
+    out("건너뜀 reason=%s unit=%s" % (p.get("reason") or "unit-not-active",
+                                      p.get("unit", "")))
+# 한도 판정은 사용률이 아니라 probe 의 rate_limited 를 본다. 사용률은 statusline 캐시에서
+# 오는데 차단된 세션은 턴이 없어 캐시가 얼고, 그러면 가장 확실히 차단된 순간에 "한도 아님"
+# 으로 읽힌다(2026-08-06 밤 실측: 5시간 40분 차단 내내 38%). 무응답 카운트가 한도 중에도
+# 늘던 게 이 때문이다.
+if p.get("rate_limited"):
+    out("건너뜀 reason=quota-blocked %s" % p.get("rate_limit_why", ""))
+if p.get("quota_pct", -1) >= QUOTA_BLOCK:
+    out("건너뜀 reason=quota-blocked pct=%s" % p["quota_pct"])
+if not p.get("transcript"):
+    out("건너뜀 reason=%s" % (p.get("reason") or "no-transcript"))
+
+la = int(p.get("last_assistant") or 0)
+base = int(d.get("last_assistant") or 0)
+alive = la > base
+suspended = bool(d.get("suspended"))
+
+# --- 도구가 열려 있다. 도는 중일 수도, 권한 승인을 기다리는 중일 수도 있다.
+# 짧으면 도는 중으로 보고 세지 않는다. 오래 열려 있으면 막힌 것으로 보고 표면화한다 —
+# 권한 요청은 transcript 에 안 남아서 직접 볼 방법이 없고, 조용히 건너뛰기만 하면
+# 넛지도 안 가고 알림도 안 가서 아무도 모른 채로 시간이 간다(fusion 18시간 34분).
+if p.get("pending_tool"):
+    since = int(p.get("pending_tool_since") or 0)
+    idle = int(time.time()) - max(since, la)
+    tool = p.get("pending_tool_name") or "이름 미상"
+    if idle < STUCK:
+        if suspended and alive:
+            clear_alert("세션이 다시 응답한다. 넛지를 재개했다.")
+            d["last_assistant"] = la
+            save(d)
+            out("복구 — 응답 재개(도구 실행 중이라 이번 회차는 안 보냄, 고정 해제)")
+        out("건너뜀 reason=tool-running tool=%s %d분 (도구 실행 중이라 레코드가 안 늘어난다)"
+            % (tool, idle // 60))
+    if suspended:
+        out("대기 — %s 가 %d분째 열려 있다(알림 고정 유지)" % (tool, idle // 60))
+    mid = raise_alert(
+        "%s 세션의 도구가 %d분째 열려 있다. 넛지를 멈췄다.\n"
+        "도구: %s\n"
+        "권한 승인 대기일 가능성이 높다 — 이 채팅의 🔐 Permission 메시지에서 "
+        "수락하거나 거절해라.\n"
+        "도구가 실제로 오래 걸리는 중일 수도 있다. 어느 쪽이든 진행되면 이 알림은 "
+        "자동으로 풀리고 넛지도 재개된다."
+        % (s, idle // 60, tool))
+    save(d)
+    out("도구 %d분 열림 — 넛지 중단, 사용자 알림%s"
+        % (idle // 60, "(고정)" if mid else "(전송 실패)"))
+
+if alive:
+    if suspended:
+        clear_alert("세션이 다시 응답한다. 넛지를 재개했다.")
+        d["last_assistant"] = la
+        save(d)
+        out("복구 — 응답 재개, 넛지 재개(고정 해제)")
+    d["no_response"] = 0
+    d["last_assistant"] = la
+    rc = subprocess.run([SEND, "--session", s, "--", msg],
+                        capture_output=True, text=True).returncode
+    d["last_send_ok"] = (rc == 0)
+    save(d)
+    out("전송" if rc == 0 else "전송 실패 rc=%d" % rc)
+
+if suspended:
+    out("대기 — 여전히 무응답(알림 고정 유지). 해소되면 자동 재개된다")
+
+# 직전 회차에 실제로 보낸 게 아니면 무응답으로 세지 않는다.
+if not d.get("last_send_ok", False):
+    rc = subprocess.run([SEND, "--session", s, "--", msg],
+                        capture_output=True, text=True).returncode
+    d["last_send_ok"] = (rc == 0)
+    save(d)
+    out("재전송(직전 전송 실패라 무응답 계수 안 함)" if rc == 0
+        else "전송 실패 rc=%d" % rc)
+
+n = int(d.get("no_response") or 0) + 1
+d["no_response"] = n
+if n < MAX:
+    rc = subprocess.run([SEND, "--session", s, "--", msg],
+                        capture_output=True, text=True).returncode
+    d["last_send_ok"] = (rc == 0)
+    save(d)
+    # 전송 결과를 문구에 함께 남긴다 — 실패를 "다시 전송" 으로 덮으면 거짓 성공이다.
+    out("무응답 %d/%d — 다시 전송" % (n, MAX) if rc == 0
+        else "무응답 %d/%d — 재전송 실패 rc=%d" % (n, MAX, rc))
+
+# 상한 도달: 넛지를 멈추고 사람에게 한 번만 알린다.
+last_seen = time.strftime("%m-%d %H:%M", time.localtime(la)) if la else "기록 없음"
+text = ("%s 세션이 넛지 %d회에 응답하지 않는다. 넛지를 멈췄다.\n"
+        "마지막 응답: %s\n"
+        "권한 수락 대기일 수 있다 — 원격 조작 화면을 확인해라.\n"
+        "그래도 안 깨어나면: systemctl --user restart claude-%s\n"
+        "세션이 다시 응답하면 이 알림은 자동으로 풀리고 넛지도 재개된다."
+        % (s, n, last_seen, s))
+mid = raise_alert(text)
+save(d)
+out("무응답 %d/%d — 넛지 중단, 사용자 알림%s"
+    % (n, MAX, "(고정)" if mid else "(전송 실패)"))
+PY
+}
+
+run_daemon() {
+    local s="${1:-}"
+    [ -n "$s" ] || usage
+    local f; f="$(session_file "$s")"
+    while true; do
+        [ -f "$f" ] || { log "daemon $s: state 없음 → 종료"; exit 0; }
+        local vals enabled end_ts interval message now
+        vals="$(F="$f" python3 -c "
+import json, os
+d=json.load(open(os.environ['F']))
+print(d.get('enabled',True))
+print(int(d['end_ts']))
+print(int(d['interval_min']))
+print(d['message'])
+" )" || { log "daemon $s: state 파싱 실패 → 종료"; exit 0; }
+        enabled="$(sed -n 1p <<<"$vals")"
+        end_ts="$(sed -n 2p <<<"$vals")"
+        interval="$(sed -n 3p <<<"$vals")"
+        message="$(sed -n '4,$p' <<<"$vals")"
+        now="$(date +%s)"
+        [ "$enabled" = "True" ] || { log "daemon $s: enabled=false → 종료"; exit 0; }
+        if [ "$now" -ge "$end_ts" ]; then log "daemon $s: 만료 → 종료"; exit 0; fi
+        log "$(tick "$s" "$f" "$message")"
+        local remain sleep_s
+        remain=$(( end_ts - $(date +%s) ))
+        sleep_s=$(( interval * 60 ))
+        [ "$remain" -lt "$sleep_s" ] && sleep_s="$remain"
+        [ "$sleep_s" -lt 1 ] && { log "daemon $s: 만료 → 종료"; exit 0; }
+        sleep "$sleep_s"
+    done
+}
+
+# 등록된 상태 파일의 문구와 회차 간격을 지금 기본값으로 맞춘다. 둘 다 등록 시점에
+# 파일로 복사되므로, 스크립트만 고치면 이미 등록된 세션은 옛 값을 계속 쓴다(데몬은
+# 회차마다 파일에서 다시 읽는다 — 즉 이 파일을 고치면 재등록 없이 바로 반영된다).
+# --message·--interval 로 준 맞춤값도 기본값으로 덮으므로 그럴 때만 쓴다.
+cmd_refresh() {
+    local f found=0
+    for f in "$NUDGE_DIR"/*.json; do
+        [ -e "$f" ] || continue
+        found=1
+        F="$f" MSG="$DEFAULT_MSG" IVL="$DEFAULT_INTERVAL" python3 - <<'PY'
+import json, os
+
+f = os.environ["F"]
+new_msg = os.environ["MSG"]
+new_ivl = int(os.environ["IVL"])
+d = json.load(open(f))
+old_msg = d.get("message", "")
+old_ivl = d.get("interval_min")
+s = d.get("session", os.path.basename(f))
+changed = []
+if old_msg != new_msg:
+    d["message"] = new_msg
+    changed.append("문구(옛 머리 %r)" % old_msg[:24])
+if old_ivl != new_ivl:
+    d["interval_min"] = new_ivl
+    changed.append("간격 %s→%d분" % (old_ivl, new_ivl))
+if not changed:
+    print("%s: 이미 최신" % s)
+else:
+    tmp = f + ".tmp.%d" % os.getpid()
+    with open(tmp, "w") as fh:
+        json.dump(d, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, f)
+    print("%s: 갱신 — %s" % (s, ", ".join(changed)))
+PY
+    done
+    [ "$found" = 1 ] || echo "등록된 세션 없음: $NUDGE_DIR"
+}
+
+case "${1:-}" in
+    --start) shift; cmd_start "$@" ;;
+    --stop) shift; cmd_stop "${1:-}" ;;
+    --status) cmd_status ;;
+    --refresh-defaults) cmd_refresh ;;
+    --tick) shift  # 검증용: 한 회차만 돌린다(데몬 루프 없이)
+        t="${1:-}"; [ -n "$t" ] || usage
+        tf="$(session_file "$t")"
+        [ -f "$tf" ] || { echo "state 없음: $tf" >&2; exit 3; }
+        tmsg="$(F="$tf" python3 -c "import json,os;print(json.load(open(os.environ['F']))['message'])")"
+        tick "$t" "$tf" "$tmsg" ;;
+    --daemon) shift; run_daemon "${1:-}" ;;
+    *) usage ;;
+esac

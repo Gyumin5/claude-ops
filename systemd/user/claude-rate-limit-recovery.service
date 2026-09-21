@@ -1,0 +1,9 @@
+[Unit]
+Description=Claude Rate-Limit Recovery Monitor (5분마다 차단→해제 전환 감지 + 알림)
+
+[Service]
+Type=oneshot
+Environment="PATH=%h/.bun/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=%h/.local/bin/rate-limit-recovery
+StandardOutput=append:%h/.claude/logs/rate-limit-recovery.log
+StandardError=append:%h/.claude/logs/rate-limit-recovery.log

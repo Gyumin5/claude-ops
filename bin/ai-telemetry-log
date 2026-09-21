@@ -1,0 +1,41 @@
+#!/bin/bash
+# ai-telemetry-log: append a single jsonl event for an AI call.
+#
+# Usage:
+#   ai-telemetry-log <provider> <exit_code> <duration_ms> <session_mode> [error_kind]
+#
+# Fields kept intentionally small (8 max).
+# File: ~/.claude/telemetry/ai-calls.jsonl
+
+set -uo pipefail
+
+LOG=~/.claude/telemetry/ai-calls.jsonl
+mkdir -p "$(dirname "$LOG")" 2>/dev/null
+: >> "$LOG"
+chmod 600 "$LOG" 2>/dev/null
+
+provider="${1:-unknown}"
+exit_code="${2:-0}"
+duration_ms="${3:-0}"
+session_mode="${4:-unknown}"
+error_kind="${5:-}"
+
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+project=$(basename "$PWD")
+
+python3 - "$ts" "$project" "$provider" "$exit_code" "$duration_ms" "$session_mode" "$error_kind" "$LOG" <<'PY'
+import json, sys
+ts, project, provider, exit_code, duration_ms, session_mode, error_kind, log = sys.argv[1:]
+rec = {
+    "ts": ts,
+    "project": project,
+    "provider": provider,
+    "session_mode": session_mode,
+    "duration_ms": int(duration_ms or 0),
+    "exit_code": int(exit_code or 0),
+}
+if error_kind:
+    rec["error_kind"] = error_kind
+with open(log, "a") as f:
+    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+PY

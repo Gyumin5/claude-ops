@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""claude-memory-audit — MEMORY.md 인덱스 ↔ memory/*.md 파일 결정론적 감사.
+
+autoDream 5 phase 중 Index Sync 만 채택. 파일 수정 절대 안 함 (dry-run only).
+각 프로젝트의 ~/.claude/projects/<key>/memory/ 안에서:
+- broken link: MEMORY.md 가 가리키는 [text](file.md) 가 실재 안 함
+- orphan topic file: memory/*.md 중 MEMORY.md 가 가리키지 않는 파일
+- duplicate index reference: 같은 파일을 가리키는 MEMORY.md 항목 2개 이상
+
+규칙:
+- symlink 따라가지 않음
+- archive/ , transcript jsonl 스캔 안 함
+- 본문 출력 안 함 — 파일명·항목명만
+- 프로젝트 경계 분리 (한 프로젝트의 항목이 다른 프로젝트 리포트에 섞이지 않음)
+- 첫 전체 실행 후보 10개 초과 시 사용자 검토 권고 (stop_condition).
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+PROJECTS_BASE = Path.home() / ".claude" / "projects"
+LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+
+# 보호 — 외부 경로/상위 경로 따라가지 않게.
+def safe_link(link, memory_dir):
+    if link.startswith(("http://", "https://", "/")):
+        return None
+    if ".." in link.split("/"):
+        return None
+    return (memory_dir / link).resolve()
+
+
+def audit_one(memory_dir):
+    """Return dict with broken_links, orphan_files, duplicate_refs."""
+    findings = {
+        "memory_dir": str(memory_dir),
+        "broken_links": [],
+        "orphan_files": [],
+        "duplicate_refs": [],
+        "errors": [],
+    }
+    mem_idx = memory_dir / "MEMORY.md"
+    if not mem_idx.is_file():
+        # 메모리 관리 안 하는 프로젝트는 조용히 skip (false positive 차단).
+        return findings
+    if mem_idx.is_symlink():
+        findings["errors"].append("MEMORY.md is symlink, skipped")
+        return findings
+
+    text = mem_idx.read_text(encoding="utf-8", errors="replace")
+    referenced = []  # list of (link_text, resolved_path)
+    for m in LINK_RE.finditer(text):
+        link = m.group(1).strip()
+        # 외부 링크 skip
+        if link.startswith(("http://", "https://", "mailto:")):
+            continue
+        resolved = safe_link(link, memory_dir)
+        if resolved is None:
+            continue
+        # 경계 체크: memory_dir 안에만 있어야 함
+        try:
+            resolved.relative_to(memory_dir.resolve())
+        except ValueError:
+            findings["errors"].append(f"link escapes memory dir: {link}")
+            continue
+        referenced.append((link, resolved))
+        if not resolved.is_file() or resolved.is_symlink():
+            findings["broken_links"].append({"link": link})
+
+    # duplicate index refs
+    seen = {}
+    for link, resolved in referenced:
+        key = str(resolved.name)
+        seen.setdefault(key, []).append(link)
+    for fname, occs in seen.items():
+        if len(occs) > 1:
+            findings["duplicate_refs"].append({"file": fname, "count": len(occs)})
+
+    # orphan: memory/*.md 중 referenced 에 없는 것 (MEMORY.md 본인은 제외)
+    referenced_files = {r.name for _, r in referenced}
+    for f in memory_dir.iterdir():
+        if f.is_symlink():
+            continue
+        if not f.is_file():
+            continue
+        if f.name == "MEMORY.md":
+            continue
+        if not f.name.endswith(".md"):
+            continue
+        if f.name not in referenced_files:
+            findings["orphan_files"].append({"file": f.name})
+
+    return findings
+
+
+def list_projects():
+    if not PROJECTS_BASE.is_dir():
+        return []
+    out = []
+    for p in sorted(PROJECTS_BASE.iterdir()):
+        mem_dir = p / "memory"
+        if mem_dir.is_dir() and not mem_dir.is_symlink():
+            out.append(p)
+    return out
+
+
+def render_report(all_findings, total_candidates):
+    lines = []
+    lines.append(f"claude-memory-audit (dry-run)")
+    lines.append(f"projects: {len(all_findings)}, total findings: {total_candidates}")
+    lines.append("")
+    for f in all_findings:
+        proj = Path(f["memory_dir"]).parent.name
+        n_broken = len(f["broken_links"])
+        n_orphan = len(f["orphan_files"])
+        n_dup = len(f["duplicate_refs"])
+        n_err = len(f["errors"])
+        if n_broken + n_orphan + n_dup + n_err == 0:
+            continue
+        lines.append(f"== {proj} ==")
+        for b in f["broken_links"]:
+            lines.append(f"  broken_link: {b['link']}")
+        for o in f["orphan_files"]:
+            lines.append(f"  orphan_file: {o['file']}")
+        for d in f["duplicate_refs"]:
+            lines.append(f"  duplicate_ref: {d['file']} (x{d['count']})")
+        for e in f["errors"]:
+            lines.append(f"  error: {e}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="claude memory directory audit (dry-run)")
+    ap.add_argument("project", nargs="?", help="optional single project key (dirname under ~/.claude/projects/)")
+    args = ap.parse_args()
+
+    if args.project:
+        proj_path = PROJECTS_BASE / args.project
+        if not proj_path.is_dir():
+            print(f"ERROR: project not found: {proj_path}", file=sys.stderr)
+            return 2
+        targets = [proj_path]
+    else:
+        targets = list_projects()
+
+    if not targets:
+        print("no projects with memory/ found")
+        return 0
+
+    all_findings = []
+    total = 0
+    for proj in targets:
+        mem_dir = proj / "memory"
+        f = audit_one(mem_dir)
+        all_findings.append(f)
+        total += len(f["broken_links"]) + len(f["orphan_files"]) + len(f["duplicate_refs"]) + len(f["errors"])
+
+    report = render_report(all_findings, total)
+    print(report)
+
+    if total > 10 and not args.project:
+        print("[NOTE] 후보 10건 초과 — 자동 처리 금지. 사용자 수동 검토 필요.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

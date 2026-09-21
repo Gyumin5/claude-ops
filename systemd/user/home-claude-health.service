@@ -1,0 +1,9 @@
+[Unit]
+Description=home claude.ai login health probe
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/home-claude-health
+# 실패 회차는 probe(최대 90s) + 백오프 60s + probe(최대 90s) = 최대 4분이다.
+# systemd 기본 TimeoutStartSec(보통 90s)이면 두 번째 probe 도중 죽어 상태가 안 남는다.
+TimeoutStartSec=360

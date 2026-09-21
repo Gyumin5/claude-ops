@@ -19,17 +19,7 @@
       "mcp__plugin_telegram_telegram__reply",
       "mcp__plugin_telegram_telegram__react",
       "mcp__plugin_telegram_telegram__edit_message",
-      "mcp__plugin_telegram_telegram__download_attachment",
-      "mcp__claude_ai_Microsoft_365__outlook_email_search",
-      "mcp__claude_ai_Microsoft_365__chat_message_search",
-      "mcp__claude_ai_Microsoft_365__read_resource",
-      "mcp__claude_ai_Microsoft_365__sharepoint_search",
-      "mcp__claude_ai_Microsoft_365__sharepoint_folder_search",
-      "mcp__claude_ai_Microsoft_365__teams_list_chats",
-      "mcp__claude_ai_Microsoft_365__get_me",
-      "mcp__claude_ai_Gmail__search_threads",
-      "mcp__claude_ai_Gmail__get_thread",
-      "mcp__claude_ai_Gmail__get_message"
+      "mcp__plugin_telegram_telegram__download_attachment"
     ],
     "deny": [
       "Read(**/.env*)",

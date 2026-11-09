@@ -4,8 +4,8 @@
 매 15분 timer가 호출. 각 systemd claude-*.service 활성 세션에 대해:
 - /proc/<pid>/cwd 에서 cwd 얻고 ~/.claude/projects/<key>/ 의 최근 .jsonl 파일 찾기
 - 마지막 user/assistant ts, 마지막 tool_use 후 매칭되는 tool_result 없으면 in-flight
-- 30분 이상 응답 없고 in-flight tool 도 없으면 컨트롤봇으로 알림 (PaperVelocity 누출 후
-  알림 정책: 컨트롤봇 한 채팅으로만)
+- 30분 이상 응답 없고 in-flight tool 도 없으면 컨트롤봇으로 알림 (알림이 여러 채팅으로
+  새어 나간 사고 뒤 정책: 컨트롤봇 한 채팅으로만)
 - 세션별 60분 쿨다운
 
 알림 내용:

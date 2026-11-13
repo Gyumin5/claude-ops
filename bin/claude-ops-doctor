@@ -160,16 +160,32 @@ def main():
             say("경고", f"[{s}] 안 돌고 있다 ({state or '모름'})",
                 f"systemctl --user start {unit}")
 
-    print("\n== 선택 ==")
+    print("\n== 텔레그램 기본 구성 ==")
+    # 기본 구성이지만 비어 있어도 세션은 돈다 — 그래서 실패가 아니라 경고로 적는다.
     control = HOME / ".claude" / "control-bot" / ".env"
     say("OK" if control.exists() else "경고",
-        "통제 봇 설정" + ("이 있다" if control.exists() else "이 없다 — 세션이 멈추면 조작할 창구가 없다"),
+        "통제 봇 설정" + ("이 있다" if control.exists()
+                         else "이 없다 — 기본 구성이다. 세션이 멈추면 조작할 창구가 없다"),
         "" if control.exists() else "SETUP.md 3-e 절.")
 
     targets = HOME / ".claude" / "userbot" / "targets.json"
     say("OK" if targets.exists() else "경고",
-        "세션끼리 넣는 통로" + ("가 설정돼 있다" if targets.exists() else "는 설정 안 됐다 — 안 써도 된다"),
+        "세션끼리 넣는 통로(유저봇)" + ("가 설정돼 있다" if targets.exists()
+                                  else "는 설정 안 됐다 — 기본 구성이다. 세션 협업과 긴 작업 결과 회신이 안 된다"),
         "" if targets.exists() else "SETUP.md 6절.")
+
+    if have("loginctl"):
+        user = os.environ.get("USER", "")
+        try:
+            out = subprocess.run(["loginctl", "show-user", user, "--property=Linger"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        if out == "Linger=yes":
+            say("OK", "로그아웃·재부팅 뒤에도 데몬이 계속 돈다(linger)")
+        else:
+            say("경고", "linger 가 꺼져 있거나 못 쟀다 — 로그아웃하면 데몬이 같이 멈춘다",
+                "SETUP.md 7절의 loginctl enable-linger.")
 
     return finish()
 
@@ -177,7 +193,7 @@ def main():
 def finish():
     print(f"\n실패 {fails} · 경고 {warns}")
     if fails:
-        print("실패를 먼저 고친다. 경고는 그 기능을 쓸 때 고치면 된다.")
+        print("실패를 먼저 고친다. 경고 중 텔레그램 기본 구성은 세우기를 마치기 전에 채운다.")
     return 1 if fails else 0
 
 

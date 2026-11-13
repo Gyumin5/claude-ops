@@ -14,7 +14,9 @@
   자기 봇에 붙는다. 그 봇에 말을 걸면 그 세션이 답한다.
 - 그 위에 감시 타이머가 얹힌다. 세션이 멈추면 다시 띄우고, 한도에 걸리면 풀리는 시점에
   다시 깨우고, 진행 상태 파일을 주기적으로 갱신한다.
-- 세션끼리 메시지를 넣는 통로(선택)와, 외부 모델 셋을 붙여 토론시키는 도구가 따로 있다.
+- 세션과 따로 사는 통제 봇과, 세션끼리 메시지를 넣는 유저봇이 붙는다. 둘 다 기본 구성이다 —
+  사람은 터미널이 아니라 텔레그램으로만 이 기계와 대화한다(README "기본 구성").
+- 외부 모델 셋을 붙여 토론시키는 도구가 따로 있다.
 
 "세션 작업 디렉토리" 는 그 세션이 일하는 폴더다. 보통 프로젝트 하나에 세션 하나를 둔다.
 이 저장소를 받은 자리(`~/dotfiles`)도 그중 하나가 될 수 있고, 그 본보기가
@@ -95,15 +97,28 @@ systemctl --user import-environment TELEGRAM_CHAT_ID   # 다시 로그인하기 
 터미널에서 직접 도구를 부를 때도 필요하니 셸 프로필에도 같은 줄을 `export` 로 넣는다.
 비워 두면 알림만 안 갈 뿐 나머지는 그대로 돈다.
 
-### 3-e. 통제 봇 (선택)
+### 3-e. 통제 봇
 
-세션이 한도에 걸리거나 멈춰도 따로 살아 있는 조작 창구다. 세션 봇과 별개로 하나 더 만든다.
+세션이 한도에 걸리거나 멈춰도 따로 살아 있는 조작 창구다. 상태 보기, 세션 재시작, 계정
+바꾸기·재로그인, 넛지 켜고 끄기를 버튼으로 한다. 세션 봇과 별개로 하나 더 만든다.
 
-```
-~/.claude/control-bot/.env
+1. BotFather 에서 `/newbot` 으로 봇을 하나 더 만든다(3-a 와 같은 절차). 이름은 알아보기
+   쉽게 `<이름>-control` 같은 것으로. 받은 토큰은 터미널에만 적는다.
+2. 설정 파일을 만든다. `ALLOWED_USER_ID` 는 3-b 에서 나온 자기 사용자 번호다 — 이 번호가
+   아닌 사람이 말을 걸면 봇은 "unauthorized" 만 답한다.
+
+```bash
+mkdir -p ~/.claude/control-bot ~/.claude/logs && chmod 700 ~/.claude/control-bot
+cat > ~/.claude/control-bot/.env <<'EOF'
 CONTROL_BOT_TOKEN=통제 봇 토큰
 ALLOWED_USER_ID=자기 텔레그램 사용자 번호
+EOF
+chmod 600 ~/.claude/control-bot/.env
 ```
+
+3. 켜는 것은 7절이다(`claude-control-bot.service`). 켠 뒤 그 봇 대화창에 `/menu` 를 보내면
+   버튼 메뉴가 뜬다. 안 뜨면 `~/.claude/logs/claude-control-bot.log` 를 본다 — 토큰이나 번호가
+   비면 "CONTROL_BOT_TOKEN / ALLOWED_USER_ID missing" 으로 바로 죽는다.
 
 이 파일들은 전부 저장소 밖이다. 커밋하지 않는다.
 
@@ -188,13 +203,12 @@ echo myproj >> machines/$(cat ~/.config/claude-machine-id).list
 
 ---
 
-## 6. 세션끼리 메시지를 넣는 통로 (선택)
+## 6. 유저봇 — 세션끼리 메시지를 넣는 통로
 
 세션 A 가 세션 B 에게 지시를 넣거나, 세션 밖에서 돌던 긴 작업이 끝났을 때 그 결과를 띄운
 세션 자신에게 돌려주는 데 쓴다. 봇은 다른 봇에게 말을 걸 수 없어서, 자기 텔레그램 계정으로
-로그인하는 발신기를 따로 둔다.
-
-안 써도 된다. 사람이 각 세션 봇에 직접 말을 거는 것만으로 나머지는 다 돈다.
+로그인하는 발신기를 따로 둔다. 기본 구성에 들어간다 — 이게 없으면 세션 밖으로 내보낸 긴
+작업의 결과가 세션으로 돌아오지 않고, 세션끼리 일을 넘길 수도 없다.
 
 ```bash
 pip install --user telethon
@@ -230,6 +244,8 @@ cp userbot/targets.json.example ~/.claude/userbot/targets.json
 claude-userbot-send --session myproj "이 저장소 검사 한 번 돌려라"
 ```
 
+확인: 그 세션 봇 대화창에 위 문장이 자기 계정 이름으로 올라오고 세션이 답하면 된 것이다.
+
 기계가 둘 이상이면 발신기는 한 대에만 둔다. 나머지 기계는 `userbot/relay.conf.example` 과
 `userbot/relay-alias.json.example` 을 참고해 ssh 로 위임한다. 위임은 명시 등록된 세션만
 허용한다 — 같은 이름의 세션이 양쪽에 있으면 조용히 엉뚱한 기계로 배달되기 때문이다.
@@ -251,7 +267,15 @@ systemctl --user enable --now claude-rate-limit-recovery.timer
 systemctl --user enable --now claude-telegram-healthcheck.timer
 systemctl --user enable --now claude-memory-lifecycle.timer
 systemctl --user enable --now claude-bun-ensure.timer
-systemctl --user enable --now claude-control-bot.service   # 통제 봇을 쓸 때만
+systemctl --user enable --now claude-control-bot.service   # 통제 봇(3-e)
+```
+
+로그아웃하거나 재부팅해도 데몬이 계속 돌게 한다. 자기 사용자에 대해서는 보통 권한 없이
+되지만, 거절되면 앞에 `sudo` 를 붙여 사람이 친다.
+
+```bash
+loginctl enable-linger "$USER"
+loginctl show-user "$USER" --property=Linger   # Linger=yes 면 된 것
 ```
 
 확인:

@@ -10,11 +10,23 @@
   1. 마지막 한도 공지 이후 한도공지가 아닌 assistant 레코드가 하나도 없다(=진행 0)
   2. 그 뒤로 queue-operation 이 1건 이상 쌓였다(=처리 못 한 사용자 입력이 있다)
   3. 공지에 적힌 reset 시각을 OVERSHOOT_MIN 분 넘겼다(=기다림이 더는 정상이 아니다)
-  4. 지금 다시 한도에 걸린 상태가 아니다(statusline 5h < 90%)
+  4. 지금 다시 한도에 걸렸다는 ★신선한 관측이 없다 — 계정이 일치하는 신선한 관측에서
+     5h >= 90% 또는 7d >= 99% 일 때만 보류하고, 관측이 낡았거나 없으면 수치를 추정하지
+     않고 1·2·3·5번으로 판정한다
   5. 유닛이 active 이고 CLAUDE_SESSION_NAME 과 프로젝트 디렉토리가 둘 다 확인된다
 
 3번이 핵심이다. 한도 대기 중의 정체는 정상이라 그것까지 세면 오탐이 25건 이상 나온다
-(2026-07-30 실측: 3번 조건 없으면 32건, 있으면 9건 — 홈 2건, peer 7건, 약 3건/월).
+(2026-07-30 실측: 3번 조건 없으면 32건, 있으면 9건 — 홈 2건, 둘째 기계 7건, 약 3건/월).
+
+4번이 옛 판에서는 "statusline 5h 수치를 모르면 아무것도 안 한다" 였고, 그래서 이 장치는
+두 달 동안 한 번도 판정 단계에 도달하지 못했다(실측 누적 quota-unknown 7,084회 ·
+quota-blocked 276회 · 세션을 실제로 본 회차 0). 정체란 턴이 안 도는 상태인데 그 수치는
+턴이 돌아야 신선해진다 — 잡으려는 상태에서 정확히 눈을 감는 구조였다. 그렇다고 낡은
+수치를 0% 로 뭉개면 2026-08-06 사고로 돌아간다(차단 내내 38% 로 읽혀 임계가 한 번도
+안 걸림). 그래서 불명을 숫자로 바꾸지 않고, 불명일 때는 턴과 무관한 1·2·3·5번으로만
+판정하되 주입을 유계로 막는다 — 연속 2회 확인, 30분 간격, 시간당 2회, ★같은 한도
+공지당 2회, 그리고 정상 복구 장치의 차단기가 서 있으면 아예 안 깨운다. 열화 방향은
+"한도 상태가 불명일 때 유계 주입을 허용" 쪽이다(ai-debate run-20260925T234222Z).
 
 조치는 주입 한 가지뿐이다. 세션 재시작은 의도적으로 구현하지 않았다 — 자식 프로세스
 점유 확인(장시간 도구 실행 중인 세션을 정체로 오판하면 작업 유실) 없이는 비가역이고,
@@ -22,7 +34,7 @@
 모든 판단은 stall-guard.log 에 남으므로 사후 분석은 파일로 한다. 단 정상 경로는
 로그를 안 쓰므로(조용한 게 정상) 실행 여부는 stall-guard.heartbeat 의 mtime 으로 본다.
 
-★안 잡는 것(2026-08-03 session-b 사고로 확인된 범위 밖): 이 가드는 "한도 공지"가
+★안 잡는 것(2026-08-03 beta 사고로 확인된 범위 밖): 이 가드는 "한도 공지"가
 있는 정체만 본다(판정 1번). 한도와 무관하게 생성이 그냥 끊긴 경우 — fusion 은 정상
 tool_result 를 0.6초 만에 받은 뒤 18시간 34분간 assistant 레코드 0, 그 사이 넛지 37건
 전송·텔레그램 48건 큐 적재, 유닛 재기동으로만 깨어남 — 은 limit_ts 가 없어 곧바로
@@ -61,7 +73,13 @@ OVERSHOOT_MIN = 20       # reset 시각 초과 최소 시간
 CONFIRM_TICKS = 2        # 연속 확인 횟수(단발 오탐 방지)
 COOLDOWN_SEC = 30 * 60   # 세션당 주입 최소 간격
 MAX_INJECT_PER_HOUR = 2  # 세션당 시간당 주입 상한
+# 같은 한도 공지 하나에 대해 깨우는 횟수 상한. 시간당 상한만 있으면 하루 넘게 서 있는
+# 세션을 48번 깨우게 된다 — 두 번 깨워서 안 살아나면 주입으로 살릴 수 있는 정체가
+# 아니다. 공지가 새로 뜨면(=그 세션이 한 번은 돌았다는 뜻) 칸은 0 으로 돌아간다.
+MAX_INJECT_PER_NOTICE = 2
 QUOTA_BLOCK_PCT = 90     # 이 이상이면 지금 다시 한도 — 정체 아님
+QUOTA_BLOCK_7D_PCT = 99  # 7일 창은 임계가 따로다(가드 공통값)
+QUEUE_DIR = os.path.join(STATE_DIR, "rate-limit-queue")
 TAIL_BYTES = 4 * 1024 * 1024
 UNIT_RE = re.compile(r"^claude-[A-Za-z0-9][A-Za-z0-9._-]*\.service$")
 # 세션이 아닌 상시 유닛만. 세션 이름과 겹치면 그 세션이 영구 사각지대가 되므로
@@ -129,8 +147,53 @@ def beat(summary):
 utc_epoch = csl.utc_epoch
 
 
-def quota_5h():
-    return csl.quota_5h(STATUSLINE_CACHE)
+def quota_hold():
+    """(보류할까, 한 줄 사유). 계정이 일치하는 신선한 관측이 임계를 넘을 때만 보류.
+
+    낡음·없음·남의 계정은 보류 근거가 아니다. 그 상태에서 수치를 지어내지 않고
+    턴과 무관한 조건으로만 판정한다 — 판단은 csl 한 곳에서 한다."""
+    blocked, why = csl.quota_blocked(STATUSLINE_CACHE,
+                                     block_5h=QUOTA_BLOCK_PCT,
+                                     block_7d=QUOTA_BLOCK_7D_PCT)
+    return blocked, why
+
+
+def quota_status():
+    """관측 상태 한 낱말(fresh / stale / relogin / stale-gen / account-unverified /
+    missing / error / other-account)."""
+    return csl.account_quota_observation(STATUSLINE_CACHE).get("status") or "unknown"
+
+
+def breaker_tripped(session):
+    """정상 복구 장치가 이 프로젝트에 대해 스스로 포기했는가.
+
+    rate-limit-recovery 가 "깨워도 또 막힌다" 를 두 번 연속 확인하면 차단기를 세우고
+    사람에게 한 번 알린다. 그 자리에서 이 가드가 다시 깨우면 같은 일을 되풀이하며
+    계정만 쓴다 — 차단기는 이쪽에서도 존중한다."""
+    path = os.path.join(QUEUE_DIR, "%s.recovery-state.json" % session)
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+    except Exception:
+        return False
+    return bool(isinstance(d, dict) and d.get("breaker"))
+
+
+def queue_bytes(session):
+    """외부 큐(한도 중 밀린 작업)의 바이트 수. 없으면 0.
+
+    판정 조건으로 쓰지 않는다 — 큐 파일이 없는 프로젝트도 정체할 수 있어서, 이걸
+    필수로 걸면 새 사각지대가 생긴다. 로그에만 남겨 사후에 가른다."""
+    return csl.queue_pending(session, QUEUE_DIR)
+
+
+def machine_id():
+    """이 호스트 이름(기계 이름, 예: home). 수신처 완전 주소의 앞자리."""
+    try:
+        with open(os.path.expanduser("~/.config/claude-machine-id")) as f:
+            return f.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
 
 
 def live_sessions():
@@ -179,7 +242,7 @@ def live_sessions():
             continue
         if not name:
             # 이름이 없으면 목록에서 빠지는데, 예전에는 그게 조용히 일어났다.
-            # peer session-a 가 도입 이후 내내 감시 밖이었고 아무도 몰랐다
+            # 둘째 기계 alpha 가 도입 이후 내내 감시 밖이었고 아무도 몰랐다
             # (2026-08-03 발견). 유닛에 CLAUDE_SESSION_NAME 을 넣어야 잡힌다.
             log_once("no-session-name unit=%s wd=%s — 이 세션은 감시되지 않는다 "
                      "(유닛 Environment 에 CLAUDE_SESSION_NAME 추가 필요)" % (unit, wd),
@@ -293,7 +356,8 @@ def inspect(path):
     over_min = int((now - reset) / 60)
     if over_min < OVERSHOOT_MIN:
         return False, {"reason": "still-waiting-reset", "over_min": over_min}
-    return True, {"stall_min": stall_min, "over_min": over_min, "queued": queue_after}
+    return True, {"stall_min": stall_min, "over_min": over_min, "queued": queue_after,
+                  "limit_ts": int(limit_ts)}
 
 
 def load_state():
@@ -316,13 +380,16 @@ def save_state(st):
         log("error stage=save-state err=%s" % e)
 
 
-def inject(session, det):
+def inject(session, det, quota="?"):
     text = INJECT_TEXT.format(mins=det["stall_min"], q=det["queued"])
     if not os.access(USERBOT_SEND, os.X_OK):
         log("inject-fail session=%s reason=no-userbot-send" % session)
         return False
     try:
-        r = subprocess.run([USERBOT_SEND, "--session", session, text],
+        # 수신처는 <기계>/<세션> 완전 주소. 여기 세션은 전부 이 호스트 유닛이라
+        # 기계는 자기 자신이다. 짧은 이름 'dotfiles' 는 두 기계에 다 있어
+        # claude-userbot-send 가 거절한다.
+        r = subprocess.run([USERBOT_SEND, "--session", f"{machine_id()}/{session}", text],
                            capture_output=True, text=True, timeout=120)
     except Exception as e:
         log("inject-fail session=%s reason=exec err=%s" % (session, e))
@@ -331,8 +398,9 @@ def inject(session, det):
         log("inject-fail session=%s rc=%d err=%s"
             % (session, r.returncode, (r.stderr or "").strip()[:200]))
         return False
-    log("inject-ok session=%s stall_min=%d over_min=%d queued=%d"
-        % (session, det["stall_min"], det["over_min"], det["queued"]))
+    log("inject-ok session=%s stall_min=%d over_min=%d queued=%d quota=%s extq=%d"
+        % (session, det["stall_min"], det["over_min"], det["queued"], quota,
+           queue_bytes(session)))
     return True
 
 
@@ -346,20 +414,19 @@ def main():
         beat("off=kill-switch")
         return 0
 
-    pct = quota_5h()
-    if pct < 0:
-        # 한도 상태 불명. 아무것도 안 한다(#072 와 같은 규칙 — 불명을 "해제"로 흘리지 않음).
+    # 한도 관문. 보류는 "계정이 일치하는 신선한 관측이 임계를 넘었다" 일 때만이다.
+    # 불명(낡음·없음·남의 계정)은 보류 근거도 해제 근거도 아니라서 수치를 안 쓰고
+    # 통과시킨다 — 대신 아래 상한들이 주입을 유계로 만든다.
+    hold, why = quota_hold()
+    quota = quota_status()
+    if hold:
         if verbose:
-            print("statusline 읽기 실패 — 판정 보류")
-        log("skip-all reason=quota-unknown")
-        beat("skip=quota-unknown")
+            print("지금 다시 한도(%s) — 정체 판정 보류" % why)
+        log("skip-all reason=quota-blocked %s" % why)
+        beat("skip=quota-blocked %s" % why)
         return 0
-    if pct >= QUOTA_BLOCK_PCT:
-        if verbose:
-            print("지금 다시 한도 근처(5h %.0f%%) — 정체 판정 보류" % pct)
-        log("skip-all reason=quota-blocked pct=%s" % pct)
-        beat("skip=quota-blocked pct=%s" % pct)
-        return 0
+    if verbose and quota != "fresh":
+        print("한도 관측 %s — 수치 없이 무진행 신호로만 판정한다" % quota)
 
     st = load_state()
     now = int(time.time())
@@ -387,6 +454,11 @@ def main():
         confirm = int(rec.get("confirm") or 0) + 1
         rec["confirm"] = confirm
         rec["last_detect"] = now
+        # 공지가 바뀌었다 = 그 세션이 그 사이 한 번은 돌았다. 공지당 칸을 새로 연다.
+        notice = int(det.get("limit_ts") or 0)
+        if int(rec.get("notice_ts") or 0) != notice:
+            rec["notice_ts"] = notice
+            rec["notice_injects"] = 0
         st[session] = rec
         changed = True
         if verbose:
@@ -398,6 +470,11 @@ def main():
                    det["queued"]))
             continue
 
+        per_notice = int(rec.get("notice_injects") or 0)
+        if per_notice >= MAX_INJECT_PER_NOTICE:
+            log("hold session=%s reason=notice-cap injects=%d notice_ts=%d"
+                % (session, per_notice, notice))
+            continue
         recent = [t for t in (rec.get("injects") or []) if now - int(t) < 3600]
         if len(recent) >= MAX_INJECT_PER_HOUR:
             log("hold session=%s reason=hourly-cap injects=%d" % (session, len(recent)))
@@ -405,12 +482,17 @@ def main():
         if recent and now - max(int(t) for t in recent) < COOLDOWN_SEC:
             log("hold session=%s reason=cooldown" % session)
             continue
+        # 정상 복구 장치가 이미 포기를 선언한 세션은 안 건드린다.
+        if breaker_tripped(session):
+            log("hold session=%s reason=recovery-breaker" % session)
+            continue
         if dry:
             print("      → 주입 대상(dry-run, 실제로는 안 보냄)")
             continue
-        if inject(session, det):
+        if inject(session, det, quota):
             recent.append(now)
             rec["injects"] = recent
+            rec["notice_injects"] = per_notice + 1
             rec["confirm"] = 0
             st[session] = rec
             changed = True
@@ -418,8 +500,8 @@ def main():
     if changed and not dry:
         save_state(st)
     if not dry:
-        beat("checked=%d stalled=%d %s"
-             % (len(seen), len(stalled_now), " ".join(seen)))
+        beat("quota=%s checked=%d stalled=%d %s"
+             % (quota, len(seen), len(stalled_now), " ".join(seen)))
     return 0
 
 

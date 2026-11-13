@@ -11,7 +11,7 @@
 
 둘째, 브리프에 절대경로가 없으면 경고 한 줄을 남긴다. 사본은 브리프에서 찾은 경로로만
 뜨므로, 경로가 없으면 세 모델이 파일을 한 줄도 못 읽고 브리프 글만 읽고 답한다
-(2026-09-15 옆 기계 run-20260915T045627Z). 막지는 않는다 — 순수 정책 토론은 경로가
+(2026-09-15 둘째 기계 run-20260915T045627Z). 막지는 않는다 — 순수 정책 토론은 경로가
 없는 게 정상이라 차단하면 오탐이다.
 """
 import importlib.machinery
@@ -64,7 +64,6 @@ def fake_run(cmd, **kw):
 # 가짜가 된다. 아래 CLI 검사 전에 원래 것으로 되돌린다.
 real_run = subprocess.run
 mod.subprocess.run = fake_run
-mod.sync_iso_credentials = lambda: (True, "")
 
 AGENTS = ["codex", "gemini", "claude-fable"]
 

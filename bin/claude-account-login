@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""계정 홈 하나에 로그인 창을 띄우고, 사람이 보내 준 코드를 그 자리에 넣어 준다.
+
+로그인은 한 턴에 안 끝난다. 클로드 로그인은 주소를 하나 내놓고 사람이 브라우저에서
+승인해 받은 코드를 되돌려 줄 때까지 기다리는데, 그 기다림이 몇 분이고 코드를 검증하는
+비밀값이 그 프로세스 안에만 있다 — 프로세스를 끊으면 주소도 같이 죽는다. 그래서 로그인
+프로세스를 세션 밖으로 떼어 두고, 주소를 파일로 내고, 코드를 이름난 파이프로 넣는다.
+
+  claude-account-login start acct-a --email <그 계정의 메일>
+  claude-account-login url acct-a          # 주소만 다시 보기
+  claude-account-login code acct-a <코드>  # 사람이 받아 온 코드를 넣는다
+  claude-account-login status acct-a       # 지금 상태와 로그 끝부분
+  claude-account-login stop acct-a         # 기다리는 로그인을 접는다
+
+코드는 어디에도 안 적는다 — 파이프로 넣고 끝이다. 로그에는 로그인 화면 출력만 남는다.
+"""
+import argparse
+import errno
+import fcntl
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import struct
+import sys
+import termios
+import time
+from pathlib import Path
+
+DEFAULT_ROOT = Path(os.path.expanduser("~/claude-accounts"))
+URL_RE = re.compile(r"https://[^\s\x00-\x20\x7f]*(?:claude\.(?:ai|com)|anthropic)[^\s\x00-\x20\x7f]*", re.I)
+ANSI_RE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b\[[0-9;?]*[ -/]*[@-~]"
+    r"|\x1b[@-Z\\-_]"
+    r"|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def strip_ansi(s):
+    return ANSI_RE.sub("", s)
+
+
+def paths(root, name):
+    home = Path(root) / name
+    d = home / "login"
+    return home, d, d / "log.txt", d / "in.fifo", d / "pid"
+
+
+def alive(pidfile):
+    try:
+        pid = int(Path(pidfile).read_text().strip())
+    except (OSError, ValueError):
+        return 0
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        return 0 if exc.errno == errno.ESRCH else pid
+    return pid
+
+
+def find_url(logfile):
+    """주소를 원본과 정리본 양쪽에서 찾는다.
+
+    로그인 화면은 주소를 그냥 찍기도 하고 터미널 링크(OSC 8)로 감싸기도 한다. 감싼
+    경우 주소는 이스케이프 안에 들어가 있어서, 화면 글자만 정리해 보면 통째로 사라진다.
+    """
+    try:
+        raw = Path(logfile).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    found = URL_RE.findall(raw) + URL_RE.findall(strip_ansi(raw))
+    if not found:
+        return None
+    return max(found, key=len)
+
+
+def run_child(home, logfile, fifo, pidfile, cmd):
+    """떼어 놓은 쪽: 로그인 프로세스를 pty 에 물리고 출력은 로그로, 입력은 파이프로."""
+    Path(pidfile).write_text(str(os.getpid()))
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    env.pop("CLAUDECODE", None)
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvpe(cmd[0], cmd, env)
+        os._exit(127)
+
+    # 창을 아주 넓게 잡는다. 기본 80칸이면 긴 주소가 줄바꿈으로 잘려 못 읽는다.
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 400, 0, 0))
+    except OSError:
+        pass
+
+    # 읽기·쓰기로 열어 두면 쓰는 쪽이 없어도 파이프가 끝나지 않는다.
+    ffd = os.open(str(fifo), os.O_RDWR | os.O_NONBLOCK)
+    with open(logfile, "ab", buffering=0) as log:
+        # 사람 왕복이다 — 메일을 열고 브라우저를 거쳐 돌아오는 데 걸리는 시간을 넉넉히 둔다.
+        deadline = time.time() + 2 * 3600
+        while time.time() < deadline:
+            try:
+                r, _, _ = select.select([fd, ffd], [], [], 1.0)
+            except OSError:
+                break
+            if fd in r:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                log.write(chunk)
+            if ffd in r:
+                try:
+                    data = os.read(ffd, 4096)
+                except OSError:
+                    data = b""
+                if data:
+                    os.write(fd, data)
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                # 남은 출력을 한 번 더 비운다.
+                try:
+                    log.write(os.read(fd, 65536))
+                except OSError:
+                    pass
+                break
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        Path(pidfile).unlink()
+    except FileNotFoundError:
+        pass
+    os._exit(0)
+
+
+def prepare(d, logfile, fifo, pidfile, fresh):
+    """기록 파일과 입력 파이프를 세운다. fresh 면 지난 회차 흔적을 지우고 새로 만든다."""
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)  # 로그에 로그인 화면이 남는다 — 남의 계정이 읽지 못하게.
+    if fresh:
+        for p in (logfile, fifo, pidfile):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+    if not fifo.exists():
+        os.mkfifo(fifo, 0o600)
+    logfile.touch()
+
+
+def resolve_claude(explicit=""):
+    """로그인 프로세스가 부를 실행파일을 바깥에서 미리 정해 둔다.
+
+    유닛 안의 PATH 는 접속 셸의 PATH 가 아니다 — 11-06 에 그 자리에서 /snap/bin 까지
+    훑다 못 찾고 죽었다. 서버는 그 실행파일을 ~/.local/bin 에 두는데 그 자리가 비대화형
+    접속 PATH 에도 없으므로, 찾는 일을 바깥에서 하고 절대경로로 넘긴다.
+    """
+    if explicit:
+        return explicit
+    found = shutil.which("claude")
+    if found:
+        return os.path.abspath(found)
+    for cand in (Path(os.path.expanduser("~/.local/bin/claude")),
+                 Path("/usr/local/bin/claude"), Path("/usr/bin/claude")):
+        if os.access(str(cand), os.X_OK):
+            return str(cand)
+    return ""
+
+
+def login_cmd(email, claude_bin=""):
+    cmd = [claude_bin or "claude", "auth", "login", "--claudeai"]
+    if email:
+        cmd += ["--email", email]
+    return cmd
+
+
+def launch(args, home, logfile, fifo, pidfile):
+    """기다리는 쪽을 접속 밖으로 내보낸다.
+
+    그냥 떼어 놓기만 하면 원격 접속이 끝날 때 같이 정리된다 — 11-05 에 그렇게 죽었다.
+    주소를 받은 뒤 사람이 돌아오기까지 접속은 여러 번 끊기므로, 가능하면 systemd 유닛으로
+    넘겨 접속과 수명을 끊는다. 유닛을 못 쓰는 환경에서는 예전처럼 두 번 갈라 떼어 놓는다.
+    """
+    me = [sys.executable, os.path.realpath(__file__), "--inner", "start", args.name,
+          "--root", str(args.root)] + (["--email", args.email] if args.email else [])
+    if getattr(args, "claude_bin", ""):
+        me += ["--claude-bin", args.claude_bin]
+    unit = f"claude-login-{args.name}-{int(time.time())}"
+    try:
+        import subprocess
+        if shutil.which("systemd-run"):
+            rc = subprocess.run(["systemd-run", "--user", "--collect", "--quiet",
+                                 f"--unit={unit}"] + me,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True)
+            if rc.returncode == 0:
+                return unit
+    except OSError:
+        pass
+
+    pid = os.fork()
+    if pid == 0:
+        os.setsid()
+        if os.fork():
+            os._exit(0)
+        nul = os.open(os.devnull, os.O_RDWR)
+        os.dup2(nul, 0), os.dup2(nul, 1), os.dup2(nul, 2)
+        run_child(home, logfile, fifo, pidfile,
+                  login_cmd(args.email, getattr(args, "claude_bin", "")))
+    os.waitpid(pid, 0)
+    return None
+
+
+def cmd_start(args):
+    home, d, logfile, fifo, pidfile = paths(args.root, args.name)
+    if not home.is_dir():
+        print(f"계정 홈이 없다: {home} — 먼저 claude-account-home-init 을 돌린다", file=sys.stderr)
+        return 1
+    running = alive(pidfile)
+    if running:
+        url = find_url(logfile)
+        print(f"이미 기다리는 로그인이 있다(pid {running}).")
+        print(url or "주소를 아직 못 받았다 — 잠시 뒤 url 로 다시 본다.")
+        return 0
+
+    args.claude_bin = resolve_claude(getattr(args, "claude_bin", ""))
+    if not args.claude_bin:
+        print("로그인에 쓸 claude 실행파일을 못 찾았다 — --claude-bin 으로 경로를 적는다.",
+              file=sys.stderr)
+        return 1
+
+    prepare(d, logfile, fifo, pidfile, fresh=True)
+    launch(args, home, logfile, fifo, pidfile)
+
+    url = None
+    for _ in range(60):
+        url = find_url(logfile)
+        if url:
+            break
+        time.sleep(1)
+    if url:
+        print(url)
+        return 0
+    print("주소를 아직 못 받았다. 잠시 뒤 url 로 다시 본다.", file=sys.stderr)
+    print((logfile.read_text(errors="replace")[-400:] or "(로그 비어 있음)"), file=sys.stderr)
+    return 3
+
+
+def cmd_url(args):
+    _, _, logfile, _, _ = paths(args.root, args.name)
+    url = find_url(logfile)
+    if url:
+        print(url)
+        return 0
+    print("주소 없음 — start 를 먼저 돌렸는지, 로그가 자라는지 status 로 본다.", file=sys.stderr)
+    return 3
+
+
+def cmd_code(args):
+    """받은 코드를 기다리는 로그인에 넣는다.
+
+    코드를 명령줄에 적지 않는다 — 이 서버는 여러 사람이 같이 쓰고, 명령줄은 남의
+    계정에서도 프로세스 목록으로 그대로 보인다. `-` 로 부르면 입력으로 받는다.
+    """
+    _, _, logfile, fifo, _ = paths(args.root, args.name)
+    if not fifo.exists():
+        print("기다리는 로그인이 없다 — start 를 먼저 돌린다.", file=sys.stderr)
+        return 1
+    if args.code == "-":
+        args.code = sys.stdin.readline()
+        if not args.code.strip():
+            print("입력으로 들어온 코드가 비어 있다.", file=sys.stderr)
+            return 2
+    fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        os.write(fd, (args.code.strip() + "\r").encode())
+    finally:
+        os.close(fd)
+    time.sleep(6)
+    print(strip_ansi(logfile.read_text(errors="replace"))[-600:])
+    return 0
+
+
+def cmd_status(args):
+    home, _, logfile, fifo, pidfile = paths(args.root, args.name)
+    creds = home / ".claude" / ".credentials.json"
+    pid = alive(pidfile)
+    print(f"홈: {home}")
+    print(f"자격 파일: {'있다' if creds.exists() else '없다'}")
+    print(f"기다리는 로그인: {('있다 (pid %d)' % pid) if pid else '없다'}")
+    print(f"입력 파이프: {'있다' if fifo.exists() else '없다'}")
+    try:
+        print("--- 로그 끝부분 ---")
+        print(strip_ansi(logfile.read_text(errors="replace"))[-800:])
+    except OSError:
+        print("(로그 없음)")
+    return 0
+
+
+def cmd_stop(args):
+    _, _, _, fifo, pidfile = paths(args.root, args.name)
+    pid = alive(pidfile)
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for p in (fifo, pidfile):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    print("기다리던 로그인을 접었다." if pid
+          else "기다리는 로그인이 없었다. 남은 파일만 치웠다.")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("action", choices=["start", "url", "code", "status", "stop"])
+    ap.add_argument("name")
+    ap.add_argument("code", nargs="?", default="")
+    ap.add_argument("--email", default="")
+    ap.add_argument("--root", default=str(DEFAULT_ROOT))
+    ap.add_argument("--claude-bin", dest="claude_bin", default="",
+                    help="로그인에 쓸 claude 실행파일 경로. 비우면 바깥에서 찾아 정한다.")
+    ap.add_argument("--inner", action="store_true",
+                    help="내부용 — 기다리는 쪽 자신. 사람이 직접 쓰지 않는다.")
+    args = ap.parse_args()
+    args.root = Path(os.path.expanduser(args.root))
+    if args.inner:
+        home, d, logfile, fifo, pidfile = paths(args.root, args.name)
+        prepare(d, logfile, fifo, pidfile, fresh=False)
+        run_child(home, logfile, fifo, pidfile, login_cmd(args.email, args.claude_bin))
+        return 0
+    if args.action == "code" and not args.code:
+        print("코드를 같이 적는다: claude-account-login code <이름> <코드>", file=sys.stderr)
+        return 2
+    return {"start": cmd_start, "url": cmd_url, "code": cmd_code,
+            "status": cmd_status, "stop": cmd_stop}[args.action](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

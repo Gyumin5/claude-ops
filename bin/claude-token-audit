@@ -7,6 +7,11 @@ from collections import defaultdict
 
 DAYS = int(sys.argv[1]) if len(sys.argv) > 1 else 7
 cutoff = time.time() - DAYS * 86400
+# 레코드를 거를 때 쓰는 경계. transcript 의 timestamp 는 "2026-07-30T02:28:26.316Z" 꼴의
+# UTC 라 사전식 비교가 그대로 성립하므로, 같은 형식의 접두사를 한 번 만들어 쓴다.
+# 날짜까지만("2026-10-24T") 만들면 그 날 00시부터 통과해 최대 하루치가 더 들어온다 —
+# "지난 7일" 이 실제로는 7~8일이 된다(ai-debate run-20261031T073516Z 가 재현).
+CUTOFF_TS = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(cutoff))
 root = os.path.expanduser("~/.claude/projects")
 
 agg = defaultdict(lambda: dict(turns=0, miss=0, hit=0, cc=0, cr=0, inp=0, out=0))
@@ -29,7 +34,7 @@ for d in sorted(glob.glob(root + "/*")):
                 if o.get("type") != "assistant" or o.get("isSidechain"):
                     continue
                 ts = o.get("timestamp", "")
-                if ts and ts < time.strftime("%Y-%m-%dT", time.gmtime(cutoff)):
+                if ts and ts < CUTOFF_TS:
                     continue
                 u = (o.get("message") or {}).get("usage") or {}
                 if not u:

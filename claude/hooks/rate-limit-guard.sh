@@ -16,6 +16,7 @@
 # 비차단 시 exit 0 (정상 진행)
 
 set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../lib/operator_chat.sh"   # 방 번호 단일 출처
 
 THRESHOLD_5H=90
 THRESHOLD_7D=99
@@ -38,7 +39,7 @@ try:
 except: print("")' 2>/dev/null)
 [ -z "$CWD" ] && CWD="$PWD"
 # 세션 키 결정: 1) env, 2) cgroup으로 systemd unit 추적, 3) cwd 상향 탐색, 4) cwd basename
-# 상향 탐색: 실험 작업트리(예: .../session-p/bridge01)에서 실행된 프로세스도 부모 프로젝트로 귀속.
+# 상향 탐색: 실험 작업트리(예: .../bias/bridge01)에서 실행된 프로세스도 부모 프로젝트로 귀속.
 # (2026-06-10 bridge01 오귀속 — cwd basename 이 세션명으로 잡혀 fallback 봇으로 알림 간 사고 후 추가)
 PROJ="${CLAUDE_SESSION_NAME:-}"
 UNIT_MATCH=$(grep -oE 'claude-[^/]+\.service' /proc/self/cgroup 2>/dev/null | head -1)
@@ -127,7 +128,7 @@ fi
 # 3. 5h / 7d 사용량 체크 (둘 중 하나라도 임계 초과면 차단)
 # 판정 규칙은 여기서 만들지 않는다 — lib 한 벌(claude-quota-observe)을 부른다.
 # 옛 방식은 이 계산을 여기·prompt-guard·recovery 에 복제해 뒀고 셋 다 캐시가 언 것을
-# 못 봐서, 얼어붙은 7일 창 99% 가 한도 해제 뒤에도 세션을 계속 가뒀다(2026-08-28 옆 기계
+# 못 봐서, 얼어붙은 7일 창 99% 가 한도 해제 뒤에도 세션을 계속 가뒀다(2026-08-28 둘째 기계
 # 6시간). 낡은 캐시는 이제 차단 근거가 아니다 — 실제로 막혀 있으면 그 턴이 429 로
 # 실패하며 캐시를 새로 채우므로 열어두는 비용은 한 턴이다.
 [ -f "$CACHE" ] || exit 0
@@ -173,12 +174,13 @@ fi
 # 유닛 밖 임시 세션은 텔레그램 알림 skip(위 IS_UNIT_SESSION 판정 참고).
 if [ "$need_alert" = true ] && [ "$IS_UNIT_SESSION" = true ] && [ -f "$TELEGRAM_ENV" ]; then
     . "$TELEGRAM_ENV"
-    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+    CHAT_ID="$(operator_chat_id)" || CHAT_ID=""
+    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "$CHAT_ID" ]; then
         msg="[${PROJ}] rate-limit-guard 작동. 모든 tool 차단 (telegram reply/edit/react/download만 허용).
 사유: ${TRIGGER}
 첫 차단 tool: ${TOOL:-?}"
         curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+            --data-urlencode "chat_id=$CHAT_ID" \
             --data-urlencode "text=${msg}" >/dev/null 2>&1
         touch "$ALERT_FLAG"
     fi
@@ -188,7 +190,7 @@ fi
 # 문제: 세션을 밖에서 깨우는 길은 텔레그램뿐인데, recovery(5분 timer)는 차단→해제 전환에서
 #       큐가 비어있지 않은 프로젝트에만 trigger:queue-flush 를 보낸다. 차단된 세션의 큐가
 #       비어 있으면 한도가 풀려도 아무도 깨우지 않는다.
-#       (2026-09-20 session-b: 첫 차단 tool=Bash → 마커 없음 → 04:53 부터 정지.)
+#       (2026-09-20 beta: 첫 차단 tool=Bash → 마커 없음 → 04:53 부터 정지.)
 # 범위: 도구 이름을 가리지 않는다. 어떤 도구가 막혔는지는 그 세션이 이어갈 일이 있는지와
 #       무관하다. 다만 유닛 밖 임시 세션은 제외한다 — 수신 경로(전용 봇)가 없어서
 #       깨울 수 없고, 마커만 큐에 남아 recovery 가 매번 헛돈다(위 IS_UNIT_SESSION 판정).
@@ -227,6 +229,11 @@ with open(qf, "a") as f:
 PY
             echo "rate-limit-guard: ${TOOL:-?} 차단 — 재개 검토 신호 큐 적재 (${PROJ})" >&2
         fi
+        # 깨운 뒤 또 막혔다는 사실은 여기서 적지 않는다. 바로 위에서 큐에 적재한 그
+        # 항목이 그 사실이고, 복구 장치가 깨우기를 보낼 때 그 큐를 직접 읽어 센다
+        # (recovery_count_rebound). 여기 있던 쓰기는 한 번도 센 적이 없었다 —
+        # 깨우기 이름표가 다음 회차 재무장에 지워져, 세션이 깨어나 도구를 돌릴 때쯤이면
+        # 셀 근거가 사라져 있었다(2026-10-31 실측: 상태 파일 전부에 그 칸이 없었다).
     ) 200>"$LOCK_FILE"
 fi
 

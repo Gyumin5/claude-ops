@@ -1,0 +1,32 @@
+# 어떤 자격 파일을 백업·복원에 담을지 적는 파일. 백업하는 쪽과 되살리는 쪽이
+# 이 한 파일을 같이 본다.
+#
+# 쓰는 법
+#   mkdir -p ~/.config/claude-secrets
+#   cp backup/policy.conf.example ~/.config/claude-secrets/policy.conf
+#   chmod 600 ~/.config/claude-secrets/policy.conf
+#   필요 없는 줄을 지우고 쓰는 줄만 남긴다.
+#
+# 이 파일이 없으면 백업도 복원도 아무것도 하지 않고 멈춘다. 기본값을 두지 않는 이유는
+# 그 기본값이 이 기계에 맞는지 아무도 안 봤기 때문이다 — 안 맞으면 담겨야 할 것이
+# 조용히 빠지거나, 담지 말아야 할 것이 담긴다.
+#
+# 적는 법 세 가지.
+#   <경로>     홈 기준 상대경로. 있으면 담고 없으면 건너뛴다.
+#   !<경로>    민감 표시. --with-sensitive 를 줘야 담기고 되살려진다.
+#              여러 사람이 쓰는 기계에는 안 담는 것이 기본이다.
+#   @sessions  machines/<기계이름>.list 의 세션마다 그 작업 폴더의
+#              .claude/telegram/.env 를 모은다. 세션별 봇 토큰이다.
+
+# 유저봇 응용프로그램 자격(API 아이디·해시)
+.claude/userbot/.env
+
+# 컨트롤봇 토큰
+.claude/control-bot/.env
+
+# 유저봇 로그인 세션. 이 파일 하나면 그 텔레그램 계정으로 로그인된다 — 그래서
+# 민감 표시다. 개인 기계에서만 --with-sensitive 로 담는다.
+!.claude/userbot/userbot.session
+
+# 세션마다의 봇 토큰
+@sessions

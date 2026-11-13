@@ -27,6 +27,7 @@ backlog(pending) 신호는 메시지가 쌓여야 떠서 지연이 있다. 그�
 
 import json
 import os
+import sys
 import subprocess
 import time
 import urllib.parse
@@ -45,7 +46,11 @@ CHILD_MISSING_CONFIRM = 3   # child 0개 연속 관측 횟수(약 1분 주기 �
 CHILD_ALERT_COOLDOWN_SEC = 3600
 
 CONTROL_BOT_ENV = Path.home() / ".claude" / "control-bot" / ".env"
-CONTROL_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from operator_chat import chat_id   # noqa: E402  (방 번호 단일 출처)
+
+CONTROL_CHAT_ID = chat_id()
 STATE_DIR = Path.home() / ".claude" / "state" / "telegram-healthcheck"
 
 
@@ -175,8 +180,8 @@ def has_telegram_child(pids):
 def has_claude_process(pids):
     """pid 들 중 실제 claude CLI 세션 프로세스가 있는지(--remote-control 플래그로 식별).
 
-    2026-07-08 peer 신고: claude-fox-bridge.service/claude-fox-live.service 는
-    peer VIO 세션이 systemd-run 으로 detach 한 헬퍼 데몬(C++/python, claude CLI
+    2026-07-08 둘째 기계 신고: claude-fox-bridge.service/claude-fox-live.service 는
+    둘째 기계 VIO 세션이 systemd-run 으로 detach 한 헬퍼 데몬(C++/python, claude CLI
     아님)인데, 유닛명이 claude- 접두를 써서 list_claude_services() 의 이름 기반
     필터를 그대로 통과해 "텔레그램 플러그인 사망 의심" 이 매 틱 오탐났다.
     유닛명이 아니라 그 유닛의 실제 cgroup 안에 claude CLI 프로세스가 있는지로
@@ -312,7 +317,7 @@ def main():
 
         # 정지된 세션은 적체 판정 대상이 아니다. 유닛 목록이 --all 이라 dead 유닛까지
         # 들어오는데, 큐를 비울 주체가 없으니 pending 이 영원히 안 빠져서 30분 임계를
-        # 반드시 넘는다 — 감지가 아니라 구조적 오탐이다(2026-09-15 옆 기계: 운영자가
+        # 반드시 넘는다 — 감지가 아니라 구조적 오탐이다(2026-09-15 둘째 기계: 운영자가
         # 일부러 정지시킨 네 세션이 한 시간마다 같이 울렸다). child 쪽은 이미 같은
         # 관문을 갖고 있었고 적체 쪽만 빠져 있었다. streak 파일도 지운다 — 남겨두면
         # 세션이 다시 살아난 순간 정지 기간까지 합산돼 첫 회차에 바로 울린다.

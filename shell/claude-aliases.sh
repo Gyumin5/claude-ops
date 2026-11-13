@@ -1,11 +1,14 @@
 # Claude Code aliases
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/operator_chat.sh"   # 방 번호 단일 출처
 # cl: 터미널에서 Claude Code 세션 붙기. systemd 서비스가 있으면 자동으로 멈추고
 #     종료 시 다시 살림. 없으면 그냥 일반 cl 동작.
 cl() {
-  # 텔레그램 페어링 자동 유지: 글로벌 access.json에 ID 주입
+  # 텔레그램 페어링 자동 유지: 글로벌 access.json에 ID 주입.
+  # 방 번호가 설정에 없으면 붙일 것도 없으니 이 블록만 건너뛴다 — cl 자체는 돈다.
   local _tg_access="$HOME/.claude/channels/telegram/access.json"
-  local _tg_id="${TELEGRAM_CHAT_ID:-}"
-  if [ -f "$_tg_access" ]; then
+  local _tg_id
+  _tg_id="$(operator_chat_id 2>/dev/null)" || _tg_id=""
+  if [ -n "$_tg_id" ] && [ -f "$_tg_access" ]; then
     python3 -c "
 import json, sys
 p='$_tg_access'
@@ -36,9 +39,9 @@ except: pass
   # 발신 세션 신원 각인: systemd 유닛이 Environment 로 주던 CLAUDE_SESSION_NAME 을 cl 로
   # 띄울 때도 똑같이 넣는다. 없으면 claude-job-detach 가 발신세션을 못 찾아(env 없음 +
   # claude-*.service cgroup 밖) unknown 으로 떨어뜨리고, 완료보고가 원래 세션 주입 대신
-  # 사람 직접알림으로 샌다 (2026-07-22 session-d session-m 잡 사고).
+  # 사람 직접알림으로 샌다 (2026-07-22 한 세션의 잡 사고).
   #
-  # 단 폴더이름만으로 각인하면 안 된다(ai-debate run-20260722T062557Z): /tmp/session-d 처럼
+  # 단 폴더이름만으로 각인하면 안 된다(ai-debate run-20260722T062557Z): /tmp/<세션이름> 처럼
   # basename 만 같은 무관한 경로에서 cl 을 켜면 진짜 그 세션이 아닌데도 등록된 이름으로
   # 각인돼, 결과가 엉뚱한 세션에 "성공적으로" 주입된다 — 알림이 안 오는 것보다 나쁘다.
   # 그래서 해당 유닛이 실제로 존재하고 그 WorkingDirectory 가 지금 위치와 같은
@@ -46,8 +49,9 @@ except: pass
   # 으로 안전하게 떨어뜨린다.
   # 각인 대상 유닛은 폴더 basename 추측이 아니라 WorkingDirectory 역조회로 찾는다.
   # (2026-07-27 ai-debate run-20260727T010915Z) basename 추측은 세션명과 폴더명이 다르면
-  # 항상 실패한다 — $HOME/proj-b 의 실제 유닛은 claude-session-b, session_c_work
-  # 는 claude-session_c 라 매번 각인 생략 경고가 떴고 사용자가 에러로 오인했다.
+  # 항상 실패한다 — 폴더 이름과 세션 이름이 어긋난 유닛들(폴더 ~/<이름> 인데 유닛은
+  # claude-<이름>-<갈래>, 폴더 <이름>_work 인데 유닛은 claude-<이름>)이 있어 매번 각인
+  # 생략 경고가 떴고 사용자가 에러로 오인했다.
   # 판정 기준은 그대로 realpath 완전일치라 2026-07-22 에 세운 오배달 방지 속성은 유지된다.
   # 후보가 0개거나 2개 이상이면 fail-closed(각인 생략) — 복수 후보 자동 선택은 하지 않는다.
   #

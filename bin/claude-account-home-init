@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""계정 하나가 쓸 전용 홈을 만든다 — 사용량이 그 계정 몫으로 따로 적히게.
+
+claude/statusline.py 는 캐시·기록 경로를 `~` 로 잡는다. 그래서 HOME 을 가르면
+계정별 수치 파일이 저절로 갈리고, bin/claude-accounts-usage 가 그것들을 모아 읽는다.
+
+빠지면 조용히 망하는 자리가 하나 있다 — 그 홈의 `.claude/settings.json` 에 상태줄
+설정이 없으면 세션이 상태줄을 아예 안 부르고, 캐시 파일이 영원히 안 생긴다. 수치가
+없는 것과 세션이 안 돈 것이 화면에서 같아 보이므로, 이 명령이 그 둘을 같이 깐다.
+
+  claude-account-home-init acct-a acct-b acct-c acct-d
+  claude-account-home-init --root /other/place acct-a
+
+이미 있는 홈은 덮어쓰지 않는다 — 빠진 것만 채우고 그렇게 말한다. 로그인은 사람 손이라
+여기서 하지 않고, 이어서 칠 명령만 적어 준다.
+"""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+STATUSLINE_SRC = REPO / "claude" / "statusline.py"
+DEFAULT_ROOT = Path(os.path.expanduser("~/claude-accounts"))
+SETTINGS = {"statusLine": {"type": "command", "command": "python3 ~/.claude/statusline.py"}}
+
+
+def init_one(root, name):
+    """홈 하나를 깔고 무엇을 했는지 한 줄로 돌려준다."""
+    home = Path(root) / name
+    cdir = home / ".claude"
+    did = []
+
+    if not cdir.is_dir():
+        cdir.mkdir(parents=True)
+        did.append("폴더")
+
+    # 이 홈에는 그 계정의 자격 파일이 들어온다. 공용 기계에서는 남의 계정이 읽을 수
+    # 있으면 안 되므로 주인만 들어가게 잠근다.
+    for p in (home, cdir):
+        if (p.stat().st_mode & 0o077) != 0:
+            os.chmod(p, 0o700)
+            if "주인만 들어가게 잠금" not in did:
+                did.append("주인만 들어가게 잠금")
+
+    link = cdir / "statusline.py"
+    if not link.exists() and not link.is_symlink():
+        link.symlink_to(STATUSLINE_SRC)
+        did.append("상태줄 연결")
+    elif link.is_symlink() and Path(os.readlink(link)) != STATUSLINE_SRC:
+        link.unlink()
+        link.symlink_to(STATUSLINE_SRC)
+        did.append("상태줄 연결 고침")
+
+    sfile = cdir / "settings.json"
+    try:
+        cur = json.loads(sfile.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cur = None
+    if not isinstance(cur, dict) or cur.get("statusLine") != SETTINGS["statusLine"]:
+        merged = cur if isinstance(cur, dict) else {}
+        merged["statusLine"] = SETTINGS["statusLine"]
+        sfile.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n",
+                         encoding="utf-8")
+        did.append("상태줄 설정")
+
+    # 첫 실행 화면과 "이 폴더를 믿느냐" 물음을 미리 지나간 것으로 적어 둔다. 서버에는
+    # 그 물음에 답할 사람이 없고, 기본값이 "아니오, 끝낸다" 라 그냥 두면 세션이 거기서
+    # 끝난다 — 그러면 상태줄이 한 번도 안 불려 수치 파일이 영원히 안 생긴다.
+    # 자격 정보가 같은 파일에 들어오므로 덮어쓰지 않고 빠진 칸만 채운다.
+    jfile = home / ".claude.json"
+    try:
+        cfg = json.loads(jfile.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    want = {"hasCompletedOnboarding": True}
+    projects = cfg.get("projects")
+    if not isinstance(projects, dict):
+        projects = {}
+    entry = projects.get(str(home))
+    if not isinstance(entry, dict):
+        entry = {}
+    changed = any(cfg.get(k) != v for k, v in want.items())
+    changed = changed or entry.get("hasTrustDialogAccepted") is not True
+    if changed:
+        cfg.update(want)
+        entry["hasTrustDialogAccepted"] = True
+        projects[str(home)] = entry
+        cfg["projects"] = projects
+        jfile.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
+                         encoding="utf-8")
+        did.append("첫 화면·폴더 신뢰 미리 적기")
+    if jfile.exists() and (jfile.stat().st_mode & 0o077) != 0:
+        os.chmod(jfile, 0o600)
+
+    return home, (", ".join(did) if did else "이미 갖춰져 있다")
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("names", nargs="+", help="계정 홈 이름 (예: acct-a acct-b)")
+    ap.add_argument("--root", default=str(DEFAULT_ROOT),
+                    help=f"계정 홈을 모아 둘 뿌리 (기본 {DEFAULT_ROOT})")
+    args = ap.parse_args()
+
+    if not STATUSLINE_SRC.exists():
+        print(f"상태줄 파일이 없다: {STATUSLINE_SRC}", file=sys.stderr)
+        return 1
+
+    root = Path(os.path.expanduser(args.root))
+    root.mkdir(parents=True, exist_ok=True)
+    homes = []
+    for name in args.names:
+        if "/" in name or name in (".", ".."):
+            print(f"이름에 경로를 쓰지 않는다: {name}", file=sys.stderr)
+            return 2
+        home, what = init_one(root, name)
+        homes.append(home)
+        print(f"{name}: {what}  ({home})")
+
+    print("\n계정마다 한 번씩 로그인해야 수치가 생긴다. 그 홈으로 세션을 띄우고 로그인한다:")
+    for home in homes:
+        print(f"  HOME={home} claude")
+    print("\n모아 보기:  claude-accounts-usage" +
+          ("" if root == DEFAULT_ROOT else f" --root {root}"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

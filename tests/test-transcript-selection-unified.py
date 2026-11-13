@@ -17,16 +17,14 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-# 저장소 뿌리를 이 파일 위치에서 찾는다. 예전엔 홈 아래 고정 경로였는데,
-# 그러면 다른 자리에 받은 사람은 그대로 못 돌린다.
-REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+ROOT = Path(__file__).resolve().parent.parent
 
-sys.path.insert(0, os.path.join(REPO, "lib"))
+sys.path.insert(0, str(ROOT / "lib"))
 import claude_session_lib as csl                      # noqa: E402
 
-W = SourceFileLoader("w", os.path.join(REPO, "bin/claude-api-5xx-watcher")).load_module()
-G = SourceFileLoader("g", os.path.join(REPO, "bin/claude-stall-guard")).load_module()
-P = SourceFileLoader("p", os.path.join(REPO, "bin/claude-session-probe")).load_module()
+W = SourceFileLoader("w", str(ROOT / "bin" / "claude-api-5xx-watcher")).load_module()
+G = SourceFileLoader("g", str(ROOT / "bin" / "claude-stall-guard")).load_module()
+P = SourceFileLoader("p", str(ROOT / "bin" / "claude-session-probe")).load_module()
 
 fails = []
 skipped = []
@@ -104,6 +102,15 @@ for ln in out.splitlines():
     n = u[len("claude-"):-len(".service")]
     if n.startswith("job-") or n.startswith("session-nudge@") or n in G.NON_SESSION:
         continue
+    # 세션과 일회성 유닛을 가르는 것은 이름이 아니라 Transient 다 — 감시 대상을
+    # 고르는 claude-stall-guard 가 쓰는 기준 그대로다. 이름 앞가지로만 거르면
+    # systemd-run 이 새로 띄우는 보조 유닛마다 이 검사가 깨진다. 2026-11-09 에
+    # 유저봇 지연 삭제 유닛(claude-userbot-del-<pid>-<ms>)이 세션으로 잡혀
+    # 둘째 기계에서 실패했다 — 그 유닛엔 transcript 가 없으니 탐침이 None 을 낸다.
+    if subprocess.run(["systemctl", "--user", "show", u, "-p", "Transient",
+                       "--value"], capture_output=True,
+                      text=True).stdout.strip() == "yes":
+        continue
     names.append(n)
 
 if not names:
@@ -119,7 +126,7 @@ for n in names:
     a = W.latest_jsonl(wd)
     pd = G.project_dir(wd)
     b = G.newest_transcript(pd) if pd else None
-    c = json.loads(subprocess.run([str(Path(os.path.join(REPO, "bin/claude-session-probe"))), n],
+    c = json.loads(subprocess.run([str(ROOT / "bin" / "claude-session-probe"), n],
                                   capture_output=True, text=True).stdout or "{}").get("transcript")
     same = (str(a) if a else None) == (str(b) if b else None) == (str(c) if c else None)
     print("3) %-12s %-40s 일치=%s" % (n, os.path.basename(str(a)), same))

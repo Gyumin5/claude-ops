@@ -1,0 +1,195 @@
+#!/bin/bash
+# claude-weekly-stability-check
+# 2026-05-21 PreCompact 데드락/cgroup 사고 가드 변경 후 1주 관찰 리포트.
+# 자동 상태 변경 금지. proposed_actions 만 기록, 컨트롤봇 알림.
+# 트리거 이중화: CronCreate(세션 내부) + systemd transient timer(fallback). flock 중복 차단.
+
+set -uo pipefail
+
+LOCK=/tmp/claude-weekly-stability-check.lock
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "another instance running, skip" >&2
+    exit 0
+fi
+
+TRIGGER="${1:-unknown}"
+REPORT_DIR="$HOME/.claude/state/weekly-stability"
+mkdir -p "$REPORT_DIR"
+TS=$(date '+%Y%m%d-%H%M%S')
+KST_LABEL=$(date '+%Y-%m-%d %H:%M KST')
+REPORT_JSON="$REPORT_DIR/report-${TS}.json"
+REPORT_MD="$REPORT_DIR/report-${TS}.md"
+
+count() {
+    # grep -c 안전 wrapper. 파일 없거나 매치 0이어도 0 한 줄만.
+    local pat="$1" file="$2" n
+    [ -f "$file" ] || { echo 0; return; }
+    n=$(grep -cE -- "$pat" "$file" 2>/dev/null || true)
+    [ -z "$n" ] && n=0
+    echo "$n" | head -1
+}
+# 시간 윈도우 필터: 7일 이내 로그 라인만 카운트 (precompact.log 처럼 [YYYY-MM-DD HH:MM:SS] 시작)
+count_recent() {
+    local pat="$1" file="$2" days="${3:-7}" n
+    [ -f "$file" ] || { echo 0; return; }
+    local since=$(date -d "$days days ago" '+%Y-%m-%d %H:%M:%S')
+    n=$(awk -v s="$since" -v p="$pat" '
+        match($0, /\[?([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})\]?/, m) {
+            if (m[1] >= s && $0 ~ p) c++
+        } END { print c+0 }
+    ' "$file" 2>/dev/null || echo 0)
+    [ -z "$n" ] && n=0
+    echo "$n"
+}
+
+PCLOG="$HOME/.claude/logs/precompact.log"
+PC_PASS=$(count_recent "통과" "$PCLOG")
+PC_RECOVER=$(count_recent "updater 갱신 성공" "$PCLOG")
+PC_SNAPSHOT=$(count_recent "AUTO_TAIL_SNAPSHOT 기록" "$PCLOG")
+PC_BLOCK=$(count_recent "압축 차단" "$PCLOG")
+
+PLG="$HOME/.claude/logs/prompt-length-guard.log"
+PLG_BLOCK=$(count "BLOCK" "$PLG")
+PLG_WARN=$(count "WARN" "$PLG")
+
+UPD="$HOME/.claude/logs/progress-updater.log"
+UPD_BOUNDED=$(count "bounded mode" "$UPD")
+UPD_ROT=$(count "rotation detected" "$UPD")
+UPD_TO=$(count "timeout" "$UPD")
+UPD_DRIFT=$(count "drift|jaccard" "$UPD")
+
+DELTA_DIR=$HOME/.claude/state/progress-delta
+DELTA_SESSIONS=0
+DELTA_TOTAL=0
+if [ -d "$DELTA_DIR" ]; then
+    DELTA_SESSIONS=$(ls "$DELTA_DIR"/*.jsonl 2>/dev/null | wc -l)
+    DELTA_TOTAL=$(cat "$DELTA_DIR"/*.jsonl 2>/dev/null | wc -l)
+fi
+
+OOM=$(journalctl --user --since '7 days ago' 2>/dev/null | grep -ciE 'oom-killer|out of memory|memory cgroup' | head -1)
+[ -z "$OOM" ] && OOM=0
+SVC_RESTART=$(journalctl --user --since '7 days ago' -u 'claude-*.service' 2>/dev/null | grep -c "Started" | head -1)
+[ -z "$SVC_RESTART" ] && SVC_RESTART=0
+ROTATE_CNT=$(journalctl --user --since '7 days ago' 2>/dev/null | grep -cE "cs rotate|cs restart" | head -1)
+[ -z "$ROTATE_CNT" ] && ROTATE_CNT=0
+
+# KST 라벨 검사: cs list 로 활성 프로젝트 cwd 추출
+KST_OK=0
+KST_BAD=0
+KST_BAD_LIST=""
+while IFS= read -r cwd; do
+    [ -z "$cwd" ] && continue
+    pg="$cwd/progress.md"
+    [ -f "$pg" ] || continue
+    if grep -m1 -E "^updated:.*KST" "$pg" >/dev/null 2>&1; then
+        KST_OK=$((KST_OK+1))
+    else
+        KST_BAD=$((KST_BAD+1))
+        KST_BAD_LIST="$KST_BAD_LIST $(basename "$cwd")"
+    fi
+done < <(systemctl --user list-units --type=service 'claude-*.service' --no-legend 2>/dev/null \
+    | awk '{print $1}' \
+    | while read u; do
+        systemctl --user show "$u" -p WorkingDirectory --value 2>/dev/null
+      done)
+
+# 판정
+VERDICT="green"
+REASONS=""
+add_reason() { REASONS="$REASONS|$1"; }
+if [ "$PC_BLOCK" -gt 0 ]; then VERDICT="red"; add_reason "precompact 압축 차단 $PC_BLOCK회"; fi
+if [ "$OOM" -gt 0 ]; then VERDICT="red"; add_reason "OOM/cgroup $OOM회"; fi
+if [ "$KST_BAD" -gt 0 ]; then [ "$VERDICT" = "green" ] && VERDICT="yellow"; add_reason "KST 라벨 누락 $KST_BAD개:$KST_BAD_LIST"; fi
+if [ "$UPD_DRIFT" -gt 3 ]; then [ "$VERDICT" = "green" ] && VERDICT="yellow"; add_reason "progress-updater drift $UPD_DRIFT회"; fi
+if [ "$DELTA_TOTAL" -lt 100 ]; then [ "$VERDICT" = "green" ] && VERDICT="yellow"; add_reason "progress-delta 활동 미미 ($DELTA_TOTAL), hook 미작동 의심"; fi
+
+PROPOSED=""
+if [ "$VERDICT" = "green" ]; then
+    PROPOSED="|precompact-guard STALE_THRESHOLD 7d→24h 복귀|session_id/inode 바인딩 가드 도입|memory-lifecycle DRY_RUN=0 전환(사용자 명시 승인 필요)"
+fi
+
+# JSON / MD 출력은 python 으로 안전 처리
+export TS_KST="$KST_LABEL" TRIGGER VERDICT REASONS PROPOSED
+export PC_PASS PC_RECOVER PC_SNAPSHOT PC_BLOCK PLG_BLOCK PLG_WARN
+export UPD_BOUNDED UPD_ROT UPD_TO UPD_DRIFT
+export DELTA_SESSIONS DELTA_TOTAL OOM SVC_RESTART ROTATE_CNT
+export KST_OK KST_BAD KST_BAD_LIST
+export REPORT_JSON REPORT_MD
+
+python3 <<'PY'
+import os, json
+def split_bar(s):
+    return [p.strip() for p in s.split("|") if p.strip()]
+i = lambda k: int(os.environ.get(k, "0") or 0)
+d = {
+  "ts_kst": os.environ["TS_KST"],
+  "trigger": os.environ["TRIGGER"],
+  "since_days": 7,
+  "verdict": os.environ["VERDICT"],
+  "reasons": split_bar(os.environ.get("REASONS", "")),
+  "proposed_actions": split_bar(os.environ.get("PROPOSED", "")),
+  "metrics": {
+    "precompact": {"pass": i("PC_PASS"), "recover": i("PC_RECOVER"),
+                   "snapshot": i("PC_SNAPSHOT"), "block": i("PC_BLOCK")},
+    "prompt_length_guard": {"block": i("PLG_BLOCK"), "warn": i("PLG_WARN")},
+    "progress_updater": {"bounded": i("UPD_BOUNDED"), "rotation_reset": i("UPD_ROT"),
+                         "timeout": i("UPD_TO"), "drift": i("UPD_DRIFT")},
+    "progress_delta": {"sessions": i("DELTA_SESSIONS"), "lines_total": i("DELTA_TOTAL")},
+    "oom_events": i("OOM"),
+    "service_restart": i("SVC_RESTART"),
+    "cs_rotate_or_restart": i("ROTATE_CNT"),
+    "kst_label": {"ok": i("KST_OK"), "bad": i("KST_BAD"),
+                  "bad_projects": os.environ.get("KST_BAD_LIST", "").split()},
+  },
+}
+open(os.environ["REPORT_JSON"], "w").write(json.dumps(d, ensure_ascii=False, indent=2))
+
+m = []
+m.append(f"# 주간 안정성 점검 ({d['ts_kst']})")
+m.append("")
+m.append(f"- 트리거: {d['trigger']}")
+m.append(f"- 판정: {d['verdict']}")
+m.append("")
+m.append("## 지표")
+mt = d["metrics"]
+pc = mt["precompact"]
+m.append(f"- PreCompact: pass={pc['pass']} recover={pc['recover']} snapshot={pc['snapshot']} block={pc['block']}")
+plg = mt["prompt_length_guard"]
+m.append(f"- prompt-length-guard: block={plg['block']} warn={plg['warn']}")
+up = mt["progress_updater"]
+m.append(f"- progress-updater: bounded={up['bounded']} rotation_reset={up['rotation_reset']} timeout={up['timeout']} drift={up['drift']}")
+pd = mt["progress_delta"]
+m.append(f"- progress-delta: sessions={pd['sessions']} lines_total={pd['lines_total']}")
+m.append(f"- OOM events: {mt['oom_events']}")
+m.append(f"- service restart: {mt['service_restart']}")
+m.append(f"- cs rotate/restart: {mt['cs_rotate_or_restart']}")
+kst = mt["kst_label"]
+bad = ",".join(kst["bad_projects"]) if kst["bad_projects"] else ""
+m.append(f"- KST 라벨: ok={kst['ok']} bad={kst['bad']}" + (f" ({bad})" if bad else ""))
+m.append("")
+if d["reasons"]:
+    m.append("## 우려")
+    for r in d["reasons"]: m.append(f"- {r}")
+    m.append("")
+if d["proposed_actions"]:
+    m.append("## proposed_actions (자동 적용 안 함, 명시 승인 필요)")
+    for p in d["proposed_actions"]: m.append(f"- {p}")
+open(os.environ["REPORT_MD"], "w").write("\n".join(m) + "\n")
+PY
+
+# 컨트롤봇 알림 (.env from claude-control-bot)
+ENV_FILE="$HOME/.config/claude-control-bot/.env"
+[ -f "$ENV_FILE" ] || ENV_FILE=/etc/claude-control-bot.env
+if [ -f "$ENV_FILE" ]; then
+    TOK=$(grep -h '^TELEGRAM_BOT_TOKEN' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | head -1)
+    CHAT=$(grep -h '^ALLOWED_CHAT_IDS' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"' | cut -d, -f1)
+    if [ -n "$TOK" ] && [ -n "$CHAT" ]; then
+        SUMMARY=$(head -20 "$REPORT_MD")
+        curl -s -X POST "https://api.telegram.org/bot${TOK}/sendMessage" \
+            -d "chat_id=${CHAT}" --data-urlencode "text=${SUMMARY}" >/dev/null
+    fi
+fi
+
+echo "$REPORT_MD"
+exit 0

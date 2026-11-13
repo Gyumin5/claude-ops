@@ -4,6 +4,10 @@
 # 순수 bash — claude 의존성 없음.
 
 set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/operator_chat.sh"   # 방 번호 단일 출처
+
+# 저장소 안 자리는 자기 위치에서 뽑는다. 심링크로 배포되니 readlink 로 실체를 먼저 푼다.
+REPO_DIR="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
 
 LOG_DIR="$HOME/.claude/logs"
 STATE_DIR="$HOME/.claude/state/watchdog"
@@ -19,14 +23,16 @@ log() {
 telegram_alert() {
     local text="$1"
     # dotfiles 봇으로 운영자에게 알림
-    local env="$HOME/dotfiles/.claude/telegram/.env"
+    local env="$REPO_DIR/.claude/telegram/.env"
     [ ! -f "$env" ] && return 0
     # shellcheck disable=SC1090
     . "$env"
     local tok="${TELEGRAM_BOT_TOKEN:-${BOT_TOKEN:-}}"
     [ -z "$tok" ] && return 0
+    local cid
+    cid="$(operator_chat_id)" || return 0
     curl -s -m 5 -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
-        --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+        --data-urlencode "chat_id=$cid" \
         --data-urlencode "text=${text}" > /dev/null 2>&1 || true
 }
 
@@ -51,6 +57,40 @@ for unit in $(systemctl --user list-unit-files 'claude-*.service' --state=enable
     # --- 3. jsonl 무응답 자동 복구 비활성화 (idle 세션과 구분 불가, false positive 잦음) ---
     # 멈춘 세션은 사용자가 claude-sessions restart <name> 수동 복구.
 done
+
+# === 4. 넛지 점검기가 살아 있나 ===
+# 점검기(claude-nudge-audit)는 넛지가 조용히 멈추는 걸 잡는 장치다. 그게 죽으면
+# 아무도 모른다 — 감시의 감시를 새 데몬으로 쌓지 않고, 이미 매분 도는 여기서
+# 마지막 실행 시각 한 줄만 본다. 타이머가 켜진 호스트에서만 본다.
+if [ "$(systemctl --user is-enabled claude-nudge-audit.timer 2>/dev/null)" = "enabled" ]; then
+    audit_state="$HOME/.local/state/claude-nudge-audit/state.json"
+    audit_age=-1
+    if [ -f "$audit_state" ]; then
+        audit_age=$(( ($(date +%s) - $(stat -c %Y "$audit_state")) / 60 ))
+    else
+        # 아직 한 번도 안 돈 상태. 타이머를 켠 직후가 그렇다 — 켜자마자 알리지 않고
+        # 타이머가 활성화된 뒤로 얼마나 지났는지로 센다. 그 시각을 못 읽으면 안 센다.
+        t=$(systemctl --user show claude-nudge-audit.timer -p ActiveEnterTimestamp --value 2>/dev/null)
+        if [ -n "$t" ]; then
+            ts=$(date -d "$t" +%s 2>/dev/null || echo "")
+            [ -n "$ts" ] && audit_age=$(( ($(date +%s) - ts) / 60 ))
+        fi
+    fi
+    # 주기 30분의 세 배를 넘기면 안 돈 것이다. 한 번 알리고 6시간 쉰다.
+    if [ "$audit_age" -gt 90 ]; then
+        mark="$STATE_DIR/nudge-audit-stale"
+        last=0
+        [ -f "$mark" ] && last=$(cat "$mark" 2>/dev/null || echo 0)
+        case "$last" in ''|*[!0-9]*) last=0;; esac
+        if [ $(( $(date +%s) - last )) -ge 21600 ]; then
+            log "nudge-audit stale ${audit_age}min → 알림"
+            telegram_alert "넛지 점검기가 ${audit_age}분째 안 돌았다(주기 30분). 넛지가 멈춰도 지금은 아무도 모른다. 확인: systemctl --user list-timers claude-nudge-audit.timer"
+            date +%s > "$mark"
+        fi
+    else
+        rm -f "$STATE_DIR/nudge-audit-stale" 2>/dev/null
+    fi
+fi
 
 # 루프 마지막 명령이 false 테스트([ != active ])면 종료코드가 1로 새어 systemd가
 # 매분 service를 failed로 표시함. 작업은 정상 수행됐으므로 명시적 성공 종료.

@@ -19,7 +19,20 @@
       "mcp__plugin_telegram_telegram__reply",
       "mcp__plugin_telegram_telegram__react",
       "mcp__plugin_telegram_telegram__edit_message",
-      "mcp__plugin_telegram_telegram__download_attachment"
+      "mcp__plugin_telegram_telegram__download_attachment",
+      "mcp__claude_ai_Microsoft_365__outlook_email_search",
+      "mcp__claude_ai_Microsoft_365__chat_message_search",
+      "mcp__claude_ai_Microsoft_365__read_resource",
+      "mcp__claude_ai_Microsoft_365__sharepoint_search",
+      "mcp__claude_ai_Microsoft_365__sharepoint_folder_search",
+      "mcp__claude_ai_Microsoft_365__teams_list_chats",
+      "mcp__claude_ai_Microsoft_365__teams_list_channel_messages",
+      "mcp__claude_ai_Microsoft_365__teams_list_channels",
+      "mcp__claude_ai_Microsoft_365__teams_list_teams",
+      "mcp__claude_ai_Microsoft_365__get_me",
+      "mcp__claude_ai_Gmail__search_threads",
+      "mcp__claude_ai_Gmail__get_thread",
+      "mcp__claude_ai_Gmail__get_message"
     ],
     "deny": [
       "Read(**/.env*)",
@@ -62,20 +75,29 @@
       "Bash(wget * | sh)",
       "Bash(dd *)",
       "Bash(mkfs*)",
-      "Bash(chmod -R 777 *)"
+      "Bash(chmod -R 777 *)",
+      "Bash(pkill *)",
+      "Bash(pkexec)",
+      "Bash(pkexec:*)",
+      "Bash(su)",
+      "Bash(su:*)",
+      "Bash(doas)",
+      "Bash(doas:*)",
+      "AskUserQuestion"
     ],
     "additionalDirectories": [
       "~"
-    ]
+    ],
+    "blockWritesOutsideWorkingDirectories": true
   },
-  "model": "opus[1m]",
+  "model": "claude-opus-5-5[1m]",
   "hooks": {
     "PreToolUse": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/rate-limit-guard.sh"
+            "command": "$HOME/.claude/hooks/rate-limit-guard.sh"
           }
         ]
       },
@@ -84,15 +106,15 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/block-ai-after-compact.sh"
+            "command": "$HOME/.claude/hooks/block-ai-after-compact.sh"
           },
           {
             "type": "command",
-            "command": "~/.claude/hooks/secrets-scan-guard.sh"
+            "command": "$HOME/.claude/hooks/secrets-scan-guard.sh"
           },
           {
             "type": "command",
-            "command": "~/.claude/hooks/bg-longjob-guard.sh"
+            "command": "$HOME/.claude/hooks/bg-longjob-guard.sh"
           }
         ]
       },
@@ -101,7 +123,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/large-read-guard.sh"
+            "command": "$HOME/.claude/hooks/large-read-guard.sh"
           }
         ]
       },
@@ -110,7 +132,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/progress-md-path-guard.sh"
+            "command": "$HOME/.claude/hooks/progress-md-path-guard.sh"
           }
         ]
       }
@@ -121,7 +143,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/auto-verify.sh"
+            "command": "$HOME/.claude/hooks/auto-verify.sh"
           }
         ]
       },
@@ -130,7 +152,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/html-charset-inject.sh"
+            "command": "$HOME/.claude/hooks/html-charset-inject.sh"
           }
         ]
       },
@@ -138,7 +160,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/tool-latency.sh"
+            "command": "$HOME/.claude/hooks/tool-latency.sh"
           }
         ]
       },
@@ -147,7 +169,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/skill-call-log.sh"
+            "command": "$HOME/.claude/hooks/skill-call-log.sh"
           }
         ]
       },
@@ -155,7 +177,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/progress-delta.sh"
+            "command": "$HOME/.claude/hooks/progress-delta.sh"
           }
         ]
       },
@@ -164,7 +186,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/progress-backup.sh"
+            "command": "$HOME/.claude/hooks/progress-backup.sh"
           }
         ]
       },
@@ -173,7 +195,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/git-commit-post.sh"
+            "command": "$HOME/.claude/hooks/git-commit-post.sh"
           }
         ]
       }
@@ -183,7 +205,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/precompact-guard.sh"
+            "command": "$HOME/.claude/hooks/precompact-guard.sh"
           }
         ]
       },
@@ -191,7 +213,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/precompact_snapshot.sh"
+            "command": "$HOME/.claude/hooks/precompact_snapshot.sh"
           }
         ]
       }
@@ -201,7 +223,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/postcompact-mark.sh"
+            "command": "$HOME/.claude/hooks/postcompact-mark.sh"
           }
         ]
       }
@@ -211,27 +233,27 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/dotfiles/claude/hooks/soft-restart-guard.sh"
+            "command": "$HOME/dotfiles/claude/hooks/soft-restart-guard.sh"
           },
           {
             "type": "command",
-            "command": "~/.claude/hooks/prompt-length-guard.sh"
+            "command": "$HOME/.claude/hooks/prompt-length-guard.sh"
           },
           {
             "type": "command",
-            "command": "~/.claude/hooks/rate-limit-prompt-guard.sh"
+            "command": "$HOME/.claude/hooks/rate-limit-prompt-guard.sh"
           },
           {
             "type": "command",
-            "command": "~/.claude/hooks/postcompact-warn.sh"
+            "command": "$HOME/.claude/hooks/postcompact-warn.sh"
           },
           {
             "type": "command",
-            "command": "~/.claude/hooks/inject-briefing.sh"
+            "command": "$HOME/.claude/hooks/inject-briefing.sh"
           },
           {
             "type": "command",
-            "command": "~/.claude/hooks/telegram-reply-injector.sh"
+            "command": "$HOME/.claude/hooks/telegram-reply-injector.sh"
           }
         ]
       }
@@ -241,7 +263,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/session-start-context.sh"
+            "command": "$HOME/.claude/hooks/session-start-context.sh"
           }
         ]
       },
@@ -249,7 +271,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/session_start_rehydrate_topicsonly.sh"
+            "command": "$HOME/.claude/hooks/session_start_rehydrate_topicsonly.sh"
           }
         ]
       },
@@ -257,7 +279,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/dotfiles/claude/hooks/session-resume-notify.sh"
+            "command": "$HOME/dotfiles/claude/hooks/session-resume-notify.sh"
           }
         ]
       }
@@ -267,11 +289,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/telegram-reply-enforcer.sh"
+            "command": "$HOME/.claude/hooks/telegram-reply-enforcer.sh"
           },
           {
             "type": "command",
-            "command": "~/.claude/hooks/completion-notify.sh"
+            "command": "$HOME/.claude/hooks/completion-notify.sh"
           }
         ]
       },
@@ -279,7 +301,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/stop_memory_capture.sh"
+            "command": "$HOME/.claude/hooks/stop_memory_capture.sh"
           }
         ]
       },
@@ -287,7 +309,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/dotfiles/claude/hooks/stop-scratchpad-selfclean.sh"
+            "command": "$HOME/dotfiles/claude/hooks/stop-scratchpad-selfclean.sh"
           }
         ]
       }
@@ -298,13 +320,10 @@
     "command": "python3 ~/.claude/statusline.py"
   },
   "enabledPlugins": {
-    "clangd-lsp@claude-plugins-official": false,
-    "code-review@claude-plugins-official": true,
-    "skill-creator@claude-plugins-official": true,
     "pyright-lsp@claude-plugins-official": true,
-    "telegram@claude-plugins-official": true,
-    "typescript-lsp@claude-plugins-official": false
+    "telegram@claude-plugins-official": true
   },
+  "extraKnownMarketplaces": {},
   "effortLevel": "high",
   "autoCompactWindow": 300000,
   "awaySummaryEnabled": true,

@@ -14,7 +14,6 @@
 셋. run_planner 는 call_agent 를 안 거쳐 사본도 치환도 없이 원문을 넘기고 작업 위치도
 안 정했다. --auto-roles 회차에만 열리던 구멍이다.
 """
-import os
 import importlib.machinery
 import importlib.util
 import subprocess
@@ -114,13 +113,12 @@ def fake_run(cmd, **kw):
 
 
 mod.subprocess.run = fake_run
-mod.sync_iso_credentials = lambda: (True, "")
 try:
     with tempfile.TemporaryDirectory() as tmp:
         run_dir = Path(tmp) / "run-20260915T000000Z"
         run_dir.mkdir(parents=True)
-        # 이 기계의 실제 홈이어야 한다 — 가려내기는 홈 경로를 보고 판단한다.
-        leaked = os.path.expanduser("~/dotfiles")
+        # 가리는 경계가 이 계정 홈이라 합성 경로로는 재현이 안 된다 — 실제 홈 밑을 쓴다.
+        leaked = str(Path.home() / "dotfiles")
         mod.set_brief_paths("경로 없는 브리프")
 
         for agent in ("gemini", "claude-fable"):
@@ -152,7 +150,7 @@ finally:
     mod.subprocess.run = real_run
 
 # ── 5. 감싼 경로와 못 쓰는 경로 ────────────────────────────────────────
-# 옆 기계 run-20260917T020033Z: 브리프가 검토 대상을 역따옴표로 감쌌더니 닫는 역따옴표가
+# 둘째 기계 run-20260917T020033Z: 브리프가 검토 대상을 역따옴표로 감쌌더니 닫는 역따옴표가
 # 경로에 붙어 존재하지 않는 경로가 됐고, 사본이 안 만들어진 채 참여자 셋 전부가 "지정된
 # 경로를 열 수 없었다" 고 밝혔는데 회차는 합의로 정상 종료했다. 조용히 실패하는 게
 # 결함이라, 감싸개를 벗기는 것과 하나도 못 쓸 때 멈추는 것 둘 다 고정한다.

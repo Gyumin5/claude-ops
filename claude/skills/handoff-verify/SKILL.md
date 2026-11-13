@@ -1,49 +1,49 @@
 ---
 name: handoff-verify
-description: 작업 완료 후 fresh-context 서브에이전트로 빌드/테스트/린트 검증. "검증", "확인", "handoff verify" 등 슬래시 호출 시.
-disable-model-invocation: true
+description: 작업 완료 후 fresh-context 서브에이전트로 그 저장소의 기본 테스트 명령을 한 번 돌려 전체 출력을 받아온다. "검증", "확인", "handoff verify" 등 호출 시. 완료·통과 판정 자체는 전역 "검증은 테스트 코드로만" 절이 정본이다.
+disable-model-invocation: false
 ---
 
-# /handoff-verify
+# /handoff-verify — 기본 테스트 명령 한 번, 전체 출력
 
-작업 완료 후 서브에이전트를 fresh context로 띄워 빌드/테스트/린트 검증. 기존 컨텍스트 편향 없이 실제 동작 확인.
+기존 컨텍스트의 편향 없이 실제로 도는지 보기 위해 서브에이전트를 새 맥락으로 띄운다.
+이 스킬이 하는 일은 명령을 고르고 돌려서 전체 출력을 가져오는 것까지다 —
+그 출력으로 완료·통과·정상을 선언할 수 있는지는 전역 규칙 "검증은 테스트 코드로만" 절(R55)이 정한다.
 
-## 절차
+## 1. 테스트 명령 고르기
 
-### 1. 프로젝트 타입 감지
-| 감지 파일 | 검증 명령 |
+그 저장소에 문서화된 기본 테스트 명령이 있으면 그것을 쓴다. 프로젝트 CLAUDE.md 의 Test 절이
+가장 우선이고, 없을 때만 아래 관용 명령으로 내려간다.
+
+| 감지 파일 | 기본 테스트 명령 |
 |---|---|
-| `package.json` | `npm run build && npm test` |
-| `Cargo.toml` | `cargo check && cargo test` |
-| `CMakeLists.txt` | `cmake --build build && ctest --test-dir build` |
+| `package.json` | `npm test` |
+| `Cargo.toml` | `cargo test` |
+| `CMakeLists.txt` | `ctest --test-dir build` |
 | `setup.py` / `pyproject.toml` | `python -m pytest` |
-| `*.tex` (main) | `latexmk -pdf main.tex` |
-| `package.xml` (catkin) | `catkin_make` 또는 `colcon build` |
+| `package.xml` (catkin) | 그 패키지의 테스트 명령 (`colcon test` 등) |
 
-CLAUDE.md에 Build/Test 섹션 있으면 우선.
+빌드와 정적 검사는 기본으로 돌리지 않는다. 기본 테스트 명령이 내부에서 빌드를 하면 그대로 두고
+따로 다시 돌리지 않는다. 실행·설치 가능한 빌드 산출물이 작업 결과이거나 빌드 설정·정적 검사 규칙을
+바꾼 작업일 때만 결과물 확인용으로 빌드를 추가한다.
 
-### 2. 서브에이전트 실행
-Agent tool, subagent_type=general-purpose, 아래 프롬프트:
+문서화된 명령도 없고 위 표에도 안 걸리면 거기서 멈추고 "테스트 근거 없음" 으로 보고한다 —
+명령을 지어내지 않는다.
+
+## 2. 서브에이전트 실행
+
+Agent tool, subagent_type=general-purpose. 프롬프트:
+
 ```
-프로젝트 fresh context 검증.
-1. 프로젝트 CLAUDE.md 읽기 (있으면)
-2. 명령 순서대로 실행: 타입체크 → 린트 → 빌드 → 테스트
-3. 각 단계 결과 보고: ✅ PASS 또는 ❌ FAIL + 에러 분류
-4. 에러 분류:
-   - Fixable (import/타입/린트): 자동 수정 시도, 최대 3회
-   - Non-Fixable (설계/외부 의존성): 보고만
-5. 최종 보고 형식:
-## 검증 결과
-- TypeCheck/Lint/Build/Test: ✅/❌
-## 자동 수정
-- 수정 내용
-## Non-Fixable
-- 이슈 목록
+새 맥락으로 이 저장소를 검증한다.
+1. 프로젝트 CLAUDE.md 읽기 (있으면) — 거기 적힌 테스트 명령이 우선이다.
+2. 테스트 명령 한 번 실행: <명령>
+3. 출력을 자르지 말고 그대로 반환한다. 통과/실패 요약만 적지 않는다.
+4. 실패했으면 실패한 채로 보고한다. 고치지 않는다.
 ```
 
-### 3. 결과 요약
-사용자에게 보고. 전체 PASS면 "검증 완료", 아니면 수정 내용/이슈 정리.
+## 3. 보고
 
-## 규칙
-- 자동 수정 최대 3회. 수정 후 반드시 재실행
-- 검증 대상 불명확하면 사용자 확인
+전체 출력과 종료 코드를 그대로 가져와 사용자에게 보인다. 이 스킬 안에서 "검증 완료" 를 선언하지
+않는다 — 판정은 호출한 세션이 R55 조건으로 한다. 실패했으면 실패한 출력을 그대로 보이고,
+고치는 것은 별도 작업으로 가른다.

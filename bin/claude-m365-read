@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""개인 계정 커넥터로 마이크로소프트 365 를 읽는다 — 이 기계가 어느 계정으로 돌든.
+
+왜 따로 있나. 커넥터는 기계가 아니라 클로드 계정을 따라간다. 밤·한도 전환으로
+공용 계정에 가 있으면 세션의 커넥터 도구는 그 공용 계정에 붙고, 그 계정에 남의
+사내 연결이 걸려 있으면 남의 사서함이 열린다(2026-11-09 둘째 기계에서 실제로 열렸다).
+그래서 읽기는 세션이 직접 하지 않고, 개인 계정 홈을 지정해 띄운 짧은 실행 하나가
+맡는다. 그 실행은 이 기계의 지금 계정과 무관하게 개인 로그인을 쓴다.
+
+쓰는 법은 읽을 것을 한 줄로 주는 것뿐이다.
+
+    claude-m365-read "오늘 온 메일 중 내 이름이 들어간 것 다섯 개를 제목만"
+    claude-m365-read --tools teams_list_chats "최근 1대1 대화 상대 열 명"
+
+도구 이름을 반드시 넘기는 까닭: 요즘 판본은 도구를 미리 안 올리고 쓸 때 올린다.
+그래서 "쓸 수 있는 도구를 적어라" 로 물으면 비어 보이고, 이름을 박아 주면 그
+자리에서 올라온다. 이름을 안 박으면 읽기가 조용히 빈손으로 끝난다.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import subprocess
+import sys
+
+HOME = pathlib.Path.home()
+ROOT = pathlib.Path(os.environ.get("CLAUDE_ACCOUNTS_ROOT", str(HOME / "claude-accounts")))
+SWITCH = pathlib.Path(__file__).resolve().parent / "claude-account-night-switch"
+PREFIX = "mcp__claude_ai_Microsoft_365__"
+
+# 읽기만 하는 도구들. 쓰기·보내기 도구는 넣지 않는다.
+DEFAULT_TOOLS = (
+    "get_me",
+    "chat_message_search",
+    "outlook_email_search",
+    "outlook_calendar_search",
+    "teams_list_chats",
+    "teams_list_channels",
+    "teams_list_channel_messages",
+)
+
+
+def die(msg):
+    print("claude-m365-read: " + msg, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def personal_account():
+    """개인 계정 이름은 밤 전환 설정의 day 줄 하나가 정본이다. 여기에 안 적는다 —
+    기계마다 다르고, 사본을 두면 한쪽이 낡는다."""
+    loader = importlib.machinery.SourceFileLoader("night_switch", str(SWITCH))
+    spec = importlib.util.spec_from_loader("night_switch", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    day = mod.read_conf()[1]
+    if not day:
+        die("밤 전환 설정에 day 줄이 없다 — 어느 계정이 개인 계정인지 모른다")
+    return day
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("task", help="읽을 것을 한 줄로")
+    ap.add_argument("--tools", default=",".join(DEFAULT_TOOLS),
+                    help="쓸 도구 이름을 쉼표로. 앞가지는 빼고 적는다")
+    ap.add_argument("--model", default="claude-haiku-5-5")
+    ap.add_argument("--timeout", type=int, default=300)
+    a = ap.parse_args()
+
+    name = personal_account()
+    home = ROOT / name
+    cred = home / ".claude" / ".credentials.json"
+    if not cred.exists():
+        die("개인 계정 자리에 로그인 파일이 없다: {} — claude-accounts 로 먼저 로그인해라"
+            .format(cred))
+
+    tools = [t.strip() for t in a.tools.split(",") if t.strip()]
+    if not tools:
+        die("도구를 하나도 안 넘겼다 — 이름을 박지 않으면 읽기가 빈손으로 끝난다")
+    allowed = ",".join(PREFIX + t for t in tools)
+
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    # 이 세 값이 남아 있으면 지정한 홈이 아니라 부르는 쪽 설정을 본다.
+    for k in ("CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "CLAUDE_ACCOUNTS_ROOT"):
+        env.pop(k, None)
+
+    cmd = ["claude", "-p", a.task, "--model", a.model, "--allowedTools", allowed]
+    try:
+        r = subprocess.run(cmd, env=env, cwd=str(home), stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=a.timeout)
+    except subprocess.TimeoutExpired:
+        die("{}초 안에 안 끝났다".format(a.timeout))
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        die("읽기 실행이 rc={} 로 끝났다".format(r.returncode))
+    out = r.stdout.strip()
+    if not out:
+        die("빈손으로 끝났다 — 도구 이름이 맞는지, 그 계정에 연결이 걸려 있는지 봐라")
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-LOG=$HOME/.claude/logs/precompact.log
+LOG="$HOME/.claude/logs/precompact.log"
 STALE_THRESHOLD=$((7*24*3600))   # 7일
 SNAPSHOT_LINES=200               # jsonl tail 줄 수
 SNAPSHOT_MARK_START="<!-- AUTO_TAIL_SNAPSHOT begin -->"
@@ -43,7 +43,7 @@ fi
 
 echo "[$ts] cwd=$CWD progress.md stale (age=${age}s) → updater 동기 실행" >> "$LOG"
 if command -v claude-progress-updater >/dev/null 2>&1; then
-    timeout 90 $HOME/.local/bin/claude-progress-updater "$CWD" >> "$LOG" 2>&1 || true
+    timeout 90 "$HOME/.local/bin/claude-progress-updater" "$CWD" >> "$LOG" 2>&1 || true
     new_mtime=$(stat -c %Y "$PROG" 2>/dev/null || echo 0)
     if [ "$(( now - new_mtime ))" -le "$STALE_THRESHOLD" ]; then
         echo "[$ts] updater 갱신 성공, 압축 통과" >> "$LOG"

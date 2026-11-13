@@ -1,0 +1,98 @@
+#!/bin/bash
+# claude-daily-reports-backup-sync: 데일리 24h 리포트 + 주간위키 원장/초안만
+# private 백업 저장소(Gyumin5/gyumin-daily-reports-backup)로 매일 동기화.
+#
+# 배경: 2026-07-08 사용자 요청 — "내 컴퓨터가 영원히 남아있는다는 보장이 없으니까
+# 백업" 목적, "데일리 워크리포트하고 주간 리포트를 올리는 게 목적". 용량은 연
+# 7MB 수준이라 저장소 자체는 가볍다. 둘째 기계 로컬에서만 의미 있음(원본이 그 기계에
+# 있음). 최초 구현은 각 프로젝트 reports/ 디렉토리 전체를 rsync -a 했다가,
+# 그 안에 있던 무관한 과거 연구 리포트 수십 개까지 전부 백업repo로 올라가버려
+# 사용자가 지적(2026-07-08) — work_report_24h_*.html 패턴만 선별하도록 수정.
+#
+# 대상: ~/dotfiles/claude/weekly-wiki/worklog/ (일간 ledger, 그대로 전체) +
+# daily-report-targets.txt 에 나열된 각 세션의 ~/<session>/reports/ 중
+# work_report_24h_*.html 만 + weekly-wiki의 주간 초안(draft_2026W*-*.md).
+set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/operator_chat.sh"   # 방 번호 단일 출처
+
+BACKUP_REPO="git@github.com:Gyumin5/gyumin-daily-reports-backup.git"
+BACKUP_LOCAL="$HOME/.claude/reports/backup-repo"
+TARGETS_FILE="$HOME/.claude/reports/daily-report-targets.txt"
+WORKLOG_DIR="$HOME/dotfiles/claude/weekly-wiki/worklog"
+WEEKLY_WIKI_DIR="$HOME/dotfiles/claude/weekly-wiki"
+FALLBACK_TELEGRAM_ENV="$HOME/dotfiles/.claude/telegram/.env"
+LOG_FILE="$HOME/.claude/state/daily-report-dispatch/backup-sync.log"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+
+FAILED=0
+
+alert_operator() {
+    [ -f "$FALLBACK_TELEGRAM_ENV" ] || return 0
+    # shellcheck disable=SC1090
+    ( . "$FALLBACK_TELEGRAM_ENV"; tok="${TELEGRAM_BOT_TOKEN:-${BOT_TOKEN:-}}"
+      [ -n "$tok" ] || exit 0
+      CHAT_ID="$(operator_chat_id)" || exit 0
+      curl -s -m 8 -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+        --data-urlencode "chat_id=$CHAT_ID" \
+        --data-urlencode "text=$1" >/dev/null 2>&1 ) || true
+}
+
+# 세션명=디렉토리명 가정이 깨지는 세션(예: gamma, cwd=gamma_work)에
+# 대비해 claude-daily-report-dispatch와 동일하게 실제 WorkingDirectory를 systemctl에서
+# 얻는다. $HOME/$SESSION 폴백은 두지 않음 — 엉뚱한 경로를 조용히 스킵(또는 백업누락)
+# 하는 것보다 fail-closed skip+알림이 낫다는 게 ai-debate(run-20260710T021224Z) 결론.
+resolve_session_workdir() {
+    local session="$1" wd
+    wd=$(systemctl --user show "claude-${session}.service" -p WorkingDirectory --value 2>/dev/null)
+    [ -z "$wd" ] && return 1
+    [ "$wd" = "/" ] && return 1
+    [ "$wd" = "$HOME" ] && return 1
+    [ -d "$wd" ] || return 1
+    printf '%s\n' "$wd"
+}
+
+if [ ! -d "$BACKUP_LOCAL/.git" ]; then
+    git clone "$BACKUP_REPO" "$BACKUP_LOCAL" >/dev/null 2>&1 || { echo "clone 실패" >&2; exit 1; }
+fi
+
+mkdir -p "$BACKUP_LOCAL/worklog"
+[ -d "$WORKLOG_DIR" ] && rsync -a --delete "$WORKLOG_DIR/" "$BACKUP_LOCAL/worklog/" 2>/dev/null
+
+mkdir -p "$BACKUP_LOCAL/weekly"
+rsync -a --delete --delete-excluded --include='draft_2026W*.md' --include='*/' --exclude='*' \
+    "$WEEKLY_WIKI_DIR/" "$BACKUP_LOCAL/weekly/" 2>/dev/null
+find "$BACKUP_LOCAL/weekly" -mindepth 1 -type d -empty -delete 2>/dev/null
+
+if [ -f "$TARGETS_FILE" ]; then
+    while IFS= read -r SESSION; do
+        SESSION="$(printf '%s' "$SESSION" | sed 's/#.*//' | xargs)"
+        [ -z "$SESSION" ] && continue
+
+        WD=$(resolve_session_workdir "$SESSION")
+        if [ -z "$WD" ]; then
+            echo "$(date -Iseconds) session=${SESSION} result=skip reason=workdir_resolve_failed" >> "$LOG_FILE"
+            alert_operator "[daily-reports-backup-sync] ${SESSION} WorkingDirectory 해석 실패 — 백업 스킵됨(기대경로 확인 필요)."
+            FAILED=1
+            continue
+        fi
+
+        SRC="${WD}/reports"
+        if [ -d "$SRC" ]; then
+            mkdir -p "$BACKUP_LOCAL/${SESSION}-reports"
+            rsync -a --delete --delete-excluded --include='work_report_24h_*.html' --include='*/' --exclude='*' \
+                "$SRC/" "$BACKUP_LOCAL/${SESSION}-reports/" 2>/dev/null
+            find "$BACKUP_LOCAL/${SESSION}-reports" -mindepth 1 -type d -empty -delete 2>/dev/null
+        else
+            echo "$(date -Iseconds) session=${SESSION} result=skip reason=no_reports_dir expected=${SRC}" >> "$LOG_FILE"
+        fi
+    done < "$TARGETS_FILE"
+fi
+
+cd "$BACKUP_LOCAL" || exit 1
+git add -A
+if git diff --cached --quiet; then
+    exit $FAILED
+fi
+git commit -m "backup: $(date '+%Y-%m-%d %H:%M KST')" >/dev/null 2>&1
+git push origin HEAD >/dev/null 2>&1
+exit $FAILED

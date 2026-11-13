@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """claude-progress-updater 패치 검증 테스트.
 
-왜 있나: 2026-08-10, 옆 기계에서 이 자동화가 progress.md 에 실재하지 않는 사건을 미래
+왜 있나: 2026-08-10, 둘째 기계에서 이 자동화가 progress.md 에 실재하지 않는 사건을 미래
 날짜로 5회 기입했다("밤새 tick 14회", "08-11 07:00 guardian 라운드 실행"). 옛 구조는
 헤드리스 claude 에게 progress.md 전문을 다시 쓰게 하고 그 결과로 파일을 통째 덮었고,
 가드 4종(길이·헤더·Jaccard)이 전부 형태만 봐서 유창한 창작을 그대로 통과시켰다.
@@ -176,9 +176,11 @@ def main():
 
     tmp = tempfile.mkdtemp(prefix="pu5.")
     try:
+        # 구역은 Current State 다 — Blockers 는 갱신기가 아예 못 쓰는 구역이라(ea8ed0d)
+        # 거기로 넣으면 미래 날짜 판정에 닿기 전에 구역 보호에서 거절된다.
         r, after, log, _ = run(tmp, {"patches": [{
-            "op": "append", "section": "## Blockers",
-            "new": "3. (관측) %s 만료 예정 — 그 전에 재무장 확인." % tomorrow,
+            "op": "append", "section": "## Current State",
+            "new": "- (관측) %s 만료 예정 — 그 전에 재무장 확인." % tomorrow,
             "evidence": ev()}]}, age=9999)
         check("미래 날짜라도 예정 문맥이면 통과한다", tomorrow in after, after[-300:])
     finally:
@@ -228,7 +230,7 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True)
 
     # 스킵이 근거를 버리면 안 된다. 옛 코드는 스킵하면서 offset 을 현재 줄수로 밀어버려서
-    # 그 주기에 오간 대화가 영구히 근거에서 빠졌다. 옆 기계 peer 2026-08-27 사고의 실제
+    # 그 주기에 오간 대화가 영구히 근거에서 빠졌다. 둘째 기계 둘째 기계 2026-08-27 사고의 실제
     # 기전이 이것이다 — 12주기 중 11회가 스킵됐고 그 스킵들이 정정 근거를 통째로 버렸다.
     tmp = tempfile.mkdtemp(prefix="pu8b.")
     try:

@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""운영자에게 한 줄 보낸다. 같은 상태를 두 번 보내지 않는다.
+
+세션을 거치지 않는다. 타이머가 도는 자리에서 쓰는 통로라, 세션이 한도에 막혔거나
+아예 안 떠 있어도 사람에게 닿아야 한다.
+
+  claude-operator-alert <자리> <상태> <글>
+
+자리(slot)는 무엇에 대한 알림인지다. 상태(key)는 그 자리의 지금 상태를 한 낱말로
+나타낸 것이고, 직전과 같으면 안 보낸다 — 5분마다 도는 자리에서 같은 글이 열두 번씩
+쌓이면 사람이 안 읽는다. 상태가 바뀌면 보낸다. 그래서 고장도 한 번, 복구도 한 번이다.
+
+  claude-operator-alert account night-blocked "공용 넷이 다 막혔다 …"
+  claude-operator-alert account ok "공용 acct-b 로 돌아왔다"
+
+  claude-operator-alert --quiet account ok "…"
+
+--quiet 는 보내지 않고 상태만 적는다. 사람이 손댈 것 없는 상태(정상·개인 계정 대체)를
+알림 없이 지나가게 하면서도, 그 뒤 고장이 다시 오면 상태가 바뀐 것으로 잡혀 한 번은
+가게 하려는 것이다 — 상태를 안 적고 건너뛰면 직전 고장과 같은 고장이 다시 와도 못 보낸다.
+
+보내기가 실패하면 상태를 안 적는다. 다음 회차가 같은 상태로 다시 보낸다 — 못 보낸
+것을 보낸 것으로 적으면 그 고장은 영원히 사람에게 안 간다.
+"""
+import os
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from operator_chat import chat_id   # noqa: E402  (방 번호 단일 출처)
+
+CHAT_ID = os.environ.get("CLAUDE_ALERT_CHAT_ID") or chat_id()
+ENV_FILE = Path(os.environ.get(
+    "CLAUDE_ALERT_ENV", str(Path.home() / "dotfiles" / ".claude" / "telegram" / ".env")))
+STATE_DIR = Path(os.environ.get(
+    "CLAUDE_ALERT_STATE", str(Path.home() / ".claude" / "state" / "alerts")))
+TIMEOUT = 10
+
+
+def token():
+    """봇 글쇠를 읽는다. 없으면 빈 문자열 — 글쇠 자체는 어디에도 안 찍는다."""
+    try:
+        text = ENV_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        for name in ("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"):
+            if line.startswith(name + "="):
+                return line.split("=", 1)[1].strip().strip("'\"")
+    return ""
+
+
+def send(text):
+    """보낸다. (됐나, 사유)."""
+    tok = token()
+    if not tok:
+        return False, "봇 글쇠를 못 읽었다: {}".format(ENV_FILE)
+    data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": text}).encode("utf-8")
+    url = "https://api.telegram.org/bot{}/sendMessage".format(tok)
+    try:
+        with urllib.request.urlopen(url, data=data, timeout=TIMEOUT) as resp:
+            if resp.status != 200:
+                return False, "텔레그램이 {} 를 냈다".format(resp.status)
+    except Exception as exc:                      # 통신은 어떤 꼴로든 깨질 수 있다
+        return False, "못 보냈다({})".format(type(exc).__name__)
+    return True, ""
+
+
+def main(argv):
+    quiet = len(argv) > 1 and argv[1] == "--quiet"
+    if quiet:
+        argv = argv[:1] + argv[2:]
+    if len(argv) < 4:
+        sys.stderr.write(__doc__)
+        return 2
+    slot, key, text = argv[1], argv[2], " ".join(argv[3:])
+    if "/" in slot or not slot:
+        sys.stderr.write("자리 이름에 경로를 넣지 않는다: {}\n".format(slot))
+        return 2
+    stamp = STATE_DIR / slot
+    try:
+        last = stamp.read_text(encoding="utf-8").strip()
+    except OSError:
+        last = ""
+    if last == key:
+        print("같은 상태라 안 보냈다 ({}={})".format(slot, key))
+        return 0
+    if not quiet:
+        ok, why = send(text)
+        if not ok:
+            sys.stderr.write(why + "\n")
+            return 1
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(key + "\n", encoding="utf-8")
+    except OSError as exc:
+        # 보내긴 했다. 못 적으면 다음 회차가 같은 글을 한 번 더 보낸다.
+        sys.stderr.write("보낸 상태를 못 적었다({})\n".format(type(exc).__name__))
+    print("{} ({}: {} → {})".format("안 보내고 상태만 적었다" if quiet else "보냈다",
+                                    slot, last or "처음", key))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

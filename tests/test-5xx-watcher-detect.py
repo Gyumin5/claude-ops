@@ -4,7 +4,6 @@
 process() 를 실제로 돌리되 재주입은 절대 못 하게 do_resend/notify 를 막고,
 상태 변화(active/attempts/gave_up)와 재주입 호출 여부로 판정을 본다.
 """
-import os
 import json
 import sys
 import tempfile
@@ -12,11 +11,8 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-# 저장소 뿌리를 이 파일 위치에서 찾는다. 예전엔 홈 아래 고정 경로였는데,
-# 그러면 다른 자리에 받은 사람은 그대로 못 돌린다.
-REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-
-w = SourceFileLoader("w", os.path.join(REPO, "bin/claude-api-5xx-watcher")).load_module()
+ROOT = Path(__file__).resolve().parent.parent
+w = SourceFileLoader("w", str(ROOT / "bin" / "claude-api-5xx-watcher")).load_module()
 
 ERR500 = "API Error: 500 Internal server error. This is a server-side issue."
 resends = []

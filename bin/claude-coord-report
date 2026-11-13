@@ -1,0 +1,59 @@
+#!/bin/bash
+# claude-coord-report: 세션들이 "운영자가 정해 달라"고 적어 둔 것을 모아 텔레그램으로 보낸다.
+#
+#   claude-coord-report brief   09시 회차 — 지금 정할 것 제목을 전부 보낸다(없으면 그렇다고 한 줄).
+#   claude-coord-report delta   10~22시 회차 — 지난 발송 뒤 생기거나 풀린 것만. 없으면 안 보낸다.
+#
+# 보낸 뒤에만 기준을 고정한다(coord.py mark-sent) — 전송이 실패하면 기준이 그대로라
+# 다음 회차가 같은 변화를 다시 보낸다. R70.
+set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/operator_chat.sh"   # 방 번호 단일 출처
+
+MODE="${1:-delta}"
+# 검사는 가짜 저장소를 가리켜 실제 텔레그램을 안 거치고 세 갈래를 다 돈다.
+REPO="${CLAUDE_COORD_REPO:-$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")}"
+TELEGRAM_ENV="$REPO/.claude/telegram/.env"
+CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+[ -n "$CHAT_ID" ] || CHAT_ID="$(operator_chat_id)" || exit 1
+
+case "$MODE" in
+    brief|delta) ;;
+    *) echo "usage: claude-coord-report brief|delta" >&2; exit 2 ;;
+esac
+
+# shellcheck disable=SC1090
+[ -f "$TELEGRAM_ENV" ] && . "$TELEGRAM_ENV"
+TOKEN="${TELEGRAM_BOT_TOKEN:-${BOT_TOKEN:-}}"
+if [ -z "$TOKEN" ]; then
+    echo "[coord-report] 봇 토큰 없음 — 안 보낸다" >&2
+    exit 1
+fi
+
+TEXT=$(python3 "$REPO/bin/coord.py" "$MODE" 2>&1)
+RC=$?
+if [ "$RC" -ne 0 ]; then
+    echo "[coord-report] 모으기 실패 rc=$RC: $TEXT" >&2
+    exit "$RC"
+fi
+if [ -z "${TEXT//[[:space:]]/}" ]; then
+    echo "[coord-report] 보낼 변화 없음"
+    exit 0
+fi
+# 텔레그램 한 건 상한. 넘치면 자르고 자른 사실을 밝힌다 — 조용히 사라지면 안 된다.
+if [ "${#TEXT}" -gt 4000 ]; then
+    TEXT="${TEXT:0:3900}
+(길어서 잘랐다. 전체는 coord.py full)"
+fi
+
+HTTP=$(curl -s -m 20 -o /dev/null -w '%{http_code}' -X POST \
+    "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${CHAT_ID}" \
+    --data-urlencode "text=${TEXT}" \
+    -d disable_web_page_preview=true)
+if [ "$HTTP" != "200" ]; then
+    echo "[coord-report] 전송 실패 http=$HTTP — 기준을 그대로 둔다" >&2
+    exit 1
+fi
+
+python3 "$REPO/bin/coord.py" mark-sent
+echo "[coord-report] 보냄 ($MODE, ${#TEXT}자)"

@@ -21,6 +21,7 @@
 #  --dry-run / -n: 재시작하지 않고 선정 결과 + 판정만 출력(검증용).
 
 set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/operator_chat.sh"   # 방 번호 단일 출처
 LOG="$HOME/.claude/logs/bun-ensure.log"
 STATE_DIR="$HOME/.claude/state/bun-ensure"
 GRACE=180       # 서비스 업타임이 이보다 짧으면 기동 중으로 보고 건너뜀(초)
@@ -32,7 +33,7 @@ BASELINE="$STATE_DIR/session-baseline.txt"           # 마지막 정상 세션 �
 ANOMALY="$STATE_DIR/anomaly.state"                   # 1행 fingerprint / 2행 최초 알림 epoch
 ALERT_COOLDOWN=21600                                 # 같은 이상 상태 재알림 간격(6h)
 TELEGRAM_ENV="$HOME/dotfiles/.claude/telegram/.env"
-CHAT_ID=${TELEGRAM_CHAT_ID:-}
+CHAT_ID="$(operator_chat_id)" || exit 1
 
 mkdir -p "$(dirname "$LOG")" "$STATE_DIR"
 ts() { date -Iseconds; }

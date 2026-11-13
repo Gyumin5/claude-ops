@@ -9,6 +9,9 @@
 # - userbot 미도입 상태에서는 사용자가 아무 메시지나 보내면 큐 flush됨.
 
 set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/operator_chat.sh"   # 방 번호 단일 출처
+# 방 번호가 없어도 큐 재개는 계속한다 — 알림만 건너뛴다.
+CHAT_ID="$(operator_chat_id)" || CHAT_ID=""
 
 THRESHOLD_5H=90
 THRESHOLD_7D=99
@@ -18,7 +21,7 @@ STATE_FLAG=~/.claude/state/rate-limit-blocked.flag
 FALLBACK_TELEGRAM_ENV=~/dotfiles/.claude/telegram/.env
 # 고아 큐 가드(2026-07-27 ai-debate run-20260727T094804Z). TTL 을 flush 훅이 아니라
 # "실제 소비 경로"인 여기서 늙힌다 — 대응 세션이 없으면 flush 훅 자체가 영원히 안 돌아
-# 만료 판정이 일어나지 않는다(peer 실측: scratchpad_plugin_ctrl 큐가 14일 생존하며
+# 만료 판정이 일어나지 않는다(둘째 기계 실측: scratchpad_plugin_ctrl 큐가 14일 생존하며
 # fallback 봇으로 가짜 알림을 계속 냈다). 새 스위퍼·기동 훅은 만들지 않는다.
 QUEUE_TTL_SEC=21600                                        # 6h. flush 훅과 같은 기준.
 QUARANTINE_DIR=~/.claude/state/orphan-queue-quarantine     # 활성 디렉토리 밖(스캔 대상 아님)
@@ -26,17 +29,29 @@ RECOVERY_LOG=~/.claude/state/rate-limit-queue/recovery.log
 # userbot 자동 재개: 큐 있는 세션 봇에 trigger:queue-flush 발송 → prompt-guard 가 큐 처리.
 USERBOT_SEND="$HOME/.local/bin/claude-userbot-send"
 USERBOT_SESSION="$HOME/.claude/userbot/userbot.session"
-# peer 처럼 유저봇이 없는 PC 는 relay.conf 의 USERBOT_HOST 로 home 에 ssh 위임.
+# 둘째 기계처럼 유저봇이 없는 PC 는 relay.conf 의 USERBOT_HOST 로 home 에 ssh 위임.
 RELAY_CONF="$HOME/.claude/userbot/relay.conf"
 
 [ -f "$CACHE" ] || exit 0
 
-# --- 모름 구간과 실측 프로브 (2026-08-30, ai-debate run-20260829T232742Z 결론 D) ---
+# --- 모름 구간 (2026-08-30, ai-debate run-20260829T232742Z 결론 D) ---
 UNKNOWN_SINCE=~/.claude/state/rate-limit-unknown-since
-PROBE_STATE=~/.claude/state/rate-limit-probe-next
-PROBE_MCP=~/.claude/state/rate-limit-probe-mcp.json
 UNKNOWN_ALERT_SEC=$((60 * 60))
-PROBE_BACKOFF_STEPS="600 1200 2400 3600"      # 10 → 20 → 40 → 60분, 60분에서 유지
+
+# 로그인 교체를 보는 두 갈래. 어느 하나만 걸려도 교체로 본다.
+#  · 계정 식별자가 바뀐다 — 이 기계에서 직접 로그인한 경우.
+#  · 로그인 적용 표시가 새로 찍힌다 — 통제 봇 릴레이로 로그인한 경우. 릴레이는 격리
+#    HOME 에서 로그인해 자격증명만 옮기므로 식별자는 한참 뒤에야 갱신된다.
+# 토큰 자동 갱신은 둘 다 안 건드린다 — 그래서 한 시간마다 헛발동하지 않는다.
+ACCOUNT_SEEN=~/.claude/state/rate-limit-account-seen
+LOGIN_APPLIED=~/.claude/state/rate-limit-login-applied
+LOGIN_SEEN=~/.claude/state/rate-limit-login-seen
+# 자동 교체가 자기가 바꿀 것임을 미리 적어 두는 자리. 사람이 손으로 갈아 끼우면 안 적힌다.
+# 여기 있는 교체는 세션을 안 깨운다 — 깨우기는 사람이 문을 연 뒤 이어가라는 신호이고,
+# 자동 교체는 사람이 아무것도 안 한 회차라 전 세션을 깨우면 밤새 열몇 세션이 같이 깬다.
+AUTO_SWITCH=~/.claude/state/rate-limit-auto-switch
+# 교체를 알아채는 데 한 회차(10분)가 걸릴 수 있어 그보다 넉넉히 잡는다.
+AUTO_SWITCH_WINDOW=900
 
 log_line() {
     mkdir -p "$(dirname "$RECOVERY_LOG")"
@@ -59,9 +74,9 @@ note_unknown_with_queue() {
     if [ -f "$env_file" ]; then
         # shellcheck disable=SC1090
         . "$env_file"
-        if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+        if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "$CHAT_ID" ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+                --data-urlencode "chat_id=$CHAT_ID" \
                 --data-urlencode "text=[$(hostname)] 한도 상태를 $((( now - first ) / 60))분째 모른 채 큐가 남아 있다. 사용량 캐시가 낡아 수치를 못 믿고, 실측 호출도 아직 성공하지 못했다. 스스로 못 풀면 사람이 볼 자리다. 로그: ${RECOVERY_LOG}" \
                 >/dev/null 2>&1
             touch "${UNKNOWN_SINCE}.alerted"
@@ -70,40 +85,18 @@ note_unknown_with_queue() {
     log_line "unknown-with-queue $(((now - first) / 60))분 — 사람에게 알림"
 }
 
-# 낡은 수치로는 해제를 확정할 수 없다. 계정이 실제로 응답하는지 한 번 찔러본다.
-# 성공(rc=0 + 비어있지 않은 응답)만 해제의 양성 증거다. 429·인증오류·타임아웃·빈
-# 응답은 전부 실패로 본다. 실패하면 10→20→40→60분으로 늘리며 재시도한다.
-probe_release() {
-    local now next step rc out
-    now=$(date +%s)
-    next=0; step=0
-    if [ -f "$PROBE_STATE" ]; then
-        next=$(cut -d' ' -f1 "$PROBE_STATE" 2>/dev/null || echo 0)
-        step=$(cut -d' ' -f2 "$PROBE_STATE" 2>/dev/null || echo 0)
-    fi
-    [ "$now" -lt "$next" ] 2>/dev/null && return 1     # 백오프 중
-    local cli="$HOME/.local/bin/claude"
-    [ -x "$cli" ] || { log_line "probe 건너뜀 — claude 없음"; return 1; }
-    # 부모 세션 MCP 를 안 건드리는 격리 호출(빈 mcp 강제). 도구를 안 쓰는 한 줄 질의다.
-    echo '{"mcpServers":{}}' > "$PROBE_MCP"
-    out=$(cd "$HOME" && CLAUDE_AUTOMATED=1 timeout 120 "$cli" \
-        --strict-mcp-config --mcp-config "$PROBE_MCP" -p "pong" 2>/dev/null)
-    rc=$?
-    if [ "$rc" -eq 0 ] && [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
-        rm -f "$PROBE_STATE"
-        log_line "probe 성공 — 해제 확정(캐시는 $QUOTA_STATUS)"
-        return 0
-    fi
-    # 실패. 다음 시각을 뒤로 민다.
-    local i=0 wait=600
-    for s in $PROBE_BACKOFF_STEPS; do
-        [ "$i" -eq "$step" ] && wait="$s"
-        i=$((i + 1))
-    done
-    [ "$step" -lt 3 ] && step=$((step + 1))
-    echo "$((now + wait)) $step" > "$PROBE_STATE"
-    log_line "probe 실패 rc=$rc — $((wait / 60))분 뒤 재시도"
-    return 1
+# 낡은 수치로도 "아직 막혔나" 는 답할 수 있다. 사용률은 얼어붙지만 창의 리셋 시각은
+# 절대 시각이라 그대로 유효하기 때문이다 — 임계를 넘긴 창의 리셋이 아직 미래면 지금도
+# 막혀 있고, 리셋이 지났으면 그 창 기준으로는 풀렸다. 판정은 lib 한 벌(windows_blocked)
+# 에 있고 여기서는 관측이 내보낸 한 줄을 읽는다.
+#
+# 이 자리는 2026-10-31 까지 계정을 한 번 찔러보는 호출이었다. 그 호출은 해제를 못
+# 가린다 — 90퍼센트는 우리가 정한 예산 상한이지 계정의 거절선이 아니라서 95퍼센트에서도
+# 멀쩡히 성공한다. 그런데도 성공을 깨우기 조건으로 써서, 막혀 있는 세션을 되풀이해
+# 깨우고 그 세션이 다시 막혀 큐에 넣은 항목이 다음 회차를 떠받쳤다(10-30 bias 9회).
+# 운영자 지시로 리셋 시각 판정으로 갈았다.
+still_blocked_by_window() {
+    [ "${QUOTA_WINDOWS_BLOCKED:-false}" = "true" ]
 }
 
 # rate-limits 조회 — 판정 규칙은 lib 한 벌(claude-quota-observe)에 있다.
@@ -111,7 +104,7 @@ probe_release() {
 # 뒀고 셋 다 cached_at 을 안 봤다. 그 계산은 resets_at 이 지난 창만 0 으로 만드는데,
 # 얼어붙은 캐시의 7일 창은 리셋이 아직 미래라 얼어붙은 99% 가 그대로 살아남는다.
 # 그래서 한도가 실제로 풀린 뒤에도 CURRENTLY_BLOCKED 이 유지돼 큐가 안 비워졌다
-# (2026-08-28 옆 기계 6시간). ai-debate run-20260829T232742Z 결론 D.
+# (2026-08-28 둘째 기계 6시간). ai-debate run-20260829T232742Z 결론 D.
 OBSERVE="$(dirname "$(realpath "$0")")/claude-quota-observe"
 [ -x "$OBSERVE" ] || OBSERVE="$HOME/.local/bin/claude-quota-observe"
 eval "$("$OBSERVE" --sh 2>/dev/null)"
@@ -130,10 +123,377 @@ has_pending_queue() {
     return 1
 }
 
+# --- 계정 교체 때 전 세션 깨우기 (2026-10-21 운영자 지시) ---
+# 깨우기 신호(trigger:queue-flush)만 보내면 큐가 빈 세션에서는 prompt-guard 가 그 신호를
+# 조용히 버린다("빈 큐 trigger 무시"). 그래서 밀린 메시지가 있는 세션만 깨어났다.
+# 이제 교체 시점에 살아 있는 세션 유닛마다 합성 레코드 한 줄을 넣고, 아래 큐 루프가
+# 평소 경로(소유자 검증 → trigger 발송 → 재시도 backoff)로 그대로 내보낸다.
+# 이미 밀린 큐가 있는 세션은 건드리지 않는다 — 그쪽은 원래 깨어나고, 한 줄을 더하면
+# 사람이 보낸 메시지 뒤에 안내문이 끼어든다.
+WAKE_CAUSE="account-switch-wake"
+WAKE_PROMPT="계정이 교체돼 한도 수치가 초기화됐다. 하던 일이 남아 있으면 이어서 진행하고, 없으면 progress.md 의 Blockers 에서 다음 단계를 하나 골라 진행해라. 자동 깨우기이므로 텔레그램 답장은 알릴 것이 생겼을 때만 한다."
+
+# 이 PC 의 claude 세션 유닛 전체. 판별은 ExecStart 가 claude-service-exec 인 것 —
+# 통제 봇·헬퍼·타이머는 제외된다(claude-accounts 의 수집과 같은 기준).
+live_session_units() {
+    local u
+    systemctl --user list-unit-files 'claude-*.service' --state=enabled --no-legend 2>/dev/null \
+        | awk '{print $1}' \
+        | while read -r u; do
+            systemctl --user cat "$u" 2>/dev/null | grep -q 'ExecStart=.*claude-service-exec' && echo "$u"
+          done
+}
+
+# 큐에 살아있는 레코드가 없을 때만 깨우기 한 줄을 append. 있으면 1 로 끝낸다.
+# 호출자는 <proj>.lock 을 잡은 상태여야 한다(flush 훅과 같은 락).
+queue_append_wake() {
+    python3 - "$1" "$2" "$QUEUE_TTL_SEC" "$WAKE_CAUSE" "$WAKE_PROMPT" <<'PY'
+import hashlib, json, sys, time
+path, proj, ttl, cause, prompt = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
+now = int(time.time())
+live = 0
+try:
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(d, dict) or "prompt" not in d:
+                continue
+            ts = int(d.get("ts_unix") or 0)
+            if ts > 0 and now - ts <= ttl:
+                live += 1
+except OSError:
+    pass
+if live:
+    sys.exit(1)
+rec = {"id": "{}-{}".format(now, hashlib.sha1((proj + prompt).encode("utf-8")).hexdigest()[:8]),
+       "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "ts_unix": now, "project": proj,
+       "cause": cause, "state": "pending", "retry_count": 0, "prompt": prompt}
+with open(path, "a") as fh:
+    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+sys.exit(0)
+PY
+}
+
+# 큐에 살아있는 레코드가 전부 깨우기 한 줄뿐인가. 맞으면 0. 사람에게 보내는 알림을
+# 가르는 데 쓴다 — 깨우기만 넣고 세션마다 알림을 쏘면 교체 한 번에 알림이 세션 수만큼 간다.
+queue_is_wake_only() {
+    python3 - "$1" "$QUEUE_TTL_SEC" "$WAKE_CAUSE" <<'PY'
+import json, sys, time
+path, ttl, cause = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+now = int(time.time())
+live = other = 0
+try:
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(d, dict) or "prompt" not in d:
+                continue
+            ts = int(d.get("ts_unix") or 0)
+            if ts <= 0 or now - ts > ttl:
+                continue
+            live += 1
+            if d.get("cause") != cause:
+                other += 1
+except OSError:
+    sys.exit(1)
+sys.exit(0 if live and not other else 1)
+PY
+}
+
+# 살아 있는 세션 전부에 깨우기 한 줄을 넣는다. 넣은 수를 기록에 남긴다.
+enqueue_wake_all() {
+    local unit proj woke=0 skipped=0
+    mkdir -p "$QUEUE_DIR" 2>/dev/null || return 0
+    while read -r unit; do
+        [ -n "$unit" ] || continue
+        proj="${unit#claude-}"; proj="${proj%.service}"
+        [ -n "$proj" ] || continue
+        # flush 훅과 같은 락을 서브셸에서 잡는다. exec 로 잡으면 그 리다이렉션이
+        # 이 셸에 영구히 붙어서 뒤쪽 동작까지 바뀐다.
+        ( flock -w 2 -x 204 || exit 2
+          queue_append_wake "$QUEUE_DIR/${proj}.jsonl" "$proj"
+        ) 204>"$QUEUE_DIR/${proj}.lock"
+        case "$?" in
+            0) woke=$((woke + 1)) ;;
+            1) skipped=$((skipped + 1)) ;;
+        esac
+    done < <(live_session_units)
+    echo "$(date -Iseconds) action=wake-all woke=${woke} skipped=${skipped}" \
+        >> "$RECOVERY_LOG" 2>/dev/null
+}
+
+# 프로젝트별 재시도 상태(큐 signature + backoff + 차단기): $QUEUE_DIR/<proj>.recovery-state.json
+# signature 가 바뀌면(새 큐 내용) attempts 리셋 + 즉시 재시도. 같으면(이전 시도 실패,
+# 큐 그대로) next_due_at 전까지 조용히 skip, 실패 반복시 10/20/40/60분 backoff(상한 유지).
+# ai-debate run-20260709T012629Z action_steps 4-6.
+#
+# "큐가 그대로인가" 는 내용으로만 본다 — 항목 id 의 모음이다. 파일 크기와 수정 시각은
+# 쓰지 않는다. 재개 신호(autoresume-<proj>)는 도구가 막힐 때마다 새 시각으로 다시 쓰이는데,
+# 그러면 내용이 똑같은데도 매번 다른 큐로 보여서 backoff 가 매 tick 처음으로 되감긴다.
+# 그래서 10/20/40/60분이 한 번도 작동하지 못했다 — delta 가 2026-09-18~21 사흘 동안
+# 44회 깨워진 것이 이 결함이다(recovery.log, 판정 run-20260921T104121Z).
+recovery_queue_signature() {
+    python3 -c '
+import hashlib, json, sys
+qfile = sys.argv[1]
+ids = []
+try:
+    with open(qfile, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ids.append(str(json.loads(line).get("id") or line))
+            except Exception:
+                ids.append(line)
+except Exception:
+    print("")
+    sys.exit(0)
+digest = hashlib.sha256("\n".join(sorted(ids)).encode("utf-8")).hexdigest()[:16]
+print("{}:{}".format(len(ids), digest))
+' "$1"
+}
+
+recovery_state_due() {
+    # $1=state_file $2=signature → stdout "DUE" 또는 "WAIT"
+    python3 -c '
+import json, sys, time
+state_file, sig = sys.argv[1], sys.argv[2]
+try:
+    st = json.load(open(state_file))
+except Exception:
+    st = {}
+if st.get("signature") != sig:
+    print("DUE")
+else:
+    print("DUE" if time.time() >= st.get("next_due_at", 0) else "WAIT")
+' "$1" "$2"
+}
+
+# 차단기. backoff 는 간격만 늘릴 뿐 60분마다 영원히 깨운다 — 깨워도 소용없는 구간이면
+# 멈춰야 한다. 세는 것은 마커 재적재도 큐 서명 변화도 아니다. 둘 다 재차단의 증거가
+# 아니기 때문이다 — 마커는 프로젝트당 고정 id 라 몇 번 막혀도 하나이고, 프롬프트 가드는
+# 처리 전에 큐를 비운다. 세는 것은 "깨운 뒤 그 세션의 도구가 실제로 가드에 막혔다" 하나이고,
+# 그 사실은 rate-limit-guard.sh 가 깨우기 id 와 함께 이 파일에 적는다(같은 락).
+# 두 번 연속이면 자동 probe 와 깨우기를 멈추고 한 번 알린다.
+RECOVERY_BREAKER_LIMIT=2
+
+recovery_state_breaker() {
+    # $1=state_file → "TRIPPED" | "OPEN"
+    python3 -c '
+import json, sys
+try:
+    st = json.load(open(sys.argv[1]))
+except Exception:
+    st = {}
+limit = int(sys.argv[2])
+print("TRIPPED" if int(st.get("post_wake_block_count") or 0) >= limit else "OPEN")
+' "$1" "$RECOVERY_BREAKER_LIMIT"
+}
+
+# 깨울 프로젝트가 하나도 없으면 더 볼 것이 없다. 간격 늘리기와 차단기에 걸린 것까지
+# 여기서 거르므로, 뒤 단계는 실제로 깨울 후보가 있을 때만 돈다.
+recovery_any_due() {
+    local f proj state sig
+    [ -d "$QUEUE_DIR" ] || return 1
+    for f in "$QUEUE_DIR"/*.jsonl; do
+        case "$f" in *.flushed.jsonl) continue ;; esac
+        [ -f "$f" ] && [ -s "$f" ] || continue
+        proj=$(basename "$f" .jsonl)
+        state="$QUEUE_DIR/${proj}.recovery-state.json"
+        [ "$(recovery_state_breaker "$state")" = "TRIPPED" ] && continue
+        sig=$(recovery_queue_signature "$f")
+        [ "$(recovery_state_due "$state" "$sig")" = "DUE" ] && return 0
+    done
+    return 1
+}
+
+# 정상 재무장. 신선한 관측이 차단 아님을 말할 때만 부른다 — 그것이 낡은 수치와 무관하게
+# 해제를 말하는 유일한 신호다. 계정 식별자는 어디에도 기록되지 않아 자동 조건으로
+# 쓸 수 없다. 손으로 풀려면 그 프로젝트의 recovery-state.json 을 지우면 된다.
+#
+# $1=true 면 재시도 간격까지 처음으로 되돌린다. 차단에서 해제로 넘어가는 그 한 번에만
+# 준다 — 신선한 tick 마다 되돌리면 소비되지 않는 큐를 5분마다 영원히 다시 깨운다
+# (2026-07-09 에 고쳤던 그 사고다).
+recovery_rearm_all() {
+    local s reset_backoff="${1:-false}"
+    for s in "$QUEUE_DIR"/*.recovery-state.json; do
+        [ -f "$s" ] || continue
+        python3 -c '
+import json, os, sys
+p = sys.argv[1]
+try:
+    st = json.load(open(p))
+except Exception:
+    sys.exit(0)
+reset_backoff = sys.argv[2] == "true"
+touched = [k for k in ("post_wake_block_count", "last_counted_wake_id", "breaker",
+                       "alerted_at", "wake_id", "wake_sent_at") if k in st]
+if not touched and not (reset_backoff and (st.get("attempts") or st.get("next_due_at"))):
+    sys.exit(0)
+for k in touched:
+    st.pop(k, None)
+if reset_backoff:
+    st["attempts"] = 0
+    st["next_due_at"] = 0
+json.dump(st, open(p + ".tmp", "w"))
+os.replace(p + ".tmp", p)
+' "$s" "$reset_backoff" 2>/dev/null || true
+    done
+}
+
+# 차단기 만료. 차단기는 "깨웠더니 그 세션이 또 막혔다" 는 관측으로 서는데, 그 관측은 그때의
+# 5시간 창 안에서만 참이다. 창은 리셋이 지나면 반드시 열리므로 마지막 되튕김에서 5시간이
+# 지났으면 차단 근거가 만료된 것이다.
+#
+# 풀어 주지 않으면 영구 잠김이 된다. 푸는 조건이 신선한 관측 하나뿐인데(recovery_rearm_all 은
+# fresh 분기에서만 불린다), 세션들이 다 막혀 멈추면 캐시가 안 갱신돼 그 관측이 영영 안 온다 —
+# 막혀서 턴이 없고, 턴이 없어서 캐시가 안 갱신되고, 낡은 수치로 계속 막히는 그 순환이다.
+# 낡은 관측 경로는 2026-10-31 에 창의 리셋 시각 판정으로 그 순환을 끊었는데, 차단기 경로만
+# 그대로 남아 있었다. 그러면 사람이 상태 파일을 손으로 지워야 풀린다.
+RECOVERY_BREAKER_EXPIRY=18000   # 5시간 — 5시간 창의 최대 길이.
+
+recovery_breaker_expire() {
+    # $1=state_file $2=만료 초 → 실제로 풀었을 때만 rc=0
+    python3 -c '
+import json, os, sys, time
+p, ttl = sys.argv[1], float(sys.argv[2])
+try:
+    st = json.load(open(p))
+except Exception:
+    sys.exit(1)
+at = st.get("last_post_wake_block_at")
+# 시각이 없으면 풀지 않는다. 지금 코드에서는 세는 자리가 횟수와 시각을 같이 적으므로
+# 둘이 갈리지 않지만, 갈린 파일을 만나면 사람이 지우는 경로를 남겨 두는 쪽이 안전하다.
+if not isinstance(at, (int, float)) or time.time() - at < ttl:
+    sys.exit(1)
+for k in ("post_wake_block_count", "last_counted_wake_id", "breaker",
+          "alerted_at", "wake_id", "wake_sent_at"):
+    st.pop(k, None)
+json.dump(st, open(p + ".tmp", "w"))
+os.replace(p + ".tmp", p)
+' "$1" "$2" 2>/dev/null
+}
+
+recovery_expire_breakers() {
+    local s proj expired=""
+    [ -d "$QUEUE_DIR" ] || return 0
+    for s in "$QUEUE_DIR"/*.recovery-state.json; do
+        [ -f "$s" ] || continue
+        [ "$(recovery_state_breaker "$s")" = "TRIPPED" ] || continue
+        proj=$(basename "$s" .recovery-state.json)
+        if ( flock -x 202; recovery_breaker_expire "$s" "$RECOVERY_BREAKER_EXPIRY" ) 202>"$QUEUE_DIR/${proj}.lock"; then
+            expired="${expired}${proj} "
+            echo "$(date -Iseconds) proj=${proj} action=breaker-expired ttl=${RECOVERY_BREAKER_EXPIRY}" \
+                >> "$RECOVERY_LOG" 2>/dev/null
+        fi
+    done
+    [ -n "$expired" ] && log_line "차단기 만료 재무장 — ${expired}(마지막 되튕김에서 5시간 경과)"
+    return 0
+}
+
 WAS_BLOCKED=false
 [ -f "$STATE_FLAG" ] && WAS_BLOCKED=true
 
 mkdir -p "$(dirname "$STATE_FLAG")"
+
+# --- 로그인 교체 처리 (2026-09-22 운영자 요청) ---
+# 계정을 갈아끼우면 공유 캐시에 남은 수치는 남의 계정 것이다. 그동안 사람이 손으로
+# bypass 를 켜고 세션마다 "이제 써도 된다" 를 알려야 빠져나왔다 — 2026-09-20 14:43 의
+# 락업이 그 자리다. 계정 표시가 바뀐 그 한 번만 청소하고, 그 뒤로는 평소대로 돈다.
+# 처음 보는 경우(표시 파일이 아직 없음)는 교체가 아니라 첫 기록이다.
+ACCOUNT_SWITCHED=false
+if [ -n "${QUOTA_ACCOUNT_NOW:-}" ]; then
+    SEEN_ACCOUNT=""
+    [ -f "$ACCOUNT_SEEN" ] && SEEN_ACCOUNT=$(cat "$ACCOUNT_SEEN" 2>/dev/null)
+    if [ "$QUOTA_ACCOUNT_NOW" != "$SEEN_ACCOUNT" ]; then
+        printf '%s\n' "$QUOTA_ACCOUNT_NOW" > "$ACCOUNT_SEEN"
+        [ -n "$SEEN_ACCOUNT" ] && ACCOUNT_SWITCHED=true
+    fi
+fi
+# 로그인 적용 표시는 로그인 그 자체에만 찍힌다 — 처음 보이는 것도 사건이다.
+if [ -f "$LOGIN_APPLIED" ]; then
+    APPLIED_AT=$(cat "$LOGIN_APPLIED" 2>/dev/null)
+    SEEN_AT=""
+    [ -f "$LOGIN_SEEN" ] && SEEN_AT=$(cat "$LOGIN_SEEN" 2>/dev/null)
+    if [ -n "$APPLIED_AT" ] && [ "$APPLIED_AT" != "$SEEN_AT" ]; then
+        printf '%s\n' "$APPLIED_AT" > "$LOGIN_SEEN"
+        ACCOUNT_SWITCHED=true
+    fi
+fi
+
+if [ "$ACCOUNT_SWITCHED" = true ]; then
+    # 남의 계정 수치를 캐시에서 들어낸다. 남겨두면 다음 tick 이 그걸 근거로 다시 막는다.
+    python3 - "$CACHE" <<'PY' 2>/dev/null || true
+import json, os, sys
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+d.pop("rate_limits", None)
+json.dump(d, open(p + ".tmp", "w"))
+os.replace(p + ".tmp", p)
+PY
+    # 로그인보다 나중에 켠 bypass 는 남긴다. 사람이 로그인하고 나서도 안 풀려서 손으로
+    # 연 문이라는 뜻이고, 그걸 로그인 표시 하나로 닫으면 방금 연 문을 곧바로 잠근다.
+    # 2026-09-29 12:23 에 실제로 그랬다. 로그인보다 먼저 켠 것만 지운다 — 그건 이전
+    # 차단 구간을 넘기려고 켠 것이고 이번 초기화로 쓸모가 없어졌다.
+    SWITCH_SINCE=""
+    [ -f "$LOGIN_APPLIED" ] && SWITCH_SINCE=$(cat "$LOGIN_APPLIED" 2>/dev/null)
+    for bf in ~/.claude/state/rate-limit-bypass.flag ~/.claude/state/rate-limit-bypass-*.flag; do
+        [ -f "$bf" ] || continue
+        if [ -n "$SWITCH_SINCE" ]; then
+            BF_AT=$(stat -c %Y "$bf" 2>/dev/null || echo 0)
+            if [ "$BF_AT" -gt "$SWITCH_SINCE" ] 2>/dev/null; then
+                SWITCH_KEPT="${SWITCH_KEPT:-}$(basename "$bf") "
+                continue
+            fi
+        fi
+        rm -f "$bf"
+        SWITCH_CLEARED="${SWITCH_CLEARED:-}$(basename "$bf") "
+    done
+    rm -f "$UNKNOWN_SINCE" "${UNKNOWN_SINCE}.alerted"
+    recovery_rearm_all true          # 간격도 차단기도 처음으로.
+    # 깨우기는 사람 손 교체에만 보낸다(운영자 지시). 자동 교체가 자기 표식을
+    # 남겼고 그게 신선하면 건너뛴다 — 표식은 한 번 쓰고 지워서 다음 교체에 안 샌다.
+    AUTO_SWITCH_HIT=false
+    if [ -f "$AUTO_SWITCH" ]; then
+        AUTO_AT=$(stat -c %Y "$AUTO_SWITCH" 2>/dev/null || echo 0)
+        NOW_AT=$(date +%s)
+        if [ $((NOW_AT - AUTO_AT)) -le "$AUTO_SWITCH_WINDOW" ] 2>/dev/null; then
+            AUTO_SWITCH_HIT=true
+        fi
+        rm -f "$AUTO_SWITCH"
+    fi
+    if [ "$AUTO_SWITCH_HIT" = true ]; then
+        log_line "계정 교체 감지(자동) — 한도 수치 초기화, bypass 해제(${SWITCH_CLEARED:-없음}) 유지(${SWITCH_KEPT:-없음}), 재개 대기열 재무장, 깨우기 건너뜀"
+    else
+        enqueue_wake_all             # 큐가 빈 세션까지 전부 깨운다(운영자 지시).
+        log_line "계정 교체 감지 — 한도 수치 초기화, bypass 해제(${SWITCH_CLEARED:-없음}) 유지(${SWITCH_KEPT:-없음}), 재개 대기열 재무장"
+    fi
+    # 이 tick 은 해제 전환으로 취급한다 — 큐에 남은 세션을 깨우고 한 번 알린다.
+    QUOTA_BLOCKED=false
+    QUOTA_STATUS=other-account
+    PCT_5H=-1
+    PCT_7D=-1
+    WAS_BLOCKED=true
+fi
 
 # 신선한 관측이 임계를 넘었다 = 확실히 차단이다.
 if [ "$QUOTA_BLOCKED" = "true" ]; then
@@ -142,23 +502,36 @@ if [ "$QUOTA_BLOCKED" = "true" ]; then
     exit 0
 fi
 
-# 관측이 신선하지 않다 = 모른다. 낡은 수치는 차단의 근거도 해제의 근거도 아니다.
-# 큐가 없으면 해제를 확정할 이유가 없으니 그냥 둔다(플래그 보존).
-# 큐가 있으면 누군가 막혀 있었다는 뜻이고, 그건 스스로 못 빠져나오는 순환이다
-# (막혀서 턴이 없고 → 턴이 없어서 캐시가 안 갱신되고 → 낡은 수치로 계속 막힌다).
-# 그때만 격리 헤드리스 호출로 실측해서 해제를 확정한다.
-if [ "$QUOTA_STATUS" != "fresh" ]; then
+# 관측이 신선하지 않다 = 사용률은 모른다. 큐가 없으면 해제를 확정할 이유가 없으니
+# 그냥 둔다(플래그 보존). 큐가 있으면 누군가 막혀 있었다는 뜻이고, 그건 스스로 못
+# 빠져나오는 순환이다(막혀서 턴이 없고 → 턴이 없어서 캐시가 안 갱신되고 → 낡은
+# 수치로 계속 막힌다). 그때 창의 리셋 시각으로 아직 막혔는지를 가른다.
+if [ "$ACCOUNT_SWITCHED" = true ]; then
+    # 사람이 방금 로그인을 갈아끼웠다. 창을 볼 이유가 없다 — 해제 신호가 이미 사람이다.
+    has_pending_queue || exit 0
+elif [ "$QUOTA_STATUS" != "fresh" ]; then
     has_pending_queue || exit 0
     note_unknown_with_queue
-    probe_release || exit 0
+    if still_blocked_by_window; then
+        log_line "깨우기 보류 — ${QUOTA_WINDOWS_WHY:-창 판정} (캐시는 $QUOTA_STATUS)"
+        exit 0
+    fi
+    # 창이 열려 있다. 차단기가 선 근거는 그때 창 안의 관측이라 지금은 만료됐다.
+    # 창 판정 뒤에 두는 것이 핵심이다 — 앞에 두면 아직 막힌 구간에서도 풀어 버린다.
+    recovery_expire_breakers
+    # 깨울 차례인 프로젝트가 없거나 아직 차단기에 걸렸으면 여기서 끝낸다.
+    recovery_any_due || exit 0
+else
+    # 신선한 관측이 차단 아님을 말한다. 낡은 수치와 무관한 유일한 해제 신호다.
+    rm -f "$UNKNOWN_SINCE" "${UNKNOWN_SINCE}.alerted"
+    recovery_rearm_all "$WAS_BLOCKED"
 fi
-rm -f "$UNKNOWN_SINCE" "${UNKNOWN_SINCE}.alerted"
 
 # 현재 안 차단됨. 이전에도 안 차단됐으면 보통 할 일 없음 — 단, 잔여 큐가 있으면
 # (이전 flush 시도가 실패/미소비된 경우) trigger_flush만 조용히 재시도한다.
 # 알림 발송·bypass flag 자동정리는 아래에서 전환 tick(IS_RETRY_ONLY=false)에서만 실행.
 # (2026-07-09: 전환 순간 1회만 시도하고 실패하면 영영 재시도 안 하던 버그 수정 —
-#  peer-dotfiles 큐 8개가 이걸로 stuck됐던 사고. peer 쪽 session-a 사고의 자체
+#  <호스트>-dotfiles 큐 8개가 이걸로 stuck됐던 사고. 둘째 기계 쪽 alpha 사고의 자체
 #  ai-debate run-20260709T012629Z 도 동일 결론 — level-triggered 재시도 + per-project
 #  cooldown/backoff로 전환.)
 IS_RETRY_ONLY=false
@@ -190,12 +563,12 @@ fi
 
 # 프로젝트의 telegram .env 경로를 fallback 없이 해석. 못 찾으면 빈 문자열.
 # trigger 발송처럼 "틀리면 남의 봇으로 오배송"되는 경로는 반드시 이걸 써야 한다
-# (peer 실측 발견: FALLBACK_TELEGRAM_ENV 로 떨어져 leg_imu_learned_estimator 의
-#  trigger 가 peer-dotfiles 자기 봇으로 새던 실회귀, 2026-07-09 — fail-closed 원칙
+# (둘째 기계 실측 발견: FALLBACK_TELEGRAM_ENV 로 떨어져 leg_imu_learned_estimator 의
+#  trigger 가 <호스트>-dotfiles 자기 봇으로 새던 실회귀, 2026-07-09 — fail-closed 원칙
 #  위반이었음).
 resolve_env_file_strict() {
     # fail-closed 라우팅 해석. 신뢰 원천은 세션 자신의 systemd WorkingDirectory 하나뿐.
-    # 큐의 .cwd 는 stale·교차오염될 수 있어(실측: peer.cwd 가 session-a 하위를 가리킴) 라우팅
+    # 큐의 .cwd 는 stale·교차오염될 수 있어(실측: 둘째 기계의 .cwd 가 alpha 하위를 가리킴) 라우팅
     # 근거로 신뢰하지 않는다 — cwd 부모탐색으로 남의 세션 트리 .env 를 주우면 오배송이 된다.
     # proj(=큐 키=세션명) → claude-<proj>.service 의 WorkingDirectory 에 있는 .env 만 채택.
     # WD 없음/= $HOME/파일없음/symlink 탈출은 전부 빈값(스킵). 이름추측 fallback(~/proj 등) 제거.
@@ -314,11 +687,35 @@ try:
 except: sys.exit(1)' ) 2>/dev/null
 }
 
+# 한 회차에 깨우기가 여러 세션으로 나갈 때 전부 같은 초에 들어가면 그 순간 열몇 세션이
+# 같이 깨어나 같은 계정을 동시에 두드린다. 첫 발송은 그대로 보내고 둘째부터 무작위 초를
+# 끼워 흩는다 — 혼자뿐인 회차는 하나도 안 느려진다.
+#
+# 총 대기에 상한을 두는 이유: 이 유닛은 10분 타이머가 부른다. 세션당 상한만 두면 세션이
+# 늘어날수록 한 회차가 길어져 다음 발화와 겹친다. 상한에 닿으면 그 뒤로는 안 잰다 —
+# 흩는 것을 조금 덜 하는 쪽이 회차가 겹치는 것보다 싸다.
+FLUSH_JITTER_MAX=${CLAUDE_FLUSH_JITTER_MAX:-20}
+FLUSH_JITTER_BUDGET=${CLAUDE_FLUSH_JITTER_BUDGET:-120}
+FLUSH_SENT=0
+FLUSH_SLEPT=0
+
+flush_jitter() {
+    [ "$FLUSH_SENT" -gt 0 ] || return 0
+    [ "$FLUSH_JITTER_MAX" -gt 0 ] || return 0
+    [ "$FLUSH_SLEPT" -lt "$FLUSH_JITTER_BUDGET" ] || return 0
+    local s=$((RANDOM % (FLUSH_JITTER_MAX + 1)))
+    [ "$s" -gt 0 ] || return 0
+    sleep "$s"
+    FLUSH_SLEPT=$((FLUSH_SLEPT + s))
+    echo "$(date -Iseconds) action=flush-jitter sec=${s} total=${FLUSH_SLEPT}" \
+        >> "$RECOVERY_LOG" 2>/dev/null
+}
+
 # 큐 자동 재개 trigger 발송. 성공 0, 실패 1.
 # 세션 이름이 아니라 그 PC 가 자기 .env 에서 알아낸 봇 @username 으로 보냄
-# → home/peer 세션 이름 충돌(둘 다 'dotfiles') 원천 차단.
+# → 두 기계의 세션 이름 충돌(둘 다 'dotfiles') 원천 차단.
 # 1) 로컬 유저봇 (home) → claude-userbot-send <@bot> 직접.
-# 2) 유저봇 없는 PC (peer) → relay.conf USERBOT_HOST 로 home 유저봇에 ssh 위임.
+# 2) 유저봇 없는 PC (둘째 기계) → relay.conf USERBOT_HOST 로 home 유저봇에 ssh 위임.
 trigger_flush() {
     local env_file="$1" botuser=""
     botuser=$(resolve_bot_username "$env_file")
@@ -347,54 +744,118 @@ send_project_alert() {
     local proj="$1" env_file="$2" qcount="$3" triggered="${4:-false}"
     [ -f "$env_file" ] || return 0
     ( . "$env_file"
-      if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-          local bypass_note=""
+      if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "$CHAT_ID" ]; then
+          local bypass_note="" head="rate-limit 해제 (5h ${PCT_5H}%, 7d ${PCT_7D}%)"
           [ -n "$CLEARED_BYPASS" ] && bypass_note=" (bypass flag 자동 해제: ${CLEARED_BYPASS})"
+          if [ "$ACCOUNT_SWITCHED" = true ]; then
+              # 수치가 아직 없다 — 새 계정의 첫 렌더가 채운다. 수치 자리에 -1 을 쓰지 않는다.
+              head="계정 교체 감지 — 한도 수치 초기화"
+              bypass_note=" (bypass flag 자동 해제: ${SWITCH_CLEARED:-없음})"
+          fi
           if [ "$qcount" -gt 0 ] && [ "$triggered" = true ]; then
-              msg="rate-limit 해제 (5h ${PCT_5H}%, 7d ${PCT_7D}%)${bypass_note}. 큐 ${qcount}개 자동 재개 중 (유저봇 trigger 발송)."
+              msg="${head}${bypass_note}. 큐 ${qcount}개 자동 재개 중 (유저봇 trigger 발송)."
           elif [ "$qcount" -gt 0 ]; then
-              msg="rate-limit 해제 (5h ${PCT_5H}%, 7d ${PCT_7D}%)${bypass_note}. 큐 ${qcount}개 대기. 아무 메시지나 보내면 자동 처리됨."
+              msg="${head}${bypass_note}. 큐 ${qcount}개 대기. 아무 메시지나 보내면 자동 처리됨."
           else
-              msg="rate-limit 해제 (5h ${PCT_5H}%, 7d ${PCT_7D}%)${bypass_note}. 큐 비어있음."
+              msg="${head}${bypass_note}. 큐 비어있음."
           fi
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+              --data-urlencode "chat_id=$CHAT_ID" \
               --data-urlencode "text=${msg}" >/dev/null 2>&1
       fi
     )
 }
 
-# 프로젝트별 재시도 상태(큐 signature + backoff): $QUEUE_DIR/<proj>.recovery-state.json
-# signature 가 바뀌면(새 큐 내용) attempts 리셋 + 즉시 재시도. 같으면(이전 시도 실패,
-# 큐 그대로) next_due_at 전까지 조용히 skip, 실패 반복시 10/20/40/60분 backoff(상한 유지,
-# 완전 중단은 안 함). ai-debate run-20260709T012629Z action_steps 4-6.
-recovery_queue_signature() {
+# 차단기를 세우고 알렸다고 표시한다. 처음 세우는 순간에만 0 을 내서, 알림이 한 번만
+# 나가게 한다. 이미 세워져 있으면 1 — 조용히 멈춰 있는다.
+# 깨운 뒤 그 세션이 또 막혀 큐에 새 항목을 넣었으면 아직 막힌 것이다. 그 사실을
+# 차단기 칸에 센다 — 깨우기 하나당 한 번만.
+#
+# 이 칸은 rate-limit-guard.sh 가 적게 돼 있었는데 한 번도 안 세었다(2026-10-31 실측:
+# 상태 파일 전부에 칸 자체가 없었다). 깨우기 이름표가 다음 회차 재무장에 지워져서,
+# 세션이 깨어나 도구를 돌릴 때쯤이면 셀 근거가 사라져 있었다. 그래서 가드 훅을
+# 기다리지 않고 복구기가 큐를 직접 읽는다 — 깨우기와 같은 파일, 같은 락이다.
+recovery_count_rebound() {
+    # $1=queue_file $2=state_file
     python3 -c '
-import os, sys
-qfile = sys.argv[1]
+import datetime, json, os, sys, time
+qf, p = sys.argv[1], sys.argv[2]
 try:
-    st = os.stat(qfile)
-    n = sum(1 for _ in open(qfile))
-    print("{}:{}:{}".format(st.st_size, int(st.st_mtime), n))
+    st = json.load(open(p))
 except Exception:
-    print("")
+    sys.exit(0)
+wid, sent = st.get("wake_id"), st.get("wake_sent_at") or 0
+if not wid or not sent or st.get("last_counted_wake_id") == wid:
+    sys.exit(0)
+hit = False
+try:
+    fh = open(qf, encoding="utf-8", errors="replace")
+except Exception:
+    sys.exit(0)
+with fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("cause") != "rate_limit_blocked":
+            continue
+        # 시각은 ts_unix 를 먼저 본다. 글자 시각은 쓰는 쪽마다 형식이 갈려서 — 가드 훅은
+        # "+09:00" 로, 이 스크립트의 합성 레코드는 "+0900" 으로 적는다 — 파이썬 3.8 의
+        # fromisoformat 이 뒤쪽을 거절한다. 거기 기대면 형식이 한 번 갈리는 순간 세기가
+        # 조용히 꺼지는데, 그게 지금 고치는 바로 그 실패 모양이다.
+        at = rec.get("ts_unix")
+        if not isinstance(at, (int, float)):
+            try:
+                at = datetime.datetime.fromisoformat(rec.get("ts") or "").timestamp()
+            except Exception:
+                continue
+        if at >= sent:
+            hit = True
+            break
+if not hit:
+    sys.exit(0)
+st["post_wake_block_count"] = int(st.get("post_wake_block_count") or 0) + 1
+st["last_counted_wake_id"] = wid
+st["last_post_wake_block_at"] = time.time()
+json.dump(st, open(p + ".tmp", "w"))
+os.replace(p + ".tmp", p)
+print(st["post_wake_block_count"])
+' "$1" "$2" 2>/dev/null
+}
+
+recovery_breaker_mark() {
+    python3 -c '
+import json, os, sys, time
+p = sys.argv[1]
+try:
+    st = json.load(open(p))
+except Exception:
+    st = {}
+if st.get("alerted_at"):
+    sys.exit(1)
+st["breaker"] = True
+st["alerted_at"] = time.time()
+json.dump(st, open(p + ".tmp", "w"))
+os.replace(p + ".tmp", p)
 ' "$1"
 }
 
-recovery_state_due() {
-    # $1=state_file $2=signature → stdout "DUE" 또는 "WAIT"
-    python3 -c '
-import json, sys, time
-state_file, sig = sys.argv[1], sys.argv[2]
-try:
-    st = json.load(open(state_file))
-except Exception:
-    st = {}
-if st.get("signature") != sig:
-    print("DUE")
-else:
-    print("DUE" if time.time() >= st.get("next_due_at", 0) else "WAIT")
-' "$1" "$2"
+# 차단기가 선 것은 사람이 봐야 하는 자리다. 자동 복구가 스스로 포기했다는 뜻이라서다.
+send_breaker_alert() {
+    local proj="$1" env_file="$2" qcount="$3"
+    [ -f "$env_file" ] || return 0
+    ( . "$env_file"
+      [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || exit 0
+      [ -n "$CHAT_ID" ] || exit 0
+      msg="[${proj}] 자동 재개를 멈춘다. 깨운 뒤 그 세션의 도구가 또 한도 가드에 막힌 것이 두 번 연속 확인됐다 — 더 깨워도 같은 일이 반복되고 계정만 쓴다. 큐 ${qcount}개는 그대로 남겨둔다. 한도가 실제로 풀려 신선한 수치가 잡히면 자동으로 다시 돈다. 그 전에 손으로 풀려면 ${QUEUE_DIR}/${proj}.recovery-state.json 파일을 지우면 된다."
+      curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          --data-urlencode "chat_id=$CHAT_ID" \
+          --data-urlencode "text=${msg}" >/dev/null 2>&1
+    )
 }
 
 recovery_state_record() {
@@ -402,9 +863,9 @@ recovery_state_record() {
     # backoff 은 "trigger_flush 가 성공했는가"가 아니라 "큐 내용이 그대로인가"로 결정한다.
     # send 는 성공해도 대상 세션이 죽어있으면 아무도 소비 안 해 signature 가 그대로임 —
     # 그 경우 success=true 로 매번 attempts 리셋하면 영원히 5분마다 재발송(수렴 안 함).
-    # (peer 실측검증 run-20260709 발견 갭 수정 — 2026-07-09.)
+    # (둘째 기계 실측검증 run-20260709 발견 갭 수정 — 2026-07-09.)
     python3 -c '
-import json, sys, time
+import json, os, sys, time
 state_file, sig, success, err = sys.argv[1], sys.argv[2], sys.argv[3] == "true", sys.argv[4]
 try:
     st = json.load(open(state_file))
@@ -418,9 +879,26 @@ if same_content:
 else:
     attempts = 0
     next_due = 0
-json.dump({"signature": sig, "attempts": attempts, "next_due_at": next_due,
-           "last_exit_code": 0 if success else 1, "last_error": err,
-           "last_trigger_at": time.time()}, open(state_file, "w"))
+out = {"signature": sig, "attempts": attempts, "next_due_at": next_due,
+       "last_exit_code": 0 if success else 1, "last_error": err,
+       "last_trigger_at": time.time()}
+# 차단기 칸은 내용이 그대로일 때만 이어간다. 큐 내용이 바뀌었다는 것은 사람이 새로
+# 무언가를 넣었다는 뜻이고, 그건 재무장 신호다 — 차단기가 새 요청을 삼키면 안 된다.
+if same_content:
+    for k in ("post_wake_block_count", "last_counted_wake_id", "breaker", "alerted_at"):
+        if k in st:
+            out[k] = st[k]
+if success:
+    # 깨우기 하나를 가리키는 이름표. 가드가 이 이름표로 "이 깨우기 뒤에 또 막혔다" 를
+    # 한 번만 센다. 이름표가 없으면 깨우기 전에 막힌 것과 구분이 안 된다.
+    out["wake_id"] = "{}-{}".format(int(time.time()), os.urandom(4).hex())
+    out["wake_sent_at"] = time.time()
+else:
+    for k in ("wake_id", "wake_sent_at"):
+        if k in st:
+            out[k] = st[k]
+json.dump(out, open(state_file + ".tmp", "w"))
+os.replace(state_file + ".tmp", state_file)
 ' "$1" "$2" "$3" "$4"
 }
 
@@ -470,7 +948,7 @@ if [ -d "$QUEUE_DIR" ]; then
         fi
         if [ "$OWNER" = "no-unit" ]; then
             # 대응 세션 유닛이 아예 없다 = 진짜 고아. fallback 봇으로 알리지 않고 격리한다.
-            # (이게 peer scratchpad_plugin_ctrl 이 14일간 가짜 알림을 낸 경로다.)
+            # (이게 둘째 기계의 scratchpad_plugin_ctrl 이 14일간 가짜 알림을 낸 경로다.)
             quarantine_queue "$proj" "no-owner-unit(live=${n})"
             flock -u 201 2>/dev/null || true; exec 201>&- 2>/dev/null || true
             continue
@@ -488,6 +966,23 @@ if [ -d "$QUEUE_DIR" ]; then
 
         if [ "$n" -gt 0 ]; then
             STATE_FILE="$QUEUE_DIR/${proj}.recovery-state.json"
+            # 차단기를 보기 전에 센다 — 이번 되튕김이 바로 그 두 번째일 수 있다.
+            exec 202>"$QUEUE_DIR/${proj}.lock"
+            REBOUND=$(flock -x 202; recovery_count_rebound "$f" "$STATE_FILE")
+            exec 202>&-
+            if [ -n "$REBOUND" ]; then
+                echo "$(date -Iseconds) proj=${proj} action=post-wake-block count=${REBOUND}" \
+                    >> "$RECOVERY_LOG" 2>/dev/null
+            fi
+            if [ "$(recovery_state_breaker "$STATE_FILE")" = "TRIPPED" ]; then
+                # 깨운 뒤 또 막힌 것이 두 번 연속 확인됐다. 깨우기를 멈추고 한 번만 알린다.
+                if ( flock -x 202; recovery_breaker_mark "$STATE_FILE" ) 202>"$QUEUE_DIR/${proj}.lock"; then
+                    send_breaker_alert "$proj" "$(resolve_env_file "$proj" "$cwd")" "$n"
+                    echo "$(date -Iseconds) proj=${proj} action=breaker-tripped queue=${n}" \
+                        >> "$RECOVERY_LOG" 2>/dev/null
+                fi
+                continue
+            fi
             SIG=$(recovery_queue_signature "$f")
             DUE=$(recovery_state_due "$STATE_FILE" "$SIG")
             if [ "$DUE" != "DUE" ]; then
@@ -501,16 +996,27 @@ if [ -d "$QUEUE_DIR" ]; then
             ERRMSG=""
             if [ -z "$strict_env_file" ]; then
                 ERRMSG="env 매핑 실패(프로젝트 전용 .env 없음 — trigger 스킵, 오배송 방지)"
-            elif trigger_flush "$strict_env_file"; then
-                TRIGGERED=true
             else
-                ERRMSG="trigger_flush 실패(username 매핑누락 또는 userbot/ssh 전송실패)"
+                flush_jitter
+                FLUSH_SENT=$((FLUSH_SENT + 1))
+                if trigger_flush "$strict_env_file"; then
+                    TRIGGERED=true
+                else
+                    ERRMSG="trigger_flush 실패(username 매핑누락 또는 userbot/ssh 전송실패)"
+                fi
             fi
-            recovery_state_record "$STATE_FILE" "$SIG" "$TRIGGERED" "$ERRMSG"
+            # 가드 훅도 같은 파일에 재차단을 적는다 — 같은 락 안에서 쓴다.
+            ( flock -x 202; recovery_state_record "$STATE_FILE" "$SIG" "$TRIGGERED" "$ERRMSG" ) 202>"$QUEUE_DIR/${proj}.lock"
             echo "$(date -Iseconds) proj=${proj} queue=${n} triggered=${TRIGGERED} sig=${SIG} err=${ERRMSG:-none}" >> "$RECOVERY_LOG" 2>/dev/null
             if [ "$IS_RETRY_ONLY" = false ]; then
-                send_project_alert "$proj" "$env_file" "$n" "$TRIGGERED"
-                NOTIFIED=true
+                # 깨우기 한 줄만 들어 있는 큐는 사람에게 안 알린다 — 세션 수만큼 같은
+                # 알림이 가는 것을 막는다. 깨운 사실은 recovery.log 에 남는다.
+                if queue_is_wake_only "$f"; then
+                    NOTIFIED=true
+                else
+                    send_project_alert "$proj" "$env_file" "$n" "$TRIGGERED"
+                    NOTIFIED=true
+                fi
             fi
         fi
     done
@@ -521,17 +1027,17 @@ fi
 CONTROL_BOT_ENV=~/.claude/control-bot/.env
 if [ "$NOTIFIED" = false ] && [ "$IS_RETRY_ONLY" = false ] && [ -f "$CONTROL_BOT_ENV" ]; then
     . "$CONTROL_BOT_ENV"
-    if [ -n "${CONTROL_BOT_TOKEN:-}" ]; then
+    if [ -n "${CONTROL_BOT_TOKEN:-}" ] && [ -n "$CHAT_ID" ]; then
         msg="rate-limit 해제 (5h ${PCT_5H}%, 7d ${PCT_7D}%). 큐 비어있음."
         curl -s -X POST "https://api.telegram.org/bot${CONTROL_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+            --data-urlencode "chat_id=$CHAT_ID" \
             --data-urlencode "text=${msg}" >/dev/null 2>&1
     fi
 fi
 
 # userbot 자동 재개는 위 큐 루프의 trigger_flush() 로 처리됨 (2026-06-02).
 # - home: claude-userbot-send --session <proj> "trigger:queue-flush" 직접.
-# - peer: relay.conf USERBOT_HOST 로 home 에 ssh 위임.
+# - 둘째 기계: relay.conf USERBOT_HOST 로 home 에 ssh 위임.
 # trigger 실패 시(유저봇 미설치/세션 만료) 기존 폴백 — 사용자 다음 메시지가 트리거.
 
 exit 0

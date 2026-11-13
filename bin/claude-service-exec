@@ -99,7 +99,7 @@ fi
 
 # exec script with pty (claude --remote-control requires tty)
 if [ "$has_jsonl" = "1" ]; then
-    exec script -q -c "claude -c${model_arg} --remote-control --channels plugin:telegram@claude-plugins-official" /dev/null < /dev/null
+    exec script -q -c "claude -c${model_arg} --permission-mode default --remote-control --channels plugin:telegram@claude-plugins-official" /dev/null < /dev/null
 else
-    exec script -q -c "claude${model_arg} --remote-control --channels plugin:telegram@claude-plugins-official" /dev/null < /dev/null
+    exec script -q -c "claude${model_arg} --permission-mode default --remote-control --channels plugin:telegram@claude-plugins-official" /dev/null < /dev/null
 fi

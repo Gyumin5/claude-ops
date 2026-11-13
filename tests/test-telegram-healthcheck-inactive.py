@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """정지된 세션에는 inbound 적체 경보를 내지 않는다.
 
-왜 있나: 2026-09-15 옆 기계에서 운영자가 일부러 정지시켜 둔 네 세션(session-a·
-session-g·session-h·session-f)이 같은 분에 '151분째 안 빠짐' 으로 한꺼번에
+왜 있나: 2026-09-15 둘째 기계에서 운영자가 일부러 정지시켜 둔 네 세션(alpha·
+raise-camera·raise-leg·raise-lidar)이 같은 분에 '151분째 안 빠짐' 으로 한꺼번에
 울렸고, 쿨다운이 한 시간이라 매시간 네 건씩 반복됐다.
 
 원인은 감지 실패가 아니라 구조적 오탐이다. 유닛 목록이 --all 이라 dead 유닛까지
@@ -37,9 +37,20 @@ def check(name, cond, detail: object = ""):
           (("\n      " + str(detail)) if detail and not cond else ""))
 
 
+def _plant_chat_id(home):
+    """방 번호는 추적 밖 설정에서 읽는다. 가짜 HOME 에 그 파일을 세워 실제 읽는 길을
+    그대로 지나가게 한다 — 없으면 모듈이 import 자리에서 거절하고 죽는다.
+    진짜 방 번호는 안 쓴다(지어낸 값이면 통로 판정에 충분하다)."""
+    d = os.path.join(home, ".config", "dotfiles-private")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "telegram.json"), "w", encoding="utf-8") as f:
+        f.write('{"operator_chat_id": "1234509876"}\n')
+
+
 def load(home):
     """HOME 을 갈아끼운 뒤 새로 읽는다 — 상태 경로가 import 시점에 굳는다."""
     os.environ["HOME"] = home
+    _plant_chat_id(home)
     loader = importlib.machinery.SourceFileLoader("tghc", str(SCRIPT))
     spec = importlib.util.spec_from_loader("tghc", loader)
     assert spec is not None
@@ -81,11 +92,11 @@ try:
     (STATE_ENV / ".env").write_text("TELEGRAM_BOT_TOKEN=x\n", encoding="utf-8")
     mod = load(str(home))
 
-    dead_unit = "claude-session-a.service"
+    dead_unit = "claude-alpha.service"
     live_unit = "claude-dotfiles.service"
 
     # ── 정지 유닛 ──────────────────────────────────────────────────────
-    # 임계를 한참 넘긴 streak 을 미리 깔아둔다. 옆 기계에서 실제로 151분이었다.
+    # 임계를 한참 넘긴 streak 을 미리 깔아둔다. 둘째 기계에서 실제로 151분이었다.
     mod.STATE_DIR.mkdir(parents=True, exist_ok=True)
     stale = mod.STATE_DIR / f"{dead_unit}.nonzero_since"
     stale.write_text(str(time.time() - 151 * 60), encoding="utf-8")

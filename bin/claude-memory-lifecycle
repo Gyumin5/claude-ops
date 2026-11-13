@@ -16,7 +16,7 @@ progress.md / history.md / history/active.md 의 deterministic lifecycle 자동�
 - ~/.cache/claude-memory-lifecycle/<key>.lock (flock 직렬화)
 - 매 변경 전 ~/.claude/state/memory-lifecycle/backups/<proj>/<ts>/{progress,history}.md 백업
 - DRY_RUN=1 환경변수 (기본): 실제 쓰기 안 함, 텔레그램 리포트만
-- 컨트롤봇 한 채팅으로 결과 알림 (chat_id TELEGRAM_CHAT_ID)
+- 컨트롤봇 한 채팅으로 결과 알림 (방 번호는 설정에서 읽는다)
 """
 import argparse
 import fcntl
@@ -33,7 +33,11 @@ from pathlib import Path
 
 KST = timezone(timedelta(hours=9))
 CONTROL_BOT_ENV = Path.home() / ".claude" / "control-bot" / ".env"
-CONTROL_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from operator_chat import chat_id   # noqa: E402  (방 번호 단일 출처)
+
+CONTROL_CHAT_ID = chat_id()
 LOCK_DIR = Path.home() / ".cache" / "claude-memory-lifecycle"
 BACKUP_BASE = Path.home() / ".claude" / "state" / "memory-lifecycle" / "backups"
 DECISION_MARKER = "[DECISION-CANDIDATE]"
@@ -75,41 +79,6 @@ def telegram_send(token, text):
 
 def project_key(cwd):
     return cwd.replace("/", "-").replace("_", "-").lstrip("-")
-
-
-def active_session_cwds():
-    """지금 돌고 있는 세션 유닛의 작업 디렉토리 목록.
-
-    템플릿 인스턴스(claude-session-nudge@x.service)와 일회성 잡(Transient=yes)은
-    세션이 아니라 뺀다. systemd 가 없거나 유닛이 없으면 빈 목록이다.
-    """
-    try:
-        out = subprocess.run(
-            ["systemctl", "--user", "list-units", "--plain", "--no-legend",
-             "--type=service", "--state=active", "claude-*.service"],
-            capture_output=True, text=True, timeout=20).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    found = []
-    for line in out.splitlines():
-        unit = line.split()[0] if line.split() else ""
-        if not unit.endswith(".service") or "@" in unit:
-            continue
-        try:
-            props = subprocess.run(
-                ["systemctl", "--user", "show", unit,
-                 "-p", "WorkingDirectory", "-p", "Transient"],
-                capture_output=True, text=True, timeout=20).stdout
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if "Transient=yes" in props:
-            continue
-        for l in props.splitlines():
-            if l.startswith("WorkingDirectory="):
-                cwd = l.split("=", 1)[1]
-                if cwd and Path(cwd).is_dir() and cwd not in found:
-                    found.append(cwd)
-    return found
 
 
 def acquire_lock(key):
@@ -405,6 +374,46 @@ def format_report(reports, dry_run):
     return "\n".join(lines)
 
 
+def session_cwds():
+    """활성 세션의 작업 디렉토리를 systemd 에서 직접 읽는다.
+
+    claude-progress-updater-all 과 같은 판정이다 — Environment 에 CLAUDE_SESSION_NAME
+    이 있는 비-transient 활성 유닛. 손으로 적은 세션→디렉토리 표를 쓰지 않는 이유는
+    history #57 이다: 표에 없는 이름은 조용히 빠져서 일곱 세션이 도입 이후 내내
+    대상이 아니었고 로그에도 안 남았다. 유닛의 WorkingDirectory 는 systemd 가 이미
+    정확히 알고 있다.
+    """
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "list-units", "--plain", "--no-legend",
+             "--type=service", "--state=active", "claude-*.service"],
+            capture_output=True, text=True, timeout=30).stdout
+    except Exception:
+        return []
+    cwds = []
+    for line in out.splitlines():
+        unit = line.split()[0] if line.split() else ""
+        if not unit or "@" in unit:        # 템플릿 인스턴스는 세션이 아니다
+            continue
+        try:
+            props = subprocess.run(
+                ["systemctl", "--user", "show", unit,
+                 "-p", "WorkingDirectory", "-p", "Environment", "-p", "Transient"],
+                capture_output=True, text=True, timeout=30).stdout
+        except Exception:
+            continue
+        if "Transient=yes" in props or "CLAUDE_SESSION_NAME=" not in props:
+            continue
+        cwd = ""
+        for pl in props.splitlines():
+            if pl.startswith("WorkingDirectory="):
+                cwd = pl.split("=", 1)[1]
+                break
+        if cwd and Path(cwd).is_dir() and cwd not in cwds:
+            cwds.append(cwd)
+    return cwds
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cwd", help="프로젝트 cwd 또는 'all' (모든 cs 관리 세션 순회)")
@@ -417,9 +426,7 @@ def main():
 
     targets = []
     if args.cwd == "all":
-        # 대상은 지금 돌고 있는 세션 유닛의 작업 디렉토리다. 목록을 코드에 박아 두면
-        # 세션이 늘거나 줄 때 조용히 어긋난다 — claude-progress-updater-all 과 같은 자리를 본다.
-        targets = active_session_cwds()
+        targets = session_cwds()
     else:
         targets.append(args.cwd)
 

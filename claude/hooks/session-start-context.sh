@@ -13,26 +13,9 @@ ACTIVE="$CWD/history/active.md"
 HIST="$CWD/history.md"
 
 parts=""
-# 기계가 관측한 기록 검증 실패를 progress.md 보다 먼저 읽힌다. 세션이 쓴 글을 세션이
-# 물려받는 구조라, 자동 갱신기가 근거 없다고 버린 제안은 로그에만 남고 아무도 안 봤다.
-# 사실 판정도 자동 정정도 안 한다 — 종류와 횟수만 전한다.
-# 주입 자리를 새로 늘리지 않는다. 이 글이 쓴 바이트만큼 아래 본문 예산에서 뺀다.
-PROG_CAP_BYTES=8000
-DIAG_CAP_BYTES=1024
-diag=""
-if command -v claude-progress-diag >/dev/null 2>&1; then
-    diag=$(claude-progress-diag render --project "$CWD" --progress "$PROG" \
-           --cap "$DIAG_CAP_BYTES" 2>/dev/null || true)
-fi
-if [ -n "$diag" ]; then
-    dbytes=$(printf '%s' "$diag" | wc -c)
-    parts+="${diag}"
-    PROG_CAP_BYTES=$(( PROG_CAP_BYTES - dbytes ))
-    [ "$PROG_CAP_BYTES" -lt 1000 ] && PROG_CAP_BYTES=1000
-fi
 if [ -f "$PROG" ]; then
     # progress는 hard limit 180줄이라 통째 주입 가능
-    pcontent=$(head -c "$PROG_CAP_BYTES" "$PROG")
+    pcontent=$(head -c 8000 "$PROG")
     parts+="## progress.md (현재 진행 상황)\n\n${pcontent}\n\n"
 fi
 # 직전 세션 handoff (cs rotate 게이트가 신선본 보장). 가장 먼저 읽도록 상단 배치.
@@ -49,9 +32,9 @@ fi
 # 주입하면서 주입 상태를 같이 잰다. active.md 는 "착수 시점에 실제로 보이는 것"이라
 # 이게 없거나 부으면 과거 결론이 조회되지 않고, 그러면 이미 기각한 실험을 다시 돈다.
 # 그런데 지금까지 그 고장이 조용했다 — 상한을 넘는 부분은 말없이 잘려나갔다.
-# (2026-08-20 실측: session-a 는 결정 428항목·"재시도 시 시간낭비" 75건을 갖고도
-#  active.md 가 없어 7568줄 일지의 꼬리만 주입받고 있었다. session_c_work
-#  592줄, proj-b 는 요약본 363줄이 본체 184줄보다 컸다.)
+# (2026-08-20 실측: alpha 는 결정 428항목·"재시도 시 시간낭비" 75건을 갖고도
+#  active.md 가 없어 7568줄 일지의 꼬리만 주입받고 있었다. gamma_work
+#  592줄, raise 는 요약본 363줄이 본체 184줄보다 컸다.)
 ACTIVE_CAP_BYTES=6000
 ACTIVE_CAP_LINES=120
 hygiene=""

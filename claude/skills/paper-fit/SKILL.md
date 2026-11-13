@@ -34,6 +34,39 @@ $ENGINE -interaction=nonstopmode main.tex >/dev/null 2>&1   # 참조 해결 위�
 PAGES=$(pdfinfo main.pdf | awk '/^Pages:/ {print $2}')
 ```
 
+## 제출 전 글꼴 검사 (Type 3 비트맵 금지)
+
+투고 포털과 출판사 조판부가 거르는 자리다. 쪽수가 맞아도 여기서 되돌아온다.
+아이트리플이·엘스비어 둘 다 Type 3 비트맵 글꼴이 섞인 PDF 를 반려한다.
+
+```bash
+pdffonts out/root.pdf | tail -n +3 | awk '{print $2,$3}' | sort | uniq -c
+```
+
+Type 1 과 CID TrueType 만 나와야 한다. `Type 3` 가 한 줄이라도 있으면 고친다.
+`emb` 칸이 `no` 인 줄도 같이 거른다 — 심어지지 않은 글꼴은 상대 기계에서 다른
+모양으로 찍힌다.
+
+어디서 오는지 먼저 가른다. 그림 PDF 를 따로 재면 라텍스 쪽인지 그림 쪽인지가
+한 번에 갈린다.
+
+```bash
+for f in fig_*.pdf; do echo "== $f"; pdffonts $f | tail -n +3 | awk '{print $2}' | sort | uniq -c; done
+```
+
+- 라텍스 쪽이면 T1 글자판의 외곽선 판이 그 기계에 없어서 비트맵으로 대신 찍힌
+  것이다. 머리말 맨 앞에 `\usepackage{lmodern}` 한 줄을 넣으면 없어진다.
+  cm-super 를 까는 길도 있지만 기계마다 깔려 있는지가 갈려서 한 줄 쪽이 낫다.
+  넣은 뒤 쪽수가 바뀔 수 있으니 전체 빌드로 다시 잰다.
+- 그림 쪽이면 matplotlib 기본값이 Type 3 다. 그림 만드는 스크립트에
+  `matplotlib.rcParams["pdf.fonttype"] = 42` 와 `["ps.fonttype"] = 42` 를 넣고
+  그림을 다시 낸다.
+
+실측(2026-11-06, velocity RAS 원고): 넣기 전 Type 3 서른한 개가 29 쪽 전체에
+퍼져 있었고 첫 쪽에만 아홉이었다. 그림 둘은 처음부터 깨끗해서 원인이 라텍스
+쪽이었다. `\usepackage{lmodern}` 한 줄로 Type 3 가 0 이 됐고 쪽수 29 와 조판
+경고 여섯 개 0 은 그대로였다.
+
 ## 본문 편집 원칙
 - 추가: 같은 단락 안에서 자연스러운 보충 설명, 예시, 수치, 부연 (창작 금지 — 기존 문맥과 연구 결과에 충실).
 - 제거: 다음 우선순위로 문장 선택

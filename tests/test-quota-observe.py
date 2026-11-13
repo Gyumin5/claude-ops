@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""계정 한도 관측 계약 검사 — 2026-08-28 옆 기계 6시간 갇힘의 재현과 방지.
+"""계정 한도 관측 계약 검사 — 2026-08-28 둘째 기계 6시간 갇힘의 재현과 방지.
 
 지키는 것:
   1. 낡은 캐시(cached_at 이 오래된)의 수치는 차단 근거가 아니다. 얼어붙은 7일 창
@@ -20,6 +20,13 @@ import time
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import claude_session_lib as csl   # noqa: E402
+
+# 이 검사의 주제는 창 계산이다. 이 기계의 계정·교체 상태를 읽으면 교체를 한 번이라도
+# 한 기계에서만 빨갛게 뜬다(2026-11-10 홈에서 실제로 그랬다) — 셋을 없는 경로로 돌린다.
+_NOWHERE = os.path.join(tempfile.mkdtemp(prefix="quota-observe."), "없다")
+csl.ACCOUNT_GENERATION = _NOWHERE
+csl.ACCOUNT_MARKER = _NOWHERE
+csl.CLAUDE_JSON = _NOWHERE
 
 FAILED = []
 
@@ -57,7 +64,7 @@ def check(name, got, want, detail=""):
 
 def main():
     now = time.time()
-    print("얼어붙은 캐시 (2026-08-28 옆 기계 재현)")
+    print("얼어붙은 캐시 (2026-08-28 둘째 기계 재현)")
     # 6시간 전에 언 캐시. 5시간 창은 리셋이 지났고, 7일 창은 리셋이 아직 미래다.
     fh = {"used_percentage": 99, "resets_at": now - 3600}
     sd = {"used_percentage": 99, "resets_at": now + 2 * 86400}

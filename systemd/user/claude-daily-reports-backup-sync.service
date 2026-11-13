@@ -1,0 +1,7 @@
+[Unit]
+Description=Sync daily worklog/reports to private GitHub backup repo
+
+[Service]
+Type=oneshot
+ExecStart=%h/dotfiles/bin/claude-daily-reports-backup-sync
+Nice=10

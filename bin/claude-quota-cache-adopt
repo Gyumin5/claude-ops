@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""계정을 갈아 끼울 때 한도 수치를 그 계정 것으로 바꿔 단다.
+
+왜 필요한가. 전환은 자격 파일만 바꾸고 끝나는데, 한도 수치는 호스트의 전 세션이 파일
+하나(~/.claude/statusline_cache.json)를 같이 쓴다. 그 파일에는 떠나는 계정의 수치가 그대로
+남아 있어서, 바꾼 직후 화면은 새 계정의 여유를 옛 계정의 숫자로 보여 준다. 지금까지는 그
+자리를 통째로 비웠고(claude-quota-cache-clear), 그러면 새 계정이 실제로 요청을 한 번
+보내고 응답 머리에 수치가 실릴 때까지 화면이 빈다.
+
+그 빈 자리를 그 계정이 마지막으로 보인 수치로 채운다. 값은 계정 홈의 같은 파일
+(~/claude-accounts/<이름>/.claude/statusline_cache.json)에서 읽는다 — 탐침이 그 계정으로
+세션을 짧게 띄워 적어 둔 것이다(claude-account-probe).
+
+계정 표시(`_account`)를 수치와 같이 옮긴다. 그래야 상태줄의 래칫이 두 계정 수치를 안 합친다.
+상태줄은 캐시에 적힌 계정 표시가 지금 계정과 같을 때만 옛 값과 새 값을 합치는데, 전환 직후
+그 비교에 쓰는 지금 계정 값은 세션이 다시 뜰 때까지 옛 계정 그대로다. 수치만 옮기고 표시를
+두면 "같은 계정" 으로 읽혀 새 계정의 낮은 값이 옛 계정의 높은 값에 가려진다.
+
+쓰는 법:
+  claude-quota-cache-adopt --to acct-a              acct-a 수치를 live 에 올린다
+  claude-quota-cache-adopt --from acct-b --to acct-a   acct-b 의 지금 수치를 그 홈에 보관하고 올린다
+
+--to 가 가리키는 홈에 수치가 없으면 live 의 수치 칸을 비운다(옛 동작 그대로). 비는 것이
+남의 수치를 보여 주는 것보다 낫다.
+"""
+import argparse
+import datetime
+import json
+import os
+import sys
+
+HOME = os.path.expanduser("~")
+LIVE = os.path.join(HOME, ".claude", "statusline_cache.json")
+ACCOUNTS_ROOT = os.environ.get("CLAUDE_ACCOUNTS_ROOT",
+                               os.path.join(HOME, "claude-accounts"))
+
+
+def account_cache(name):
+    return os.path.join(ACCOUNTS_ROOT, name, ".claude", "statusline_cache.json")
+
+
+def valid_name(name):
+    return bool(name) and "/" not in name and not name.startswith(".")
+
+
+def load(path):
+    """사전이면 돌려주고, 없거나 깨졌으면 None. 깨진 파일을 덮어쓰지 않으려고 가른다."""
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save(path, data):
+    """같은 디렉토리 임시 파일 + rename. 부분 쓰기를 남기지 않는다."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "{}.tmp-{}".format(path, os.getpid())
+    with open(tmp, "w") as fh:
+        json.dump(data, fh)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def fmt(ts):
+    if not isinstance(ts, (int, float)):
+        return "끝 시각 없음"
+    return datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M KST")
+
+
+def describe(rate_limits):
+    if not isinstance(rate_limits, dict) or not rate_limits:
+        return "한도 칸 없음"
+    parts = []
+    for key, label in (("five_hour", "다섯시간"), ("seven_day", "주간")):
+        win = rate_limits.get(key)
+        if isinstance(win, dict):
+            parts.append("{} {}퍼센트 ({}까지)".format(
+                label, win.get("used_percentage"), fmt(win.get("resets_at"))))
+    return " / ".join(parts) or "한도 칸 없음"
+
+
+def stash(name):
+    """떠나는 계정: live 의 지금 수치를 그 홈 캐시에 보관한다."""
+    live = load(LIVE)
+    if live is None:
+        print("live 캐시를 못 읽었다 — 보관 건너뜀")
+        return
+    rl = live.get("rate_limits")
+    if not isinstance(rl, dict) or not rl:
+        print("live 에 한도 칸이 없다 — 보관할 것 없음")
+        return
+    dst = account_cache(name)
+    data = load(dst)
+    if data is None:
+        # 그 홈에 캐시 파일 자체가 없으면 수치만 담은 새 파일을 만든다. 상태줄이 읽는
+        # 다른 칸은 그 계정으로 세션이 돌 때 채워진다.
+        data = {}
+    data["rate_limits"] = rl
+    if live.get("_account") is not None:
+        data["_account"] = live.get("_account")
+    try:
+        save(dst, data)
+    except OSError as exc:
+        print("{} 홈에 보관 실패: {} — 그 계정 수치는 다음 탐침에서 다시 잰다"
+              .format(name, exc))
+        return
+    print("{} 홈에 보관: {}".format(name, describe(rl)))
+
+
+def adopt(name):
+    """들어오는 계정: 그 홈 수치를 live 에 올린다. 없으면 live 수치 칸을 비운다."""
+    live = load(LIVE)
+    if live is None:
+        print("live 캐시를 못 읽었다 — 손대지 않는다")
+        return 1
+    src = load(account_cache(name))
+    rl = src.get("rate_limits") if isinstance(src, dict) else None
+    before = describe(live.get("rate_limits"))
+    if isinstance(rl, dict) and rl:
+        live["rate_limits"] = rl
+        # 계정 표시를 같이 옮긴다 — 안 옮기면 상태줄이 두 계정 수치를 합친다.
+        if isinstance(src, dict) and src.get("_account") is not None:
+            live["_account"] = src.get("_account")
+        print("{} 수치를 올렸다: {} (이전 {})".format(name, describe(rl), before))
+    else:
+        live.pop("rate_limits", None)
+        print("{} 홈에 수치가 없다 — live 수치 칸을 비웠다 (이전 {})".format(name, before))
+    try:
+        save(LIVE, live)
+    except OSError as exc:
+        print("live 캐시 쓰기 실패: {}".format(exc))
+        return 1
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--from", dest="src", help="떠나는 계정 이름 (지금 수치를 그 홈에 보관)")
+    ap.add_argument("--to", dest="dst", required=True, help="들어오는 계정 이름")
+    args = ap.parse_args(argv[1:])
+
+    for name in (args.src, args.dst):
+        if name is not None and not valid_name(name):
+            print("계정 이름이 올바르지 않다: {}".format(name), file=sys.stderr)
+            return 2
+
+    if args.src and args.src != args.dst:
+        stash(args.src)
+    return adopt(args.dst)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

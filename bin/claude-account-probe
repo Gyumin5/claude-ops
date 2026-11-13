@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""계정 홈에서 세션을 짧게 한 번 돌려 그 계정의 사용량 수치를 받아 둔다.
+
+수치를 만드는 것은 그 계정으로 도는 대화형 세션의 상태줄 하나뿐이다 — 머리 없는 호출은
+상태줄을 아예 안 부른다(2026-11-05 실측, state/usage-probe-20261105/). 그런데 서버에는
+화면이 없고 세션을 손으로 띄울 사람도 없다. 그래서 세션을 가짜 터미널에 물려 띄우고,
+그 홈의 `.claude/statusline_cache.json` 이 새로 적히면 바로 접는다.
+
+  claude-account-probe acct-a
+  claude-account-probe acct-a acct-b acct-c acct-d
+  claude-account-probe --root <경로> --timeout 180 acct-a
+
+화면이 묻는 것(첫 실행 안내·이 폴더를 믿느냐)은 여기서 답하지 않는다 — 답을 눈으로 못
+보는 자리에서 아무 키나 넣으면 기본값이 "아니오, 끝낸다" 인 물음에도 그대로 들어간다.
+그 물음들은 claude-account-home-init 이 홈을 깔 때 미리 지나간 것으로 적어 둔다.
+
+세션을 띄우기만 해서는 한도 칸이 안 온다 — 그 수치는 서버가 응답에 실어 주는 값이라
+한 번은 물어봐야 한다(11-06 실측: 띄운 직후 수치 파일은 2.9초 만에 생기는데 한도 칸이
+비어 있다). 그래서 아주 짧은 물음 하나를 넣고, 한도 칸이 찰 때까지 기다린다.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pty
+import re
+import select
+import signal
+import struct
+import sys
+import termios
+import fcntl
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+
+# 한도를 다 쓴 계정은 물음에 답하지 않고 이 줄을 화면에 내놓는다. 그러면 한도 칸도 안
+# 오므로, 이 줄을 못 보면 말이 없는 계정과 다 쓴 계정이 똑같이 "시간초과" 로 보인다.
+ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\a\x1b]*(?:\a|\x1b\\)")
+# 줄 끝은 캐리지리턴으로도 온다. 그걸 안 끊으면 뒤따르는 화면 글자가 통째로 딸려 온다.
+HIT_LIMIT = re.compile(r"hit your (?:weekly|5-hour|usage) limit[^\r\n│]*", re.I)
+
+DEFAULT_ROOT = Path(os.path.expanduser("~/claude-accounts"))
+CACHE_REL = Path(".claude") / "statusline_cache.json"
+MCP_REL = Path(".claude") / "empty-mcp.json"
+# 수치가 안 온 까닭은 수치 파일에 안 적힌다. 모아 보기가 "말이 없다" 와 "다 썼다" 를
+# 가르려면 이 자리가 있어야 한다 — 없으면 고칠 것이 없는데 고치려 든다.
+NOTE_REL = Path(".claude") / "account-probe.json"
+# 이 파일이 있으면 그 홈은 안 띄운다. 자격을 다른 기계로 가져가 쓰는 동안 두 자리가
+# 같은 토큰 묶음을 각자 갱신하지 않게 하는 자리다.
+HOLD_REL = Path("probe-hold")
+
+MONTHS = {m: i for i, m in enumerate(
+    "jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
+KINDS = (("weekly", "7일 한도"), ("5-hour", "다섯 시간 한도"))
+WHEN_RE = re.compile(
+    r"resets\s+(?:([A-Za-z]{3,9})\s+(\d{1,2}),?\s*)?(\d{1,2})(?::(\d{2}))?\s*([ap])m",
+    re.I)
+
+
+def read_note(home):
+    """지난 회차가 남긴 까닭. 없거나 깨졌으면 빈 칸."""
+    try:
+        data = json.loads((Path(home) / NOTE_REL).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def parse_reset(note, now=None):
+    """화면 한 줄에서 어느 창이 언제 풀리는지를 뽑는다.
+
+    한도를 다 쓴 계정은 수치 칸을 아예 안 주므로 이 한 줄이 유일한 단서다. 뽑아 두면
+    ⑴우리 말로 보여 줄 수 있고 ⑵풀릴 때까지 그 계정을 다시 안 띄울 수 있다. 못
+    알아보면 시각을 비워 돌려준다 — 그때는 원문을 그대로 보여 준다.
+    """
+    if not note:
+        return "", None
+    kind = next((ko for eng, ko in KINDS if eng in note.lower()), "한도")
+    m = WHEN_RE.search(note)
+    if not m:
+        return kind, None
+    mon, day, hh, mm, ap = m.groups()
+    hour = int(hh) % 12 + (12 if ap.lower() == "p" else 0)
+    base = datetime.fromtimestamp(now if now is not None else time.time())
+    try:
+        if mon:
+            month = MONTHS.get(mon[:3].lower())
+            if month is None:
+                return kind, None
+            when = base.replace(month=month, day=int(day), hour=hour,
+                                minute=int(mm or 0), second=0, microsecond=0)
+            if (base - when).days > 30:      # 해를 넘긴 날짜다
+                when = when.replace(year=when.year + 1)
+        else:
+            when = base.replace(hour=hour, minute=int(mm or 0), second=0, microsecond=0)
+            if when <= base:                 # 시각만 적힌 줄은 가장 가까운 앞날이다
+                when += timedelta(days=1)
+    except ValueError:
+        return kind, None
+    return kind, when.timestamp()
+
+
+def _resolve_claude(explicit=""):
+    """실행파일 찾기는 claude-account-login 의 것 하나를 쓴다 — 두 벌로 두면 갈린다."""
+    src = Path(__file__).resolve().with_name("claude-account-login")
+    loader = importlib.machinery.SourceFileLoader("account_login", str(src))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod.resolve_claude(explicit)
+
+
+def limits_of(cache, since=0.0):
+    """수치 파일에서 한도 두 칸을 꺼낸다. 아직 안 왔으면 None.
+
+    since 를 주면 그 시각 뒤에 적힌 파일만 본다 — 전 회차가 남긴 값을 이번에 받은 것으로
+    읽으면, 계정이 말이 없어도 늘 "받았다" 가 나온다.
+    """
+    cache = Path(cache)
+    try:
+        if since and cache.stat().st_mtime < since:
+            return None
+        data = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    limits = data.get("rate_limits") or {}
+    # 둘 중 하나만 와도 받은 것이다. 7일가 거의 다 찬 계정은 다섯 시간 창이 아예
+    # 안 열려서 그 칸이 안 온다 — 2026-11-06 어느 계정이 7일 99퍼센트에 다섯 시간
+    # 칸 없음으로 왔고, 다섯 시간을 필수로 보던 옛 조건이 그걸 시간초과로 적었다.
+    for key in ("five_hour", "seven_day"):
+        win = limits.get(key)
+        if isinstance(win, dict) and win.get("used_percentage") is not None:
+            return limits
+    return None
+
+
+def clear_limits(cache):
+    """띄우기 전에 그 홈의 한도 칸을 비운다. 없으면 아무 일도 안 한다.
+
+    비우지 않으면 이번 회차가 전 회차의 수치를 그대로 돌려준다. 상태줄에는 래칫이
+    걸려 있어서(claude/statusline.py `_merge_rate_limits`) 같은 창 안에서는 낮은 값이
+    높은 값을 못 덮고, 한도 칸이 안 온 렌더는 앞 값을 그대로 물려받는다. 새 세션은
+    첫 렌더를 수치가 오기 전에 그리므로, 비우지 않으면 그 첫 렌더가 옛 값을 적고
+    파일 시각만 새것이 된다 — 시각으로 신선도를 보는 limits_of 가 그걸 못 가른다.
+
+    실측(2026-11-06): 한 계정을 연달아 세 번 띄워 1.6~1.8초 만에 매번 5시간 14퍼센트가
+    나왔는데, 같은 계정을 쓰는 홈 세션은 같은 시각에 56퍼센트였다. 이 자리를 비우고
+    다시 띄우니 9.1초 걸려 58퍼센트가 왔다.
+    """
+    cache = Path(cache)
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict) or "rate_limits" not in data:
+        return
+    data.pop("rate_limits", None)
+    tmp = cache.with_name(cache.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(cache)
+
+
+def probe_one(home, claude_bin, timeout, ask, ask_after, model=""):
+    """홈 하나에서 세션을 띄워 한도 칸을 받고 접는다. (상태, 걸린 시간, 한도) 를 돌려준다."""
+    cache = home / CACHE_REL
+    clear_limits(cache)
+
+    mcp = home / MCP_REL
+    mcp.parent.mkdir(parents=True, exist_ok=True)
+    mcp.write_text('{"mcpServers":{}}', encoding="utf-8")
+
+    env = dict(os.environ, HOME=str(home), TERM="xterm-256color")
+    # 이 둘이 남아 있으면 띄운 쪽을 부모 세션으로 보고 다르게 군다.
+    env.pop("CLAUDECODE", None)
+    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+
+    t0 = time.time()
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            os.chdir(str(home))
+            argv = [claude_bin, "--strict-mcp-config", "--mcp-config", str(mcp)]
+            if model:
+                # 한도는 모델 무게로 센다 — 수치만 받으면 되니 가장 가벼운 것으로 띄운다.
+                argv += ["--model", model]
+            os.execvpe(claude_bin, argv, env)
+        except OSError:
+            pass
+        os._exit(127)
+
+    # 좁은 창이면 상태줄이 접히고, 접힌 화면은 그릴 것이 없다고 판단될 수 있다.
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))
+    except OSError:
+        pass
+
+    state = "시간초과"
+    lim = None
+    note = ""
+    asked = False
+    screen = ""
+    while time.time() - t0 < timeout:
+        lim = limits_of(cache, since=t0)
+        if lim is not None:
+            state = "받았다"
+            break
+        hit = HIT_LIMIT.search(screen)
+        if hit:
+            state = "한도 소진"
+            note = " ".join(hit.group(0).split())
+            break
+        if not asked and time.time() - t0 >= ask_after:
+            # 화면이 다 서기 전에 넣으면 글자가 먹힌다 — 잠깐 두고 한 번만 넣는다.
+            asked = True
+            try:
+                os.write(fd, ask.encode("utf-8") + b"\r")
+            except OSError:
+                break
+        r, _, _ = select.select([fd], [], [], 0.5)
+        if fd in r:
+            try:
+                chunk = os.read(fd, 65536)   # 안 읽으면 세션이 막힌다.
+            except OSError:
+                break
+            if not chunk:
+                break
+            # 화면은 한도 소진 문구를 찾는 데만 쓴다. 뒷부분만 들고 있는다.
+            screen = (screen + ANSI.sub("", chunk.decode("utf-8", "replace")))[-8192:]
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            break
+        for _ in range(20):
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                break
+            time.sleep(0.1)
+        else:
+            continue
+        break
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    return state, time.time() - t0, lim, note
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("names", nargs="+", help="계정 홈 이름 (예: acct-a acct-b)")
+    ap.add_argument("--root", default=str(DEFAULT_ROOT))
+    ap.add_argument("--timeout", type=float, default=30.0,
+                    help="한 홈을 기다리는 시간(초). 기본 30")
+    ap.add_argument("--ask", default="hi",
+                    help="한도 칸을 받으려고 한 번 던지는 짧은 물음. 기본 hi")
+    ap.add_argument("--ask-after", dest="ask_after", type=float, default=6.0,
+                    help="화면이 설 때까지 두는 시간(초). 기본 6")
+    ap.add_argument("--model", default="claude-haiku-5-5",
+                    help="탐침을 띄울 모델. 빈 값이면 그 홈의 기본값. 기본 claude-haiku-5-5")
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="같이 띄울 홈 수. 0 이면 적힌 홈을 다 같이 띄운다. 기본 0")
+    ap.add_argument("--claude-bin", dest="claude_bin", default="")
+    args = ap.parse_args()
+
+    claude_bin = _resolve_claude(args.claude_bin)
+    if not claude_bin:
+        print("세션을 띄울 claude 실행파일을 못 찾았다 — --claude-bin 으로 경로를 적는다.",
+              file=sys.stderr)
+        return 1
+
+    root = Path(os.path.expanduser(args.root))
+    for name in args.names:
+        if "/" in name or name in (".", ".."):
+            print(f"이름에 경로를 쓰지 않는다: {name}", file=sys.stderr)
+            return 2
+
+    def one(name):
+        """홈 하나를 보고 (rc, 보여 줄 한 줄) 을 돌려준다. 띄우는 자리는 여기 하나뿐이다."""
+        rc = 0
+        home = root / name
+        if not home.is_dir():
+            return 1, f"{name}: 계정 홈이 없다 ({home})"
+        if not (home / ".claude" / ".credentials.json").exists():
+            return 1, f"{name}: 아직 로그인 안 했다 — claude-account-login start {name}"
+        # 그 계정 자격을 다른 자리로 가져가 쓰는 동안은 이 홈을 안 띄운다. 한 자격을
+        # 두 자리에서 각자 갱신하면 늦게 쓴 쪽이 이미 바뀐 옛 토큰을 내민다. 멈추는
+        # 것은 그 계정 하나뿐이고, 표시 파일을 지우면 다음 회차부터 다시 낀다.
+        if (home / HOLD_REL).exists():
+            return 0, f"{name}: 멈춤 — 다른 자리에서 쓰는 중 ({home / HOLD_REL})"
+        # 다 쓴 창이 아직 안 풀렸으면 띄우지 않는다 — 띄워 봐야 같은 줄을 다시 받고
+        # 기다린 시간만 버린다.
+        prev = read_note(home)
+        wait_until = prev.get("until")
+        if (prev.get("state") == "한도 소진"
+                and isinstance(wait_until, (int, float)) and wait_until > time.time()):
+            return 1, (f"{name}: 건너뜀 — {prev.get('kind') or '한도'} 소진, "
+                       f"{datetime.fromtimestamp(wait_until).strftime('%m-%d %H:%M')} 풀림")
+        state, took, lim, note = probe_one(home, claude_bin, args.timeout,
+                                           args.ask, args.ask_after, args.model)
+        kind, until = parse_reset(note) if state == "한도 소진" else ("", None)
+        extra = ""
+        if state == "받았다" and lim:
+            five = (lim.get("five_hour") or {}).get("used_percentage")
+            week = (lim.get("seven_day") or {}).get("used_percentage")
+            extra = f" (5시간 {five}% · 7일 {week}%)"
+        elif state == "한도 소진":
+            # 이건 고장이 아니라 그 계정의 지금 상태다. 한도 칸은 안 오지만 화면이
+            # 언제 풀리는지를 말해 준다.
+            rc = 1
+            if until:
+                extra = (f" ({kind} — "
+                         f"{datetime.fromtimestamp(until).strftime('%m-%d %H:%M')} 풀림)")
+            else:
+                extra = f" ({note})" if note else ""
+        else:
+            rc = 1
+            if (home / CACHE_REL).exists():
+                extra = " (수치 파일은 생겼는데 한도 칸이 안 왔다)"
+        rec = {"at": time.time(), "state": state, "note": note}
+        if kind:
+            rec["kind"] = kind
+        if until:
+            rec["until"] = until
+        try:
+            (home / NOTE_REL).write_text(
+                json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        return rc, f"{name}: {state} — {took:.1f}초{extra}"
+
+    # 계정마다 홈이 따로라 같이 띄워도 서로 안 밟는다. 하나에 9초쯤 걸리므로 차례로
+    # 돌면 넷이 사십 초가 되고, 같이 띄우면 그 셈이 제일 느린 하나로 줄어든다
+    # (2026-11-06 운영자 지시). 보여 주는 차례는 들어온 차례 그대로 둔다.
+    jobs = args.jobs if args.jobs > 0 else len(args.names)
+    rc = 0
+    if jobs <= 1 or len(args.names) <= 1:
+        results = [one(name) for name in args.names]
+    else:
+        with ThreadPoolExecutor(max_workers=min(jobs, len(args.names))) as pool:
+            results = list(pool.map(one, args.names))
+    for code, line in results:
+        rc = rc or code
+        print(line)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

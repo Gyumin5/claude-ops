@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""계정별 클로드 사용량을 한 줄씩 모아 보여 준다.
+
+수치를 만드는 것은 그 계정으로 떠 있는 대화형 세션의 상태줄 하나뿐이다(2026-11-05 실측,
+state/usage-probe-20261105/). 머리 없는 호출은 상태줄을 안 부르고, 계정 토큰으로 API 를
+직접 부르면 거절하면서 한도 헤더도 안 준다. 그래서 계정마다 전용 홈을 두고 그 홈에서
+세션을 돌리면, 상태줄이 그 홈의 `.claude/statusline_cache.json` 에 그 계정 수치를 적는다.
+claude/statusline.py 는 경로를 `~` 로 잡으므로 홈이 갈리면 파일도 저절로 갈린다 —
+계정별 수집을 위해 그 파일을 고칠 필요가 없다.
+
+이 명령은 그 파일들을 읽어 한 줄씩 낼 뿐이다. 쓰지 않는다.
+
+  claude-accounts-usage                 # 기본 뿌리 ~/claude-accounts + 지금 쓰는 홈
+  claude-accounts-usage --root <경로>   # 다른 뿌리
+  claude-accounts-usage --json          # 기계가 읽을 형태
+  claude-accounts-usage --host <대상>   # 저 기계 수치도 같이 (ssh 대상, 여러 번 가능)
+
+한 줄의 뜻:
+  5시간 28% (19:00 초기화)   지금 그 계정이 다섯 시간 창에서 쓴 비율과 그 창이 풀리는 시각
+  7일 4% (11-09(일) 19:00 초기화)  7일 창도 같다 — 날짜에 요일을 붙여 이번 주인지가 선다
+  수치 없음                   그 홈에서 세션이 아직 한 번도 안 돌았다
+  한도를 다 썼다              그 계정이 창을 다 써서 답하지 않는다 — 고장이 아니다
+  (지금 이 계정)              그 줄은 계정 자리가 아니라 지금 도는 홈에서 읽었다
+
+풀릴 시각이 지난 창은 수치로 안 쓴다. 그 창은 이미 0 으로 초기화됐고 우리가 든 값은
+초기화 전에 잰 값이라, 그대로 적으면 지금 그만큼 쓴 계정으로 읽힌다. 창이 다 지난
+계정은 "수치 없음 — <창>이 <시각> 에 풀렸고 그 뒤로 안 쟀다" 로 적는다.
+
+지금 이 기계가 쓰는 계정의 줄은 계정 자리 파일이 아니라 지금 도는 홈에서 읽는다. 계정
+자리의 사본은 갈아 끼울 때만 갱신돼서, 그 계정으로 하루를 돌면 사본이 하루치 뒤처진
+값을 사실처럼 보여 준다(2026-11-07 실측: 지금 계정이 7일 42% 인데 그 자리 사본은
+18시간 전 13% 였다). 같은 계정이라는 판정은 이름이 아니라 설정의 계정 번호로 한다 —
+이름이 같아도 다른 계정일 수 있고, 손으로 로그인한 기계는 표식 자체가 없다.
+
+저 기계 수치는 그 기계에서 같은 명령을 돌려 받아 온다 — 수치를 만드는 것은 그 계정으로
+떠 있는 세션의 상태줄이라(위 문단) 파일만 가져와서는 안 되고, 그 기계의 계정 홈을 그
+기계가 읽어야 한다. ssh 대상은 인자로만 받는다. 호스트가 여럿이면 같이 띄우고, 한쪽이
+안 되면 그 줄만 실패로 적고 나머지는 그대로 낸다.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+# 저 기계에서 돌릴 명령. 두 호스트 다 같은 자리에 둔다 — PATH 에 기대면 ssh 가 여는
+# 비대화형 셸이 그 경로를 안 읽어 "명령 없음" 으로 떨어진다.
+REMOTE_CMD = "~/dotfiles/bin/claude-accounts-usage --json"
+REMOTE_TIMEOUT = 40
+
+CACHE_REL = Path(".claude") / "statusline_cache.json"
+# claude-account-probe 가 마지막 회차의 까닭을 여기 적는다. 한도를 다 쓴 계정은 수치
+# 파일에 한도 칸이 아예 안 오므로, 이 자리가 없으면 말이 없는 계정과 똑같이 보인다.
+NOTE_REL = Path(".claude") / "account-probe.json"
+CREDS_REL = Path(".claude") / ".credentials.json"
+# 갈아 끼운 쪽이 적는 표식. 지금 어느 계정 자리로 도는지의 정본이다.
+MARKER_REL = Path(".claude") / "state" / "account-current"
+DEFAULT_ROOT = Path(os.path.expanduser("~/claude-accounts"))
+
+
+def has_creds(home):
+    """그 홈에 로그인 파일이 있나. 안을 안 열고 크기만 본다 — 토큰을 읽을 일이 없다."""
+    try:
+        return (Path(home) / CREDS_REL).stat().st_size > 0
+    except OSError:
+        return False
+
+
+def read_note(home):
+    """마지막으로 띄워 본 회차가 남긴 까닭. 없으면 빈 칸."""
+    try:
+        data = json.loads((Path(home) / NOTE_REL).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def apply_spent_note(row, note, now=None):
+    """탐침이 "한도 소진" 이라고 적어 뒀으면 그 줄로 바꾼다. 아니면 그대로 둔다.
+
+    어느 창이 언제 풀리는지는 탐침이 뽑아 둔다 — 화면 한 줄을 여기서 또 뜯으면 뜯는
+    자리가 둘이 되고 한쪽이 낡는다. 못 뽑았으면 원문만 남는다.
+
+    풀릴 시각이 이미 지났으면 그 쪽지는 끝난 사실이라 "지금 다 썼다" 로 적지 않는다.
+    탐침은 그 계정을 안 띄우는 동안 쪽지를 안 고치므로, 풀린 뒤에도 그 자리에 그대로
+    남아 며칠씩 거짓을 말한다. 대신 언제 풀렸는지와 그 뒤로 안 쟀다는 것을 남긴다 —
+    통째로 버리면 왜 수치가 없는지가 사라져서 사람이 로그인을 의심하게 된다.
+    """
+    if note.get("state") != "한도 소진":
+        return
+    until = note.get("until")
+    if note.get("kind"):
+        row["kind"] = note["kind"]
+    if isinstance(until, (int, float)):
+        if until <= (time.time() if now is None else now):
+            row["spent_until"] = until
+            return
+        row["until"] = until
+    row["state"] = "spent"
+    row["detail"] = note.get("note", "")
+
+
+#  (칸 이름, 짧은 이름, 한도 이름). 짧은 이름은 한 줄에 적을 때, 한도 이름은 "무엇이
+#  풀렸나" 를 말할 때 쓴다 — 탐침 쪽지가 쓰는 말과 같아야 두 경로가 한 말을 한다.
+WINDOW_NAMES = (("five_hour", "5시간", "5시간 한도"),
+                ("seven_day", "7일", "7일 한도"))
+
+
+def drop_expired_windows(row, now):
+    """풀릴 시각이 지난 창은 수치에서 뺀다 — 그 창은 이미 0 으로 초기화됐다.
+
+    우리가 든 값은 초기화 전에 잰 값이라, 그대로 적으면 지금 그만큼 쓴 계정으로
+    읽힌다(2026-11-08 실측: 한 계정이 아홉 시간 전에 끝난 창의 99퍼센트를 지금
+    수치처럼 달고 있었다). 창이 다 지났으면 수치가 없는 것과 같으므로, 탐침 쪽지가
+    쓰는 말과 같은 줄로 적게 상태까지 바꾼다 — 통째로 버리면 왜 수치가 없는지가
+    사라져서 사람이 로그인을 의심한다.
+
+    저 기계에서 받아 온 줄에도 같이 건다. 그 기계가 아직 낡은 판본이면 지난 창을
+    그대로 보내 오고, 받는 쪽이 안 가르면 그 줄만 옛 결함을 그대로 보여 준다.
+    """
+    if row.get("state") != "ok":
+        return row
+    gone = []
+    for key, _short, kind in WINDOW_NAMES:
+        win = row.get(key)
+        if not isinstance(win, dict):
+            continue
+        resets = win.get("resets_at")
+        if isinstance(resets, (int, float)) and resets <= now:
+            gone.append((resets, kind))
+            row.pop(key)
+    if any(isinstance(row.get(key), dict) for key, _s, _k in WINDOW_NAMES):
+        return row
+    row["state"] = "no-limits"
+    if gone:
+        when, kind = max(gone)
+        row["kind"], row["spent_until"] = kind, when
+    return row
+
+
+def read_home(label, home, now=None):
+    """홈 하나를 읽어 한 줄짜리 사실로 바꾼다. 없거나 깨지면 사유를 적는다."""
+    now = time.time() if now is None else now
+    row = {"label": label, "home": str(home)}
+    path = Path(home) / CACHE_REL
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        # 수치 파일이 없는 까닭은 셋이고 할 일이 다르다 — 아직 로그인을 안 한 홈은
+        # 사람이 로그인해야 하고, 로그인은 했는데 수치가 안 온 홈은 다시 재면 되고,
+        # 한도를 다 쓴 홈은 다시 재도 안 나온다(탐침이 그 계정을 아예 안 띄운다).
+        # 셋째를 "세션이 아직 안 돌았다" 로 적으면 사람이 헛되이 다시 재게 된다.
+        if not has_creds(home):
+            row["state"] = "no-login"
+            return row
+        row["state"] = "no-cache"
+        apply_spent_note(row, read_note(home), now)
+        return row
+    except (OSError, ValueError) as exc:
+        row["state"] = "broken"
+        row["detail"] = str(exc)[:120]
+        return row
+
+    limits = data.get("rate_limits") or {}
+    if not isinstance(limits, dict) or not limits:
+        row["state"] = "no-limits"
+        apply_spent_note(row, read_note(home), now)
+        return row
+
+    row["state"] = "ok"
+    row["cached_at"] = data.get("_cached_at")
+    for key in ("five_hour", "seven_day"):
+        win = limits.get(key)
+        if not isinstance(win, dict):
+            continue
+        row[key] = {
+            "used_percentage": win.get("used_percentage"),
+            "resets_at": win.get("resets_at"),
+        }
+    return drop_expired_windows(row, now)
+
+
+def account_uuid(home):
+    """그 홈이 어느 계정인가. 토큰이 아니라 계정 번호라 갱신돼도 안 바뀐다.
+
+    자격 파일끼리 비교하는 길은 쓰지 않는다 — 쓰는 동안 토큰이 저절로 갱신돼서 같은
+    계정인데 글자가 달라진다(history #326 의 기각 사유).
+    """
+    try:
+        data = json.loads((Path(home) / ".claude.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    acct = data.get("oauthAccount")
+    if not isinstance(acct, dict):
+        return ""
+    uid = acct.get("accountUuid")
+    return uid if isinstance(uid, str) else ""
+
+
+def live_seat(home):
+    """지금 도는 홈이 어느 계정 자리로 갈아 끼워져 있나. 없으면 빈 값.
+
+    설정의 계정 번호보다 이 표식이 먼저다. 번호는 세션이 다음에 프로필을 받아올
+    때까지 옛 계정을 들고 있어서, 공용 계정으로 갈아 끼운 뒤에도 한참 개인 계정을
+    가리킨다 — 그 값으로 판정하면 공용 계정 수치가 개인 계정 줄에 "지금 이 계정"
+    으로 붙는다(2026-11-09 둘째 기계 실측: 표식 shared3, 번호 ogm3614, 화면은 shared3 수치를
+    ogm3614 줄에 적었다). 손으로 로그인만 한 기계에는 표식이 없으므로 그때만 번호로
+    내려간다. 판정 규칙은 claude-accounts 의 current_name() 과 같다.
+    """
+    try:
+        name = (Path(home) / MARKER_REL).read_text(
+            encoding="utf-8").splitlines()[0].strip()
+    except (OSError, IndexError):
+        return ""
+    if not name or "/" in name or name.startswith("."):
+        return ""
+    return name
+
+
+def collect(root, include_current=True, names=None):
+    """뿌리 아래 계정 홈을 읽는다. names 를 주면 그 이름만 — 뿌리에 다른 계정이
+    생겨도 안 새게 하려는 것이다. 열쇠글을 걸고 바깥에 내놓는 자리에서 쓴다.
+
+    지금 이 기계가 쓰는 계정의 줄은 그 계정 자리가 아니라 지금 도는 홈에서 읽는다.
+    자리의 사본은 갈아 끼울 때만 갱신되므로, 그 계정으로 오래 돌수록 자리 사본이
+    뒤처진 값을 사실처럼 보여 준다. 머리 없는 기계(사용량 서버처럼 대화형 세션이 없는
+    자리)는 지금 도는 홈에 계정 번호가 없어서 이 바꿔치기가 저절로 안 걸린다.
+
+    지금 도는 홈에 아직 수치가 없으면 자리 사본을 그대로 쓴다. 둘 다 같은 계정이라
+    오래된 수치라도 아무것도 안 보여 주는 것보다 낫고, 나이 칸이 얼마나 뒤처졌는지를
+    같이 적는다. 바꿔치기가 수치를 없애는 쪽으로 돌면 이번에 고치려는 것과 같은
+    종류의 오해를 반대 방향으로 만든다.
+    """
+    live_home = Path(os.path.expanduser("~"))
+    live_name = live_seat(live_home)
+    live_uuid = account_uuid(live_home)
+    rows = []
+    if include_current:
+        rows.append(read_home("현재", live_home))
+    if root.is_dir():
+        for home in sorted(p for p in root.iterdir() if p.is_dir()):
+            if names is not None and home.name not in names:
+                continue
+            if (home.name == live_name if live_name
+                    else bool(live_uuid) and account_uuid(home) == live_uuid):
+                row = read_home(home.name, live_home)
+                if row.get("state") != "ok":
+                    seat = read_home(home.name, home)
+                    if seat.get("state") == "ok":
+                        row = seat
+                row["live"] = True
+                rows.append(row)
+                continue
+            rows.append(read_home(home.name, home))
+    return rows
+
+
+def host_tag(target):
+    """ssh 대상에서 라벨에 쓸 짧은 이름. gmoh@home → home, 둘째 기계 → 둘째 기계."""
+    return target.split("@")[-1].split(".")[0] or target
+
+
+def collect_remote(target):
+    """저 기계에서 같은 명령을 돌려 그 기계의 줄들을 받아 온다.
+
+    시각 칸(cached_at·resets_at)은 저쪽이 적은 epoch 를 그대로 쓴다 — 절대 시각이라
+    두 기계 시계가 맞으면 옮길 필요가 없고, 안 맞으면 나이 칸이 그만큼 어긋난 채
+    보인다. 거짓 수치가 아니라 저쪽 시계가 어긋났다는 신호다.
+    """
+    tag = host_tag(target)
+    try:
+        out = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target, REMOTE_CMD],
+            capture_output=True, text=True, timeout=REMOTE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return [{"label": tag, "home": "", "state": "error",
+                 "detail": f"{REMOTE_TIMEOUT}초 안에 답이 없다"}]
+    if out.returncode != 0:
+        why = (out.stderr or out.stdout).strip().splitlines()
+        return [{"label": tag, "home": "", "state": "error",
+                 "detail": f"접속·실행 실패 rc={out.returncode}"
+                           + (f" — {why[-1][:120]}" if why else "")}]
+    try:
+        rows = json.loads(out.stdout)["rows"]
+    except (ValueError, KeyError, TypeError):
+        return [{"label": tag, "home": "", "state": "error",
+                 "detail": "저쪽 출력이 읽히지 않는다 — 그 기계의 판본이 낡았을 수 있다"}]
+    now = time.time()
+    for r in rows:
+        r["host"] = tag
+        r["label"] = f"{tag}:{r.get('label', '?')}"
+        drop_expired_windows(r, now)
+    return rows
+
+
+WEEKDAY = "월화수목금토일"
+
+
+def fmt_clock(epoch, now):
+    """리셋 시각을 KST 로 짧게. 오늘이면 시:분, 아니면 월-일(요일) 시:분.
+
+    요일을 붙이는 이유는 날짜만으로는 그게 이번 주인지 다음 주인지가 안 서기 때문이다.
+    """
+    if not isinstance(epoch, (int, float)):
+        return "?"
+    when = datetime.fromtimestamp(epoch)
+    today = datetime.fromtimestamp(now).date()
+    if when.date() == today:
+        return when.strftime("%H:%M")
+    return when.strftime("%m-%d") + f"({WEEKDAY[when.weekday()]}) " + when.strftime("%H:%M")
+
+
+def fmt_window(win, now):
+    if not win:
+        return "칸 없음"
+    pct = win.get("used_percentage")
+    resets = win.get("resets_at")
+    pct_s = f"{pct}%" if isinstance(pct, (int, float)) else "?%"
+    # 지난 창은 여기 안 온다 — drop_expired_windows 가 읽는 자리에서 먼저 뺀다.
+    return f"{pct_s} ({fmt_clock(resets, now)} 초기화)"
+
+
+def fmt_age(cached_at, now):
+    if not isinstance(cached_at, (int, float)):
+        return "갱신 시각 없음"
+    mins = int((now - cached_at) // 60)
+    if mins < 1:
+        return "방금"
+    if mins < 60:
+        return f"{mins}분 전"
+    return f"{mins // 60}시간 {mins % 60}분 전"
+
+
+def render(rows, now):
+    head = datetime.fromtimestamp(now)
+    out = [f"계정별 사용량 ({head.strftime('%Y-%m-%d')}({WEEKDAY[head.weekday()]})"
+           f" {head.strftime('%H:%M')} KST)"]
+    width = max((len(r["label"]) for r in rows), default=2)
+    for r in rows:
+        label = r["label"].ljust(width)
+        # 지금 도는 홈에서 읽은 줄은 그렇다고 적는다. 안 적으면 그 계정 자리의 사본을
+        # 읽은 줄과 구분이 안 가서, 왜 "현재" 줄과 똑같은지가 안 선다.
+        mark = " (지금 이 계정)" if r.get("live") else ""
+        if r["state"] == "ok":
+            # 칸이 안 온 창은 아예 안 적는다. 7일가 거의 다 찬 계정은 다섯 시간 창이
+            # 안 열려서 그 칸이 없는데, 빈 칸을 적으면 뒤에서 읽는 쪽이 못 알아본다.
+            parts = [short + " " + fmt_window(r[key], now)
+                     for key, short, _kind in WINDOW_NAMES if r.get(key)]
+            out.append(f"{label}  " + "  ".join(parts)
+                       + f"  {fmt_age(r.get('cached_at'), now)} 값{mark}")
+        elif r["state"] == "no-login":
+            out.append(f"{label}  로그인 안 함 — 그 홈에 한 번 로그인해야 수치가 생긴다")
+        elif r["state"] == "no-cache":
+            if r.get("spent_until"):
+                out.append(f"{label}  수치 없음 — {r.get('kind', '한도')}가 "
+                           f"{fmt_clock(r['spent_until'], now)} 에 풀렸고 그 뒤로 안 쟀다{mark}")
+            else:
+                out.append(f"{label}  수치 없음 — 로그인은 됐는데 그 홈에서 세션이 아직 안 돌았다{mark}")
+        elif r["state"] == "spent":
+            if r.get("until"):
+                out.append(f"{label}  {r.get('kind', '한도')}를 다 썼다 — "
+                           f"{fmt_clock(r['until'], now)} 풀림{mark}")
+            else:
+                tail = f" ({r['detail']})" if r.get("detail") else ""
+                out.append(f"{label}  한도를 다 썼다 — 그 계정은 지금 답하지 않는다{tail}")
+        elif r["state"] == "no-limits":
+            if r.get("spent_until"):
+                out.append(f"{label}  수치 없음 — {r.get('kind', '한도')}가 "
+                           f"{fmt_clock(r['spent_until'], now)} 에 풀렸고 그 뒤로 안 쟀다{mark}")
+            else:
+                out.append(f"{label}  수치 없음 — 상태줄은 돌았는데 한도 칸이 안 왔다{mark}")
+        else:
+            out.append(f"{label}  읽기 실패 — {r.get('detail', '')}")
+    if len(rows) <= 1:
+        out.append("(계정별 홈이 아직 없다 — 뿌리 밑에 계정마다 폴더를 하나씩 둔다)")
+    return "\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--root", default=str(DEFAULT_ROOT),
+                    help=f"계정별 홈을 모아 둔 뿌리 (기본 {DEFAULT_ROOT})")
+    ap.add_argument("--json", action="store_true", help="기계가 읽을 형태로")
+    ap.add_argument("--no-current", action="store_true", help="지금 쓰는 홈은 빼고")
+    ap.add_argument("--names", nargs="*", default=None,
+                    help="이 이름들만. 안 적으면 뿌리 아래 전부")
+    ap.add_argument("--host", action="append", default=[], metavar="대상",
+                    help="저 기계 수치도 같이 낸다 (ssh 대상. 여러 번 적을 수 있다)")
+    args = ap.parse_args()
+
+    now = time.time()
+    # 이 기계 읽기와 저 기계 접속은 공유 상태가 없다 — 같이 띄워 느린 쪽 하나만 기다린다.
+    with ThreadPoolExecutor(max_workers=len(args.host) + 1) as pool:
+        local = pool.submit(
+            collect, Path(os.path.expanduser(args.root)),
+            not args.no_current,
+            set(args.names) if args.names is not None else None)
+        remotes = [pool.submit(collect_remote, h) for h in args.host]
+        rows = local.result()
+        for f in remotes:
+            rows += f.result()
+    if args.json:
+        json.dump({"now": now, "rows": rows}, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+    else:
+        print(render(rows, now))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,216 @@
+#!/bin/bash
+# claude-daily-report-dispatch: 매일 09:00 KST에 R&D 세션들한테 "전날 24시간
+# 작업보고서(HTML)+주간위키용 ledger" 작성을 주입하는 디스패처.
+#
+# 배경: 2026-07-08 사용자 요청 — 둘째 기계(mimosa VIO)·alpha(LIO 벤치) 세션이
+# 이미 만들던 것 같은 상세 HTML 24시간 리포트를 매일 자동으로 받고 싶고,
+# 그 내용이 weekly-wiki 원장(ledger-yaml)에도 반영되길 원함. ai-debate
+# run-20260708T001749Z 권고(registry+동적 대상판별+ledger sidecar authoritative)
+# 를 골자로 하되, 대상이 2세션뿐이라 정교한 registry/체커/재시도까지는
+# 과설계라 판단 — 대상목록 파일 하나로 단순화.
+#
+# 대상목록: ~/.claude/reports/daily-report-targets.txt (세션이름 한 줄씩,
+# 주석 # 허용). 없으면 아무것도 안 하고 조용히 종료.
+# 세션이 실제로 살아있는지(systemctl active)만 확인 — 없으면 스킵.
+set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/operator_chat.sh"   # 방 번호 단일 출처
+
+TARGETS_FILE="$HOME/.claude/reports/daily-report-targets.txt"
+WORKLOG_DIR="$HOME/dotfiles/claude/weekly-wiki/worklog"
+USERBOT_SEND="$HOME/.local/bin/claude-userbot-send"
+USERBOT_SESSION="$HOME/.claude/userbot/userbot.session"
+RELAY_CONF="$HOME/.claude/userbot/relay.conf"
+FALLBACK_TELEGRAM_ENV="$HOME/dotfiles/.claude/telegram/.env"
+[ -f "$TARGETS_FILE" ] || exit 0
+
+# 세션이름→봇 static 테이블(targets.json/relay-alias.json)은 이름 충돌/드리프트에
+# 취약해 실제 오배달 사고(2026-07-08)로 이어졌다(ai-debate run-20260710T013002Z
+# 결론). claude-soft-restart 와 동일하게, 대상 세션 자신의 프로젝트
+# .claude/telegram/.env 에 있는 진짜 토큰을 getMe 로 실시간 확인해 봇을 정한다 —
+# static 테이블 폴백은 오배달을 숨길 수 있어 채택하지 않음(해석 실패시 fail-closed).
+session_workdir() {
+    local wd
+    wd=$(systemctl --user show "claude-${1}.service" -p WorkingDirectory --value 2>/dev/null)
+    [ -z "$wd" ] && return 1
+    [ "$wd" = "/" ] && return 1
+    [ "$wd" = "$HOME" ] && return 1
+    printf '%s\n' "$wd"
+}
+
+resolve_botuser() {
+    local session="$1" wd env_file tok botuser
+    wd=$(session_workdir "$session") || return 1
+    env_file="${wd}/.claude/telegram/.env"
+    [ -f "$env_file" ] || return 1
+    # source 하지 않고 안전하게 값만 파싱(.env 내용을 셸로 실행하지 않음).
+    tok=$(grep -E '^(TELEGRAM_BOT_TOKEN|BOT_TOKEN)=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2-)
+    tok="${tok%\"}"; tok="${tok#\"}"; tok="${tok%\'}"; tok="${tok#\'}"
+    [ -n "$tok" ] || return 1
+    botuser=$(curl -s --max-time 8 "https://api.telegram.org/bot${tok}/getMe" 2>/dev/null \
+        | python3 -c 'import json,sys
+try: print("@"+json.load(sys.stdin)["result"]["username"])
+except Exception: sys.exit(1)' 2>/dev/null)
+    [ -n "$botuser" ] || return 1
+    printf '%s\n' "$botuser"
+}
+
+alert_operator() {
+    # 해석 실패로 리포트가 안 나갈 때 운영자에게만 알림(오배달과 무관한 known-good 채널).
+    [ -f "$FALLBACK_TELEGRAM_ENV" ] || return 0
+    # shellcheck disable=SC1090
+    ( . "$FALLBACK_TELEGRAM_ENV"; tok="${TELEGRAM_BOT_TOKEN:-${BOT_TOKEN:-}}"
+      [ -n "$tok" ] || exit 0
+      CHAT_ID="$(operator_chat_id)" || exit 0
+      curl -s -m 8 -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+        --data-urlencode "chat_id=$CHAT_ID" \
+        --data-urlencode "text=$1" >/dev/null 2>&1 ) || true
+}
+
+# 둘째 기계 등 로컬에 userbot 세션이 없는 머신은 relay.conf 의 홈으로 ssh 릴레이해서
+# 보낸다(claude-soft-restart 의 send_via_userbot 과 동일 패턴). 세션이름이 아니라
+# resolve_botuser 로 이미 해석된 @username 을 그대로 전달 대상으로 쓴다.
+# 보낸 자리를 적는 이름표. 받는 쪽 기록에 "누가 넣었나" 로 남는다. 기계가 여럿이면
+# 어느 기계에서 나갔는지가 같이 보여야 해서 기계 이름을 앞에 붙인다 — 마커가 없는
+# 기계는 도구 이름만 쓴다(없는 이름을 지어내면 기록이 거짓이 된다).
+#   echo "<기계>" > ~/.config/claude-machine-id
+dispatch_origin() {
+    local mid=""
+    [ -f "$HOME/.config/claude-machine-id" ] \
+        && mid="$(tr -d '[:space:]' < "$HOME/.config/claude-machine-id")"
+    if [ -n "$mid" ]; then
+        printf '%s/daily-report-dispatch' "$mid"
+    else
+        printf 'daily-report-dispatch'
+    fi
+}
+
+send_via_userbot() {
+    local botuser="$1" text="$2" origin
+    origin="$(dispatch_origin)"
+    if [ -x "$USERBOT_SEND" ] && [ -f "$USERBOT_SESSION" ]; then
+        "$USERBOT_SEND" --origin "$origin" "$botuser" "$text" >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    if [ -f "$RELAY_CONF" ]; then
+        # shellcheck disable=SC1090
+        . "$RELAY_CONF"
+        if [ -n "${USERBOT_HOST:-}" ]; then
+            # -n 필수: 안 붙이면 ssh가 stdin을 먹어서 이 함수를 부르는 while-read
+            # 루프(대상목록 파일에서 읽음)가 한 번 돌고 바로 끝나버림.
+            ssh -n -o BatchMode=yes -o ConnectTimeout=20 "$USERBOT_HOST" \
+                "~/.local/bin/claude-userbot-send --origin '${origin}' '${botuser}' '${text}'" >/dev/null 2>&1 && return 0
+        fi
+    fi
+    return 1
+}
+
+LOG_DIR="$HOME/.claude/state/daily-report-dispatch"
+mkdir -p "$LOG_DIR" "$WORKLOG_DIR" 2>/dev/null
+
+# 타이머 회차와 사람의 수동 복구가 겹치면 같은 세션에 프롬프트가 두 번 들어간다.
+# 이미 도는 인스턴스가 있으면 조용히 빠진다 — 겹친 쪽이 하려던 일은 이미 진행 중이다.
+exec 9>"$LOG_DIR/dispatch.lock"
+if ! flock -n 9; then
+    echo "$(date -Iseconds) result=skip reason=already_running" >> "$LOG_DIR/dispatch.log"
+    exit 0
+fi
+
+# 보고 대상일. 기본은 어제다. 부팅 catch-up 이 자정을 넘겨 돌면 "어제"가 실제 누락된 날이
+# 아니게 되므로, 사람이 복구할 때는 날짜를 직접 준다:
+#   claude-daily-report-dispatch 2026-09-02
+REPORT_DATE="${1:-$(date -d 'yesterday' '+%Y-%m-%d')}"
+if ! date -d "$REPORT_DATE" >/dev/null 2>&1; then
+    echo "날짜 형식이 틀렸다: $REPORT_DATE (기대: YYYY-MM-DD)" >&2
+    exit 2
+fi
+
+# 준비 안 된 세션을 다시 보는 전체 마감과 순회 간격.
+# 2026-09-03 둘째 기계 사고: 08:00 예약종료 → 14:56:35 부팅 → Persistent 타이머가 19초 뒤에
+# 밀린 09:00 회차를 실행. 그 순간 세션 5개는 아직 안 떴고(마지막이 45초 뒤) 2개는 떴지만
+# 네트워크 미준비로 getMe 가 실패해서, 7개가 1초 안에 전부 스킵됐고 그날치가 통째로 없어졌다.
+# 60초 첫 재검사는 관측된 유닛 지연 45초를 덮고, 남은 4분은 별개 축인 DNS·텔레그램 도달성에 준다.
+# 5분은 이 관측에 근거한 초기값이다 — 부팅 로그가 더 쌓이면 조정한다.
+READY_DEADLINE=300
+RETRY_INTERVAL=60
+
+PENDING=()
+while IFS= read -r LINE; do
+    LINE="$(printf '%s' "$LINE" | sed 's/#.*//' | xargs)"
+    [ -z "$LINE" ] && continue
+    PENDING+=("$LINE")
+done < "$TARGETS_FILE"
+[ ${#PENDING[@]} -gt 0 ] || exit 0
+TARGET_COUNT=${#PENDING[@]}
+
+declare -A LAST_REASON=()
+DEADLINE=$(( $(date +%s) + READY_DEADLINE ))
+
+while :; do
+    PASS_START=$(date +%s)
+    NOT_READY=()
+
+    for SESSION in "${PENDING[@]}"; do
+        UNIT="claude-${SESSION}.service"
+        if ! systemctl --user is-active --quiet "$UNIT" 2>/dev/null; then
+            LAST_REASON["$SESSION"]="유닛이 안 떠 있다"
+            echo "$(date -Iseconds) session=${SESSION} result=wait reason=inactive" >> "$LOG_DIR/dispatch.log"
+            NOT_READY+=("$SESSION")
+            continue
+        fi
+
+        BOTUSER=$(resolve_botuser "$SESSION")
+        if [ -z "$BOTUSER" ]; then
+            LAST_REASON["$SESSION"]="봇 신원 해석 실패(.env/getMe)"
+            echo "$(date -Iseconds) session=${SESSION} result=wait reason=resolve_botuser_failed source=env_getme" >> "$LOG_DIR/dispatch.log"
+            NOT_READY+=("$SESSION")
+            continue
+        fi
+
+        LEDGER_FILE="${WORKLOG_DIR}/${REPORT_DATE}.${SESSION}.md"
+        PROMPT="[자동 트리거] ${REPORT_DATE}(00:00~23:59 KST) 24시간 작업보고서를 작성해줘.
+
+1) HTML 리포트: 프로젝트의 reports/ 디렉토리에 work_report_24h_$(date -d "$REPORT_DATE" '+%Y%m%d').html 로 저장. 스타일은 지금까지 만들던 형식 그대로(다크/라이트 테마 대응 카드 UI, 상단에 기간·한줄요약, KPI 요약 박스, 섹션별 카드+상태태그(완료/진행중/ADOPT/DO-NOT-ADOPT 등), 정량비교 표, 근본원인 문단, 다음 단계 목록, 하단 footer에 하드제약·산출물 경로). 실제 수치·판정·근거 있는 내용만, 지어내지 말 것. 그날 특별한 작업이 없었으면 길게 억지로 채우지 말고 짧게 '특이사항 없음' 정도로.
+2) 완료되면 그 HTML 파일을 텔레그램으로 나(사용자)한테 직접 보내줘(reply 도구로 파일 첨부).
+3) 같은 내용을 주간위키용 원장으로도 남겨줘 — ${LEDGER_FILE} 파일에 PART1(산문 요약)+PART2(\`\`\`ledger-yaml 블록, task_id/title/status/why/work_done/result/implication/evidence/transcript_anchor/confidence/report_value/next_action 필드)를 ~/dotfiles/claude/weekly-wiki/worklog_prompt.txt 형식 그대로 작성. 파일명이 세션이름을 포함하는 건 여러 R&D 세션이 같은 날짜에 각자 남기기 때문 — 정상."
+
+        # 주입은 세션당 한 번만 한다. 발송 실패는 재시도하지 않는다 — 상대가 이미 받았는지
+        # 알 수 없는 상태에서 다시 넣으면 같은 날 보고서를 두 번 쓰게 만든다.
+        if send_via_userbot "$BOTUSER" "$PROMPT"; then
+            echo "$(date -Iseconds) session=${SESSION} botuser=${BOTUSER} result=sent source=env_getme ledger=${LEDGER_FILE}" >> "$LOG_DIR/dispatch.log"
+            unset "LAST_REASON[$SESSION]"
+        else
+            LAST_REASON["$SESSION"]="유저봇 발송 실패(${BOTUSER})"
+            echo "$(date -Iseconds) session=${SESSION} botuser=${BOTUSER} result=send_failed source=env_getme" >> "$LOG_DIR/dispatch.log"
+        fi
+        sleep 60
+    done
+
+    PENDING=("${NOT_READY[@]}")
+    [ ${#PENDING[@]} -eq 0 ] && break
+
+    NOW=$(date +%s)
+    [ "$NOW" -ge "$DEADLINE" ] && break
+    # 발송 성공 뒤의 60초 대기가 이미 순회 간격 몫을 했으면 더 자지 않는다.
+    ELAPSED=$(( NOW - PASS_START ))
+    if [ "$ELAPSED" -lt "$RETRY_INTERVAL" ]; then
+        NAP=$(( RETRY_INTERVAL - ELAPSED ))
+        LEFT=$(( DEADLINE - NOW ))
+        [ "$NAP" -gt "$LEFT" ] && NAP="$LEFT"
+        sleep "$NAP"
+    fi
+done
+
+# 알림은 마지막에 한 건으로 합친다. 예전에는 세션마다 즉시 알려서, 부팅 경합 한 번에
+# 다섯 건이 한꺼번에 나갔고 정작 "그날치가 통째로 없다"는 사실은 그 안에 안 보였다.
+FAILED=()
+for SESSION in "${!LAST_REASON[@]}"; do
+    FAILED+=("${SESSION}(${LAST_REASON[$SESSION]})")
+done
+if [ ${#FAILED[@]} -gt 0 ]; then
+    SUMMARY="$(printf '%s\n' "${FAILED[@]}" | sort | paste -sd', ' -)"
+    echo "$(date -Iseconds) result=failed date=${REPORT_DATE} count=${#FAILED[@]} sessions=${SUMMARY}" >> "$LOG_DIR/dispatch.log"
+    alert_operator "[daily-report-dispatch] ${REPORT_DATE} 리포트 요청이 ${#FAILED[@]}건 안 나갔다 — ${SUMMARY}. 5분 재시도 뒤에도 준비가 안 됐다. 그 세션들의 그날 보고서는 없다. 복구: claude-daily-report-dispatch ${REPORT_DATE}"
+    exit 1
+fi
+echo "$(date -Iseconds) result=complete date=${REPORT_DATE} sessions=${TARGET_COUNT}" >> "$LOG_DIR/dispatch.log"
+exit 0

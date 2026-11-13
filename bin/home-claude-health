@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # home-claude-health: 홈의 claude.ai 로그인이 살아있는지 1시간마다 확인하고,
-# 죽었으면 옆 기계 세션으로 알린다(홈이 못 알리는 상황을 다른 머신이 대신 알리는 설계).
+# 죽었으면 둘째 기계 세션으로 알린다(홈이 못 알리는 상황을 다른 머신이 대신 알리는 설계).
 #
 # 왜 이렇게 복잡한가 (2026-08-07 오탐):
 #   옛 구현은 probe 출력을 버리고 rc≠0 을 전부 "로그인 만료" 로 라벨했다. 17:56 회차에
@@ -24,8 +24,8 @@ set -uo pipefail
 
 # 이 스크립트는 home 전용이다. 다른 머신에서 돌면 그 머신을 재고서 '[home health]' 라벨로
 # 알린다 — 자기 상태를 남의 이름으로 보고하게 된다. 유닛 배포·심링크에도 머신 가드가
-# 있지만(install.sh), 스크립트 자신도 스스로를 막는다. (2026-08-07 옆 기계 지적: 공용 bin
-# 루프에 넣었더니 유닛 가드를 안 타고 옆 기계에 심겼다.)
+# 있지만(install.sh), 스크립트 자신도 스스로를 막는다. (2026-08-07 둘째 기계 지적: 공용 bin
+# 루프에 넣었더니 유닛 가드를 안 타고 둘째 기계에 심겼다.)
 MID_FILE="$HOME/.config/claude-machine-id"
 MID=""
 [ -f "$MID_FILE" ] && MID="$(tr -d '[:space:]' < "$MID_FILE")"
@@ -36,7 +36,7 @@ fi
 # 마커가 없거나 비었으면 fail-open 이다 — 그대로 돈다. home 에서 마커가 날아갔을 때
 # 감시가 조용히 죽는 쪽이 더 나쁘기 때문이다. 대신 라벨을 호스트명으로 바꿔서, 모르는
 # 머신에서 돌았을 때 "[home health]" 라고 남의 이름으로 보고하지는 않게 한다.
-# 침묵과 오보 중 하나를 고르는 대신 문구를 정직하게 만드는 쪽이다. (2026-08-07 옆 기계 질의.)
+# 침묵과 오보 중 하나를 고르는 대신 문구를 정직하게 만드는 쪽이다. (2026-08-07 둘째 기계 질의.)
 LABEL="${MID:-$(hostname -s 2>/dev/null || echo unknown)}"
 
 STATE_DIR="${HOME_CLAUDE_HEALTH_STATE_DIR:-$HOME/.local/state/home-claude-health}"
@@ -46,17 +46,28 @@ LEGACY_STATE="$HOME/.cache/home-claude-health.state"
 BACKOFF="${HOME_CLAUDE_HEALTH_BACKOFF:-60}"
 CLAUDE_BIN="${HOME_CLAUDE_HEALTH_CLAUDE:-$HOME/.local/bin/claude}"
 NOTIFY_BIN="${HOME_CLAUDE_HEALTH_NOTIFY:-$HOME/.local/bin/claude-userbot-send}"
-# 수신처는 peer 프로젝트 세션이 아니라 peer-dotfiles 다(2026-08-21 사용자 지시).
-# peer 으로 보내면 그 세션은 자기 프로젝트 작업 중이라 이 경보를 처리할 맥락이 없고,
-# 사람이 손으로 peer-dotfiles 에 옮겨 붙이고 있었다. 인프라 경보는 인프라 세션으로 간다.
-NOTIFY_SESSION="${HOME_CLAUDE_HEALTH_SESSION:-peer-dotfiles}"
+# 수신처는 프로젝트 세션이 아니라 인프라를 맡는 세션이다. 프로젝트 세션으로 보내면
+# 그 세션은 자기 작업 중이라 이 경보를 처리할 맥락이 없고, 사람이 손으로 옮겨 붙이게
+# 된다. 인프라 경보는 인프라 세션으로 간다.
+#
+# 이름은 기계마다 다르므로 설정에서 읽는다. 기본값을 지어 두지 않는 이유는, 없는
+# 세션으로 보내면 보내는 쪽이 성공을 찍고 아무 데도 안 가기 때문이다 — 가장 알아야
+# 할 때 조용해진다. 설정이 없으면 알림을 건너뛰고 그 사실을 로그에 남긴다.
+#   echo "<기계>/dotfiles" > ~/.config/claude-health-session
+NOTIFY_SESSION="${HOME_CLAUDE_HEALTH_SESSION:-$(cat "$HOME/.config/claude-health-session" 2>/dev/null)}"
 EMPTY="${HOME_CLAUDE_HEALTH_EMPTY:-$STATE_DIR/empty-mcp.json}"
 
 mkdir -p "$STATE_DIR" 2>/dev/null
 echo '{"mcpServers":{}}' > "$EMPTY" 2>/dev/null
 
 # 알림 경로는 telethon userbot 이라 claude.ai 인증과 독립이다 — 만료됐을 때도 나간다.
-notify() { "$NOTIFY_BIN" --session "$NOTIFY_SESSION" "$1" >/dev/null 2>&1; }
+notify() {
+    if [ -z "$NOTIFY_SESSION" ]; then
+        echo "$(date '+%F %T') notify-skipped reason=no-session msg=$1" >> "$LOG"
+        return 0
+    fi
+    "$NOTIFY_BIN" --session "$NOTIFY_SESSION" "$1" >/dev/null 2>&1
+}
 
 # 출력에서 사람에게 보여줄 한 줄. ANSI 제거, 토큰성 문자열 마스킹, 길이 제한.
 first_line() {
@@ -73,6 +84,14 @@ first_line() {
 classify() {
     local rc="$1" low
     low=$(printf '%s' "$2" | tr 'A-Z' 'a-z')
+    # 사용량 한도가 제일 먼저다. 한도에 걸린 응답은 계정이 멀쩡하다는 증거이지
+    # 고장이 아니다 — 창이 초기화되면 저절로 풀린다. 인증보다 앞에 두는 이유는
+    # 한도 문구에 "session" 이 들어가서 인증 갈래의 문구와 헷갈릴 자리이기 때문이다.
+    case "$low" in
+        *"session limit"*|*"usage limit"*|*"hit your limit"*|\
+        *"out of credits"*|*"purchase more credits"*)
+            echo limit; return;;
+    esac
     case "$low" in
         *"please run /login"*|*"run /login"*|*"not logged in"*|*"invalid api key"*|\
         *"oauth token expired"*|*"oauth token has expired"*|*"oauth token revoked"*|\
@@ -140,6 +159,15 @@ if [ "$class1" = "auth" ] && [ "$class2" = "auth" ]; then
     else
         save_state auth "$count" 1
     fi
+    exit 0
+fi
+
+# 사용량 한도는 고장이 아니다. 알리지 않고 실패 횟수도 올리지 않는다 — 한도 구간이
+# 몇 시간이면 그 사이 회차가 쌓여 "연속 2회차 실패" 로 나가고, 사람은 멀쩡한 계정을
+# 보러 오게 된다(2026-09-22 실사례). 직전 경보 상태는 건드리지 않는다 — 한도 응답은
+# 인증이 살아 있다는 증거지만 그것만으로 앞선 경보를 해소로 바꾸지는 않는다.
+if [ "$class2" = "limit" ]; then
+    save_state limit "$prev_count" "$prev_alerted"
     exit 0
 fi
 

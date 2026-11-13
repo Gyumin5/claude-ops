@@ -1,0 +1,12 @@
+[Unit]
+Description=Claude Coord Report (세션들이 정해 달라는 것 모아 보내기 — 09시 전체, 10~22시 변화만)
+
+[Service]
+Type=oneshot
+Environment="PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# 09시 회차만 전체, 나머지는 변화만. 시각 판정은 스크립트가 아니라 여기서 한다.
+ExecStart=/bin/bash -c 'if [ "$(date +%%H)" = "09" ]; then exec %h/dotfiles/bin/claude-coord-report brief; else exec %h/dotfiles/bin/claude-coord-report delta; fi'
+# 모으기가 매달려 있으면 그 회차는 없는 게 낫다 — 다음 회차가 한 시간 뒤에 온다.
+TimeoutStartSec=300
+StandardOutput=append:%h/.claude/logs/coord-report.log
+StandardError=append:%h/.claude/logs/coord-report.log

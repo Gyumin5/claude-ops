@@ -15,10 +15,9 @@ import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
-# 저장소 뿌리를 이 파일 위치에서 찾는다. 예전엔 홈 아래 고정 경로였는데,
-# 그러면 다른 자리에 받은 사람은 그대로 못 돌린다.
-REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+ROOT = Path(__file__).resolve().parent.parent
 
 # 결함주입용으로 사본을 검사할 수 있게 열어둔다(검사가 실제로 회귀를 잡는지 확인할 때).
 HOOK = os.environ.get("BG_GUARD_HOOK") or os.path.join(
@@ -58,7 +57,7 @@ def main():
     check("foreground 차단", run("ai-debate '질문'")[0], 2)
     check("background 차단", run("ai-debate '질문'", bg=True)[0], 2)
     check("파이프 뒤에서도 차단", run("cat brief.md | ai-debate '질문'")[0], 2)
-    check("절대경로 차단", run(os.path.join(REPO, "bin/ai-debate '질문'"))[0], 2)
+    check("절대경로 차단", run(str(ROOT / "bin" / "ai-debate") + " '질문'")[0], 2)
     check("timeout 래퍼 차단", run("timeout 590 ai-debate '질문'")[0], 2)
     _, err = run("ai-debate '질문'")
     check("대안 명령을 알려준다", "ai-debate-detach" in err, True, err[:80])
@@ -73,6 +72,11 @@ def main():
     check("주석만", run("# ai-debate 얘기")[0], 0)
     check("무관한 명령 foreground", run("ls -la")[0], 0)
     check("무관한 명령 background", run("sleep 5", bg=True)[0], 0)
+    # 쪼개 놓고 글자로 `|&;` 를 다시 가르면 따옴표로 보호된 인자가 갈려서 그 조각이
+    # 명령 시작 자리로 승격된다. 인용문 속 이름이 실행으로 읽힌다.
+    check("따옴표 안의 세로줄과 이름", run("echo 'a|ai-debate 질문'")[0], 0)
+    # 반대쪽 — 따옴표가 갈리면 어휘 분석이 실패해 그 조각이 통째로 판정에서 빠진다.
+    check("인자에 세로줄이 든 실제 호출", run("ai-debate 'a|b'")[0], 2)
     # heredoc 본문은 데이터다 — 커밋 메시지·문서에 ai-debate 로 시작하는 줄이 있어도 명령이 아니다.
     check("heredoc 본문", run(
         "git commit -F - <<'MSG'\n제목\n\nai-debate run-2026 에서 정했다\nMSG")[0], 0)

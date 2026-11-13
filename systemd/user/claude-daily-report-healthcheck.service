@@ -1,0 +1,7 @@
+[Unit]
+Description=Check that daily 24h work-report HTML files were actually generated
+
+[Service]
+Type=oneshot
+ExecStart=%h/dotfiles/bin/claude-daily-report-healthcheck
+Nice=10

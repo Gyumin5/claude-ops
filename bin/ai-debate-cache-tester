@@ -22,8 +22,13 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from operator_chat import chat_id   # noqa: E402  (방 번호 단일 출처)
 
 STATE_DIR = Path.home() / ".claude" / "state" / "ai-debate-cache-tester"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -74,7 +79,7 @@ def telegram(msg: str):
             [
                 "curl", "-sS", "-X", "POST",
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                "--data-urlencode", "chat_id=TELEGRAM_CHAT_ID",
+                "--data-urlencode", "chat_id=%s" % chat_id(),
                 "--data-urlencode", f"text={msg}",
             ],
             capture_output=True, timeout=15,

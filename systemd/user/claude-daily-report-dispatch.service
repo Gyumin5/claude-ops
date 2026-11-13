@@ -1,0 +1,7 @@
+[Unit]
+Description=Inject daily 24h work-report request into peer R&D sessions
+
+[Service]
+Type=oneshot
+ExecStart=%h/dotfiles/bin/claude-daily-report-dispatch
+Nice=10

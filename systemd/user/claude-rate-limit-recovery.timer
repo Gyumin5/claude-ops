@@ -1,9 +1,10 @@
 [Unit]
-Description=Claude Rate-Limit Recovery Monitor Timer (5분마다)
+Description=Claude Rate-Limit Recovery Monitor Timer (1분 기점, 10분 격자)
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=5min
+# 한도 창은 10분 격자로 리셋된다. 확인도 그 격자에 맞춰야 리셋 직후를 늦게 보지 않는다.
+# 1분을 기점으로 두는 것은 정각에 몰리는 다른 타이머와 겹치지 않게 하려는 것이다.
+OnCalendar=*-*-* *:01/10:00
 Persistent=true
 
 [Install]

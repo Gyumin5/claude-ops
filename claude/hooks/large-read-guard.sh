@@ -4,7 +4,7 @@
 # 목적: Prompt is too long 사고의 주요 원인인 대형 파일 통째 read 차단.
 # Read tool 호출에서 file_path 의 byte/line 검사:
 # - offset/limit 명시 → 통과 (이미 청크화 중)
-# - 5MB 초과 또는 10K 줄 초과 → 차단 + ctx_read 안내
+# - 5MB 초과 또는 10K 줄 초과 → 차단 + 부분 읽기 안내
 # - jsonl/log/min.js/css 등 위험 확장자는 임계 절반 적용
 #
 # 출력: 허용 시 exit 0. 차단 시 hookSpecificOutput.permissionDecision="deny" + reason.
@@ -83,8 +83,8 @@ if size > threshold_bytes:
         f"large-read-guard 차단: '{fp}' 크기 {mb:.1f}MB (임계 {threshold_bytes/(1024*1024):.1f}MB). "
         "통째 read 금지. 다음 중 하나로 다시 시도: "
         "(1) Read tool에 offset/limit 지정, "
-        "(2) ctx_read mode='lines:N-M' 또는 mode='signatures', "
-        "(3) ctx_search 로 패턴 좁힌 grep, "
+        "(2) Grep 또는 rg 로 필요한 줄을 먼저 찾고 그 구간만 Read, "
+        "(3) head/tail 로 앞뒤만 보기, "
         "(4) PDF면 Read pages='1-5' 식. "
         "참고: ~/.claude/CLAUDE.md '큰 입력 방어'."
     )
@@ -105,7 +105,7 @@ except Exception:
 if est_lines > threshold_lines:
     deny(
         f"large-read-guard 차단: '{fp}' 추정 {est_lines:,} 줄 (임계 {threshold_lines:,}). "
-        "통째 read 금지. offset/limit 또는 ctx_read mode='lines:N-M', ctx_search 사용. "
+        "통째 read 금지. Read 의 offset/limit 으로 구간을 잡거나 Grep·rg 로 좁혀라. "
         "참고: ~/.claude/CLAUDE.md '큰 입력 방어'."
     )
 

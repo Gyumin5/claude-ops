@@ -24,6 +24,10 @@ class Env:
         self.notify_log = os.path.join(tmp, "notify.log")
         self.fake_claude = os.path.join(tmp, "fake-claude")
         self.fake_notify = os.path.join(tmp, "fake-notify")
+        # 수신 세션 이름은 기계마다 다르고 스크립트는 설정에서 읽는다. 검사는 그 값을
+        # 여기서 고정한다 — 글자를 검사 안에 박으면 그 검사는 어느 기계에서 도느냐로
+        # 붙었다 떨어졌다 한다.
+        self.notify_session = "beta/dotfiles"
         os.makedirs(os.path.join(tmp, "home", ".cache"), exist_ok=True)
         with open(self.fake_notify, "w") as f:
             # $2=세션 이름, $3=본문. 수신처도 따로 남긴다 — 본문만 보면 경보가
@@ -57,6 +61,7 @@ class Env:
             "HOME_CLAUDE_HEALTH_CLAUDE": self.fake_claude,
             "HOME_CLAUDE_HEALTH_NOTIFY": self.fake_notify,
             "NOTIFY_LOG": self.notify_log,
+            "HOME_CLAUDE_HEALTH_SESSION": self.notify_session,
         })
         return subprocess.run(["bash", SCRIPT], env=env, capture_output=True, text=True)
 
@@ -90,9 +95,11 @@ def _q(s):
 
 
 OK_NOISE = "Permission deny rule (.claude/settings.json): Write(**/.env*) is not matched"
-UPDATE_FAIL = "/home/user/.local/bin/claude: cannot execute binary file"
+UPDATE_FAIL = "/home/u/.local/bin/claude: cannot execute binary file"
 AUTH_FAIL = "Invalid API key · Please run /login"
 BARE_401 = "API error: 401 unauthorized (oauth)"
+# 2026-09-22 둘째 기계가 받은 경보에 실린 실제 probe 출력이다.
+LIMIT_FAIL = "You've hit your session limit · resets 1:20am (Asia/Seoul)"
 
 results = []
 
@@ -258,13 +265,75 @@ def main():
     print("수신처")
 
     def t15(e):
-        # 기본 수신처는 peer 프로젝트 세션이 아니라 peer-dotfiles 다. 여기가 틀리면
+        # 기본 수신처는 둘째 기계 프로젝트 세션이 아니라 <호스트>-dotfiles 다. 여기가 틀리면
         # 경보가 그걸 처리할 맥락이 없는 세션에 떨어지고 사람이 손으로 옮겨야 한다.
         e.set_probe((1, AUTH_FAIL), (1, AUTH_FAIL))
         e.run()
         s = e.notify_sessions()
-        check("경보는 peer-dotfiles 로 간다", s == ["peer-dotfiles"], str(s))
+        check("경보는 설정이 가리킨 세션으로 간다", s == [e.notify_session], str(s))
     case(t15)
+
+    def t15b(e):
+        # 설정이 비면 없는 세션으로 보내지 않는다. 보내는 쪽이 성공을 찍고 아무 데도
+        # 안 가면, 가장 알아야 할 때 조용해진다.
+        e.notify_session = ""
+        e.set_probe((1, AUTH_FAIL), (1, AUTH_FAIL))
+        e.run(); e.run()
+        log = os.path.join(e.state_dir, "probe.log")
+        body = open(log).read() if os.path.exists(log) else ""
+        check("수신 세션이 없으면 안 보낸다", e.notify_sessions() == [], str(e.notify_sessions()))
+        check("안 보낸 사실이 로그에 남는다", "notify-skipped reason=no-session" in body, body[-200:])
+    case(t15b)
+
+    def t16(e):
+        # 2026-09-22 실사례. 한도 응답이 "미분류" 로 떨어져 연속 2회차 경보가 나갔다.
+        # 한도는 고장이 아니다 — 계정이 살아 있다는 증거이고 창이 돌면 저절로 풀린다.
+        e.set_probe((1, LIMIT_FAIL), (1, LIMIT_FAIL))
+        e.run()
+        check("한도 1회차 무경보", e.notifications() == [], str(e.notifications()))
+        check("한도는 limit 으로 분류된다", (e.state() or {}).get("class") == "limit",
+              str(e.state()))
+        e.run()
+        check("한도 2회차도 무경보", e.notifications() == [], str(e.notifications()))
+        st = e.state() or {}
+        check("한도는 실패 횟수를 안 올린다", st.get("count") == "0", str(st))
+        check("한도 회차도 기록에는 남는다", "class=limit/limit" in e.probe_log(),
+              e.probe_log())
+    case(t16)
+
+    def t17(e):
+        # 한도가 풀리면 평소대로 성공으로 끝난다. 한도 구간이 앞선 상태를 오염시키지
+        # 않는지도 같이 본다 — 경보한 적이 없으므로 복구 알림도 나가면 안 된다.
+        e.set_probe((1, LIMIT_FAIL), (1, LIMIT_FAIL))
+        e.run()
+        e.set_probe((0, OK_NOISE))
+        e.run()
+        check("한도 뒤 성공은 조용히 끝난다", e.notifications() == [],
+              str(e.notifications()))
+        check("한도 뒤 성공이면 상태가 지워진다", e.state() is None, str(e.state()))
+    case(t17)
+
+    def t18(e):
+        # 한도 문구가 인증 갈래를 이기는지. 두 문구가 한 출력에 같이 있으면 한도다 —
+        # 한도에 걸렸다는 것 자체가 로그인이 살아 있다는 뜻이라 재로그인을 시키면 안 된다.
+        e.set_probe((1, LIMIT_FAIL + " · please run /login"),
+                    (1, LIMIT_FAIL + " · please run /login"))
+        e.run()
+        check("한도 문구가 인증 문구를 이긴다", "로그인 만료" not in " ".join(e.notifications()),
+              str(e.notifications()))
+        check("그 회차 분류는 limit", (e.state() or {}).get("class") == "limit",
+              str(e.state()))
+    case(t18)
+
+    def t19(e):
+        # 한도와 무관한 실패는 종전대로 미분류 경보가 나가야 한다. limit 갈래를 넣다가
+        # 이쪽을 삼키면 진짜 고장이 조용해진다.
+        e.set_probe((1, UPDATE_FAIL), (1, UPDATE_FAIL))
+        e.run()
+        e.run()
+        joined = " ".join(e.notifications())
+        check("한도 아닌 실패는 여전히 2회차에 알린다", "연속 2회차" in joined, joined)
+    case(t19)
 
     ok = all(results)
     print("\n%d/%d PASS" % (sum(results), len(results)))

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "arxiv-latex": {
+      "command": "bash",
+      "args": [
+        "-c",
+        "cd ~/.local/share/mcp/arxiv-latex-mcp && uv run server/main.py"
+      ]
+    }
+  }
+}

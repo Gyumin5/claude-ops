@@ -171,6 +171,18 @@ def inject(text):
                or os.environ.get("CLAUDE_SESSION_NAME") or "").strip()
     if not session:
         return False, "발신 세션명을 모른다(CLAUDE_DETACH_ORIGIN_SESSION 없음)"
+    if "/" not in session:
+        # CLAUDE_SESSION_NAME 은 짧은 이름이다(예: dotfiles). 두 기계에 같은 이름이
+        # 있으면 claude-userbot-send 가 거절하므로(944a4e0) 기계 이름을 붙여
+        # <기계>/<세션> 완전 주소로 만든다. claude-job-detach 가 각인해 주는
+        # CLAUDE_DETACH_ORIGIN_SESSION 은 이미 완전 주소라 여기 안 걸린다.
+        try:
+            with open(os.path.join(HOME, ".config", "claude-machine-id")) as f:
+                mid = f.read().strip()
+        except OSError:
+            mid = ""
+        if mid:
+            session = "%s/%s" % (mid, session)
     send = os.path.join(HOME, "dotfiles", "bin", "claude-userbot-send")
     if not os.path.exists(send):
         return False, "claude-userbot-send 가 없다"

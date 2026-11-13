@@ -4,8 +4,8 @@
 매 15분 timer가 호출. 각 systemd claude-*.service 활성 세션에 대해:
 - /proc/<pid>/cwd 에서 cwd 얻고 ~/.claude/projects/<key>/ 의 최근 .jsonl 파일 찾기
 - 마지막 user/assistant ts, 마지막 tool_use 후 매칭되는 tool_result 없으면 in-flight
-- 30분 이상 응답 없고 in-flight tool 도 없으면 컨트롤봇으로 알림 (알림이 여러 채팅으로
-  새어 나간 사고 뒤 정책: 컨트롤봇 한 채팅으로만)
+- 30분 이상 응답 없고 in-flight tool 도 없으면 컨트롤봇으로 알림 (Theta 누출 후
+  알림 정책: 컨트롤봇 한 채팅으로만)
 - 세션별 60분 쿨다운
 
 알림 내용:
@@ -19,18 +19,14 @@ import sys
 import time
 from pathlib import Path
 
-# 저장소 뿌리를 이 파일 위치에서 찾는다. 예전엔 홈 아래 고정 경로였는데,
-# 그러면 다른 자리에 받은 사람은 그대로 못 돌린다.
-REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-
 THRESHOLD_NO_ACTIVITY_SEC = 30 * 60
 ALERT_COOLDOWN_SEC = 60 * 60
 TOOL_INFLIGHT_WINDOW_SEC = 5 * 60
 # stuck-loop 예외: in-flight tool 이 있어도 assistant 응답이 너무 오래 끊기고
-# 큐잉된 사용자 prompt 가 누적되면 stuck 으로 판정 (2026-05-11 session-i 사고).
+# 큐잉된 사용자 prompt 가 누적되면 stuck 으로 판정 (2026-05-11 zeta 사고).
 STUCK_NO_ASSISTANT_SEC = 60 * 60
 STUCK_QUEUE_OP_MIN = 3
-# 자동 복구 (2026-05-28 session-i 1h thinking hang 사고 후):
+# 자동 복구 (2026-05-28 zeta 1h thinking hang 사고 후):
 # assistant 무응답 60분 + in-flight tool 없음 + 큐잉 사용자 ≥ 1 + rate-limit 차단 아님
 # + 직전 healthcheck 동일 상태 → 자동 cs restart.
 AUTO_RESTART_ASSISTANT_AGE_SEC = 60 * 60
@@ -45,14 +41,14 @@ AUTO_RESTART_GLOBAL_MAX_PER_TICK = 1
 SHADOW_FLAG = Path.home() / ".claude" / "state" / "auto-restart-enforce.flag"
 AUTO_RESTART_STATE_DIR = Path.home() / ".claude" / "state" / "auto-restart"
 # shadow 로 판정된 무진행을 사람에게 알린다(2026-08-11, history #56).
-# 그 전까지 shadow 는 스냅샷 파일만 쓰고 아무한테도 안 알렸다 — 08-11 옆 기계 2시간 40분
+# 그 전까지 shadow 는 스냅샷 파일만 쓰고 아무한테도 안 알렸다 — 08-11 둘째 기계 2시간 40분
 # 건을 11:40 부터 6회 정확히 잡아놓고도 아무도 몰랐다. 감지가 아니라 출력이 없던 것이다.
 # 자동 개입(restart·주입)은 그대로 안 한다: 그날처럼 요청이 늦게라도 끝나는 경우
 # 재시작은 진행 중이던 작업을 죽인다(ai-debate run-20260811T053205Z).
 HANG_ALERT_MAX_AGE_SEC = 24 * 3600   # 이보다 오래된 건 멈춘 게 아니라 방치된 세션이다
 HANG_ALERT_COOLDOWN_SEC = 6 * 3600   # 세션당
-# 임계 근거(실측, 스냅샷 3,681건 / 홈 61.7일 + 옆 기계 55.7일):
-# 상한 없이 알리면 주당 11.8건인데 대부분 session-e·session-j·resume 처럼 며칠~한 달 방치된
+# 임계 근거(실측, 스냅샷 3,681건 / 홈 61.7일 + 둘째 기계 55.7일):
+# 상한 없이 알리면 주당 11.8건인데 대부분 albert·251229·resume 처럼 며칠~한 달 방치된
 # 세션이다(최대 무응답 51,951분). 24h 상한 + 6h 쿨다운이면 주당 4.6건으로 떨어지고,
 # 실제 사고 2건(08-11 160분, 08-05 fusion 1,114분)은 둘 다 상한 안에 남는다.
 STATUSLINE_CACHE = Path.home() / ".claude" / "statusline_cache.json"
@@ -64,12 +60,15 @@ EXCLUDE_SERVICES = {
     "claude-progress-updater.service",
     "claude-rate-limit-recovery.service",
     "claude-session-healthcheck.service",
-    "claude-daily-research.service",
 }
 STATE_DIR = Path.home() / ".claude" / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 CONTROL_BOT_ENV = Path.home() / ".claude" / "control-bot" / ".env"
-CONTROL_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from operator_chat import chat_id   # noqa: E402  (방 번호 단일 출처)
+
+CONTROL_CHAT_ID = chat_id()
 
 
 def load_control_token():
@@ -466,7 +465,10 @@ def snapshot_auto_restart(svc, payload):
 def cs_restart(name):
     try:
         r = subprocess.run(
-            [os.path.join(REPO, "bin/cs"), "restart", name],
+            # 옛 자리는 bin/cs 였는데 그 파일이 저장소에 없다 — cs 는 ~/.local/bin 에만
+            # 있는 claude-sessions 심링크다. 그래서 이 경로는 늘 없는 파일이었고
+            # 예외를 삼켜 "재시작 실패" 로만 보였다. 실체인 형제 파일을 직접 부른다.
+            [str(Path(__file__).resolve().parent / "claude-sessions"), "restart", name],
             capture_output=True, text=True, timeout=60,
         )
         return r.returncode == 0, (r.stdout + r.stderr)[-400:]
@@ -495,7 +497,7 @@ def main():
         events = parse_jsonl_tail(jl, n=300)
         info = analyze_session(events)
         # idle 계산: 마지막 user/assistant ts 만 사용. jsonl mtime 은 queue-operation
-        # 이벤트로 갱신될 수 있어서 false-negative (session-i 5/10 hang 사고).
+        # 이벤트로 갱신될 수 있어서 false-negative (zeta 5/10 hang 사고).
         last_act_candidates = [info["last_user_ts"], info["last_assistant_ts"]]
         last_act_candidates = [x for x in last_act_candidates if x is not None]
         if not last_act_candidates:
@@ -595,7 +597,7 @@ def main():
             snapshot_auto_restart(svc, payload)
             findings.append(f"{name}(shadow)")
             # 스냅샷만 남기고 끝내지 않는다. 여기까지 온 건 판정이 다 통과했다는 뜻이고,
-            # 그걸 파일에만 적어두면 아무도 모른다(08-11 옆 기계 건이 그랬다).
+            # 그걸 파일에만 적어두면 아무도 모른다(08-11 둘째 기계 건이 그랬다).
             if hang_alert_due(svc, payload["assistant_age_sec"]):
                 telegram_alert(
                     token,
@@ -738,6 +740,42 @@ def evaluate_install_state():
             ("install-stale", ok_head) + tuple(hits))
 
 
+def install_session_name():
+    """이 호스트에서 저장소를 들고 있는 세션 이름. 마커의 machine_id 가 단일 출처다."""
+    try:
+        mid = json.loads(INSTALL_OK.read_text()).get("machine_id") or ""
+    except Exception:
+        mid = ""
+    if not mid:
+        return ""
+    # <기계>/<세션> 완전 주소. 짧은 이름 'dotfiles' 는 두 기계에 다 있어 보내는 호스트
+    # 기준으로 조용히 풀린다 — claude-userbot-send 가 이제 그 이름을 거절한다.
+    return f"{mid}/dotfiles"
+
+
+def install_alert(token, text):
+    """install-watch 알림은 사람이 아니라 그 호스트의 저장소 세션으로 보낸다.
+
+    배포를 안 돌린 것은 사람이 처리할 일이 아니라 커밋한 세션이 안 끝낸 일이다(R39).
+    사람에게 쏘면 사람이 그 세션에 다시 옮겨 적어야 한다. 주입이 실패하면 그때는
+    사람에게 간다 — 조용히 삼키면 배포가 밀린 채로 아무도 모른다.
+    """
+    name = install_session_name()
+    if name:
+        try:
+            r = subprocess.run(["claude-userbot-send", "--session", name, text],
+                               capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+                return True
+        except Exception as exc:
+            text += f" (세션 주입 실패: {type(exc).__name__})"
+        else:
+            text += f" (세션 {name} 주입 실패 rc={r.returncode})"
+    else:
+        text += " (대상 세션 미확인 — 마커에 machine_id 가 없다)"
+    return telegram_alert(token, text)
+
+
 def check_install_state(token):
     """상태 지문 기반 알림. 같은 미해결 상태를 15분마다 반복하지 않는다(알림피로 방지)."""
     try:
@@ -762,7 +800,7 @@ def check_install_state(token):
             # 건이면 "아직 안 고쳐졌나?"가 실제 질문이 되므로 그때만 통보한다.
             age = now - int(prev.get("first_alert_ts") or 0)
             if age >= RECOVERY_NOTIFY_MIN_SEC or int(prev.get("alert_count") or 1) >= 2:
-                telegram_alert(token,
+                install_alert(token,
                                f"[install-watch] {host} 정상 복구. 이전 상태={prev.get('status')} "
                                f"(지속 {age // 3600}시간)")
             try:
@@ -774,7 +812,7 @@ def check_install_state(token):
     import hashlib
     fp = hashlib.sha1(("|".join([host, status] + [str(p) for p in parts])).encode()).hexdigest()[:12]
     if prev.get("fingerprint") != fp:
-        telegram_alert(token, f"[install-watch] {host} {status} — {detail}")
+        install_alert(token, f"[install-watch] {host} {status} — {detail}")
         _atomic_json(INSTALL_WATCH_STATE,
                      {"fingerprint": fp, "status": status, "detail": detail,
                       "first_alert_ts": now, "last_alert_ts": now, "alert_count": 1})
@@ -786,7 +824,7 @@ def check_install_state(token):
     age, since_last = now - first, now - last
     due = (age >= REALERT_AFTER_SEC and last <= first) or (since_last >= REALERT_INTERVAL_SEC)
     if due:
-        telegram_alert(token, f"[install-watch] {host} {status} 미해결 {age // 3600}시간 — {detail}")
+        install_alert(token, f"[install-watch] {host} {status} 미해결 {age // 3600}시간 — {detail}")
         prev.update(last_alert_ts=now, alert_count=int(prev.get("alert_count") or 1) + 1)
         _atomic_json(INSTALL_WATCH_STATE, prev)
 

@@ -60,7 +60,7 @@ resolve_mem_dir() {
         return 0
     fi
     rp=$(realpath "$cwd" 2>/dev/null || echo "$cwd")
-    # Claude Code 프로젝트 디렉토리 규칙: 절대경로의 '/' 를 '-' 로. (확인된 예: $HOME/dotfiles → -home-USER-dotfiles)
+    # Claude Code 프로젝트 디렉토리 규칙: 절대경로의 '/' 를 '-' 로. (확인된 예: /home/u/dotfiles → -home-u-dotfiles)
     key=$(printf '%s' "$rp" | sed -e 's|/|-|g')
     [ -z "$key" ] && return 1
     printf '%s' "$HOME/.claude/projects/${key}/memory"
@@ -76,8 +76,8 @@ ACTIVE="$ADIR/active.md"
 
 # git 이 추적 중인 파일은 안 건드린다. 이 스크립트는 매 턴 도는데, 추적되는 파일을
 # 매 턴 고치면 그 저장소는 늘 dirty 상태가 되고 checkout·merge 가 막힌다 —
-# session-f 가 worktree 에서 실제로 겪었다. 2026-08-20 실측으로 17개 중 4개가
-# 추적 중이다(peer, proj-b, proj-b-wt/camera, proj-b-wt/leg).
+# raise-lidar 가 worktree 에서 실제로 겪었다. 2026-08-20 실측으로 17개 중 4개가
+# 추적 중이다(저장소 네 곳).
 # 추적을 풀지 말지는 그 저장소 판단이라 여기서 대신 정하지 않는다. 대신 조용히
 # 지나가지 않고 로그에 남긴다 — 안 그러면 "켰는데 왜 안 되지"가 된다.
 # 락·임시파일·사본보다 먼저 본다. 뒤에 두면 생성은 거부하면서 .active.md.lock 과
@@ -104,7 +104,7 @@ ts=$(date '+%Y-%m-%d %H:%M KST' 2>/dev/null)
 
 # --- flock 직렬화 (#7). flock 없으면(macOS 기본) 락 없이 진행(방어적). ---
 # 락은 저장소 밖에 둔다. 프로젝트 안(history/.active.md.lock)에 만들면 추적을 푼
-# 저장소마다 untracked 로 남아 git status 를 영구히 더럽힌다 — proj-b 가 추적을 풀자마자
+# 저장소마다 untracked 로 남아 git status 를 영구히 더럽힌다 — raise 가 추적을 풀자마자
 # 그렇게 나왔다. 락은 실행 시 부산물이지 프로젝트 파일이 아니다. 같은 FS 여야 하는 건
 # 원자적 mv 대상인 TMP 뿐이고 락은 아무 데나 있어도 된다.
 LOCKDIR="$HOME/.claude/state/active-md-locks"
@@ -127,7 +127,7 @@ MAXBYTES=6000
 
 # history.md 에서 "최근 N건" 을 뽑을 때 쓸 명령(head 또는 tail)을 정렬 방향으로 정한다.
 #   규약은 append(오래된 것이 위)지만 실제로 prepend(최신이 위)로 쓰는 프로젝트가 있다
-#   — 2026-08-20 실측: session-j 는 첫 헤더 2026-08-20 / 끝 헤더 2026-04-21 로 역순이고,
+#   — 2026-08-20 실측: 251229 는 첫 헤더 2026-08-20 / 끝 헤더 2026-04-21 로 역순이고,
 #   나머지 여덟은 append 였다. 방향을 가정하고 tail 을 쓰면 그 프로젝트에서는
 #   가장 오래된 것을 집는다. 최신 기각이 조용히 빠지는 쪽이라 침묵 실패다.
 #   판정 불가(헤더 0~1개, 날짜 없음)면 규약 기본인 append 로 본다.
@@ -146,8 +146,8 @@ RECENT=tail
 
 # 수기 관리본을 말없이 덮지 않는다. 이 스크립트는 기존 active.md 를 읽지 않고 통째로
 # 갈아치우는데, 지금 신뢰 allowlist 에는 dotfiles 한 줄뿐이라 나머지 트리의 active.md 는
-# 전부 사람이(세션이) 손으로 써온 것이다 — 2026-08-20 실측으로 proj-b 363줄,
-# session_c_work 592줄. 그 트리를 allowlist 에 넣는 순간 그게 25줄 자동요약으로
+# 전부 사람이(세션이) 손으로 써온 것이다 — 2026-08-20 실측으로 raise 363줄,
+# gamma_work 592줄. 그 트리를 allowlist 에 넣는 순간 그게 25줄 자동요약으로
 # 바뀌고, history/ 를 gitignore 한 저장소에서는 되돌릴 방법이 없다.
 # 그래서 자동 헤더가 없는 파일은 첫 실행에서 사본을 남기고, 생성본 머리에 그 경로를 적는다.
 MANUAL_BAK=""
@@ -176,8 +176,8 @@ fi
     # 0-a) 고정 서문. history/active-preamble.md 가 있으면 그대로 맨 앞에 붙인다.
     #    이 파일은 생성기가 안 건드린다 — 프로젝트가 손으로 관리하는 상시 제약용이다.
     #    필요한 이유: 생성기는 history.md 에서 뽑아 쓰는 것만 실을 수 있는데, 프로젝트마다
-    #    "매 세션 맨 위에 반드시 보여야 하는" 안전 제약이 따로 있다(2026-08-20 peer:
-    #    sudo 금지·공용 계정·실행 중 so 제자리수정 금지 등). 그게 재생산이 안 돼서 peer 은
+    #    "매 세션 맨 위에 반드시 보여야 하는" 안전 제약이 따로 있다(2026-08-20 한 로봇 저장소:
+    #    sudo 금지·공용 계정·실행 중 so 제자리수정 금지 등). 그게 재생산이 안 돼서 그 저장소는
     #    자동생성을 못 켠다고 했고, 그 판단이 맞다 — 안전 제약이 사라지는 건 요약이 얇아지는
     #    것과 다른 종류의 손실이다. 기각 목록보다도 앞에 둔다.
     #    상한을 두는 이유는 서문이 예산을 다 먹으면 기각 목록이 밀려나기 때문이다.
@@ -200,10 +200,10 @@ fi
     #    실측 배경(2026-08-20): 여섯 프로젝트에 이 기재가 171건 있는데 이 파일에는
     #    한 건도 안 실리고 있었다. 기록은 있었고 조회가 끊겨 있었다.
     #    출처는 루트 history.md 하나가 아니다. 결정 로그를 history/<이름>.md 로 쪼개는
-    #    프로젝트가 있다 — proj-b 는 센서별로 나눠 history/lidar.md 에 결정 477건·기각
+    #    프로젝트가 있다 — raise 는 센서별로 나눠 history/lidar.md 에 결정 477건·기각
     #    103건이 있는데, 루트만 읽던 동안 그게 통째로 시야 밖이었다(2026-08-20
-    #    session-f 보고, 실측 확인). 형식을 아무리 지켜도 안 실리는 종류의 사각지대다.
-    #    월별 archive(history/YYYY-MM*.md)는 뺀다 — 규약상 lazy load 대상이고, proj-b 만
+    #    raise-lidar 보고, 실측 확인). 형식을 아무리 지켜도 안 실리는 종류의 사각지대다.
+    #    월별 archive(history/YYYY-MM*.md)는 뺀다 — 규약상 lazy load 대상이고, raise 만
     #    해도 137건이라 최근 기각을 밀어낸다. 뺐다는 사실은 아래 꼬리줄에 적는다.
     #    조용히 빼면 그게 다시 "있는 줄 알았는데 없던" 항목이 된다.
     neg_sources=""
@@ -235,7 +235,15 @@ $_f"
         negtotal=$((negtotal + _n))
         nsrc=$((nsrc + 1))
         _pick=$(_recent_cmd "$_f")
-        _lines=$(grep -E '^- *실험/실패' "$_f" 2>/dev/null | "$_pick" -10)
+        # 한 줄이 통째로 길다 — 기각 사유는 문단으로 적히므로 그대로 실으면 열 줄이
+        # 6000바이트 예산을 거의 다 먹고, 정작 최근 결정이 잘려 나간다(11-05 실측 6781바이트).
+        # 앞머리만 싣고 원문은 history.md 로 보낸다. 글자 단위로 자른다 — 바이트로 자르면
+        # 한글이 깨진다.
+        _lines=$(grep -E '^- *실험/실패' "$_f" 2>/dev/null | "$_pick" -10 \
+                 | python3 -c 'import sys
+for ln in sys.stdin:
+    ln = ln.rstrip("\n")
+    print(ln if len(ln) <= 200 else ln[:200] + " …(원문은 history.md)")')
         negbody="${negbody}### $(basename "$_f") (${_n}건 중 최근 $(printf '%s\n' "$_lines" | wc -l)건)
 ${_lines}
 "

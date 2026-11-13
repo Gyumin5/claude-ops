@@ -1,0 +1,17 @@
+[Unit]
+Description=Run claude-daily-report-healthcheck 09:30~17:30 KST (재시도, 마감 17시)
+
+[Timer]
+# 09:30 단발이면 늦게 끝낸 세션을 오탐한다(2026-07-26 실사고). 2시간 간격으로
+# 재검사하고, 스크립트가 마감(17시) 전에는 pending 으로만 남긴다.
+OnCalendar=*-*-* 09:30:00
+OnCalendar=*-*-* 11:30:00
+OnCalendar=*-*-* 13:30:00
+OnCalendar=*-*-* 15:30:00
+OnCalendar=*-*-* 17:30:00
+Persistent=true
+AccuracySec=1min
+Unit=claude-daily-report-healthcheck.service
+
+[Install]
+WantedBy=timers.target

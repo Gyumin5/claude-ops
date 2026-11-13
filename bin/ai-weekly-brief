@@ -1,0 +1,343 @@
+#!/bin/bash
+# ai-weekly-brief: 주 1회 연구 후보 수집 + 설치 확장 점검을 한 회차로 묶어 보고한다.
+#
+# 이 파일만 잠금·로그·상태·보고서·텔레그램 전송을 맡는다. 수집·점검·평가는
+# 같은 디렉토리의 세 모듈이 한다(심링크 실행 대비 realpath 로 찾는다).
+#   ai-weekly-brief-collect.py    출처에서 후보를 모아 순위대로 고른다
+#   ai-weekly-brief-audit.py      설치된 확장의 근거를 모은다
+#   ai-weekly-brief-evaluate.py   둘을 한 번의 토론에 넘겨 판정을 받는다
+#
+# 크론은 이미 세션 밖이라 claude-job-detach 를 쓰지 않는다.
+#
+# 실행 슬롯은 홈 호스트 사용자 크론탭의 월요일 09:30 KST 다(저장소 밖이라 여기에만
+# 적어 둔다 — install.sh 는 크론탭을 안 건드린다). 2026-10-19 운영자 지시로
+# 일요일 05:30 에서 옮겼다. 바꿀 때는 `crontab -l` 을 먼저 파일로 받아 두고 고친다.
+
+set -uo pipefail
+
+export NVM_DIR="$HOME/.nvm"
+set +u
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+set -u
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+COLLECT="$SCRIPT_DIR/ai-weekly-brief-collect.py"
+AUDIT="$SCRIPT_DIR/ai-weekly-brief-audit.py"
+EVALUATE="$SCRIPT_DIR/ai-weekly-brief-evaluate.py"
+
+source "$SCRIPT_DIR/../lib/operator_chat.sh"   # 방 번호 단일 출처
+CHAT_ID="$(operator_chat_id)" || exit 1
+# 회차가 끝나면 이 세션에 결과를 주입한다 — 사람에게만 보내면 아무도 판단하지 않는다.
+# 수신처는 <기계>/<세션> 완전 주소다. 짧은 이름 'dotfiles' 는 두 기계에 다 있어
+# claude-userbot-send 가 rc=1 로 거절한다(944a4e0) — 그러면 회차 결과가 아무 세션에도
+# 안 닿고 로그에만 남는다.
+INJECT_SESSION="${AIWB_SESSION:-$(cat "$HOME/.config/claude-machine-id" 2>/dev/null || echo home)/dotfiles}"
+# 비밀은 이 파일에서만 읽는다. 코드·로그·보고서에 토큰을 적지 않는다.
+TELEGRAM_ENV="$HOME/dotfiles/.claude/telegram/.env"
+DATA_DIR="$HOME/.local/share/ai-briefing"
+STATE_DIR="$HOME/.local/state/ai-weekly-brief"
+REPORT_DIR="$DATA_DIR/weekly-brief"
+RUN_DIR="$STATE_DIR/run"
+TODAY=$(date '+%Y-%m-%d')
+RUN_ID=$(date -u '+%Y%m%dT%H%M%SZ')
+LOG_FILE="$DATA_DIR/ai-weekly-brief.log"
+STATUS_FILE="$STATE_DIR/status.jsonl"
+HISTORY_FILE="$STATE_DIR/seen-history.jsonl"
+REPORT_FILE="$REPORT_DIR/${TODAY}.md"
+LOCK_FILE="$STATE_DIR/.run.lock"
+DAYS="${AIWB_DAYS:-7}"
+DEADLINE=$(( $(date +%s) + 1800 ))   # 회차 전체 예산. 전송 시간은 아래에서 따로 남긴다.
+
+mkdir -p "$DATA_DIR" "$STATE_DIR" "$REPORT_DIR" "$RUN_DIR"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
+status() {  # status <단계> <성공여부> <추가 JSON 조각>
+    printf '{"ts":"%s","run_id":"%s","phase":"%s","success":%s%s}\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$RUN_ID" "$1" "$2" \
+        "${3:+,$3}" >> "$STATUS_FILE"
+}
+left() { echo $(( DEADLINE - $(date +%s) )); }
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    log "다른 회차가 돌고 있어 건너뛴다"
+    exit 0
+fi
+
+log "=== 회차 시작 $RUN_ID (최근 ${DAYS}일) ==="
+status start true
+
+CAND="$RUN_DIR/candidates.jsonl"
+APPENDIX="$RUN_DIR/appendix.jsonl"
+SRCSTAT="$RUN_DIR/sources.json"
+AUDITF="$RUN_DIR/installs.json"
+EVALF="$RUN_DIR/evaluation.json"
+INPUTF="$RUN_DIR/debate-input.txt"
+
+# ── 1. 수집 ──
+collect_out=$(timeout 600 python3 "$COLLECT" --out "$CAND" --status "$SRCSTAT" \
+    --appendix "$APPENDIX" --history "$HISTORY_FILE" --days "$DAYS" \
+    --budget 30000 2>>"$LOG_FILE")
+collect_rc=$?
+log "수집: rc=$collect_rc $collect_out"
+if [ "$collect_rc" -ne 0 ]; then
+    : > "$CAND"
+    status collect false "\"error\":\"rc_$collect_rc\""
+else
+    status collect true "\"summary\":\"$collect_out\""
+fi
+cand_count=$( [ -f "$CAND" ] && wc -l < "$CAND" || echo 0 )
+
+# ── 2. 설치 점검 근거 ──
+audit_out=$(timeout 180 python3 "$AUDIT" --out "$AUDITF" --budget 10000 2>>"$LOG_FILE")
+audit_rc=$?
+log "설치 근거: rc=$audit_rc $audit_out"
+[ "$audit_rc" -eq 0 ] || echo '{"items":[],"problems":["수집 실패"]}' > "$AUDITF"
+status audit $( [ "$audit_rc" -eq 0 ] && echo true || echo false ) "\"summary\":\"$audit_out\""
+
+# ── 3. 평가 (연구 + 설치 점검을 한 번의 토론으로) ──
+eval_budget=$(( $(left) - 180 ))   # 전송에 쓸 시간을 남긴다
+if [ "$eval_budget" -lt 120 ]; then
+    log "시간이 모자라 평가를 건너뛴다"
+    echo '{"state":"시간 부족으로 평가 생략","decision":""}' > "$EVALF"
+    status evaluate false "\"error\":\"no_time\""
+else
+    eval_out=$(timeout "$eval_budget" python3 "$EVALUATE" --candidates "$CAND" \
+        --audit "$AUDITF" --trend "$REPORT_DIR" --out "$EVALF" \
+        --input-dump "$INPUTF" 2>>"$LOG_FILE")
+    eval_rc=$?
+    log "평가: rc=$eval_rc $eval_out"
+    if [ "$eval_rc" -ne 0 ] || [ ! -s "$EVALF" ]; then
+        echo '{"state":"평가 실패","decision":""}' > "$EVALF"
+        status evaluate false "\"error\":\"rc_$eval_rc\""
+    else
+        status evaluate true "\"summary\":\"$eval_out\""
+    fi
+fi
+
+# ── 4. 보고서 작성 (전송 전에 반드시 로컬에 남긴다) ──
+python3 - "$REPORT_FILE" "$SRCSTAT" "$AUDITF" "$EVALF" "$APPENDIX" "$TODAY" "$RUN_ID" <<'PY' 2>>"$LOG_FILE"
+import json, os, sys
+report, srcstat, auditf, evalf, appendix, today, run_id = sys.argv[1:8]
+
+def jload(p, d):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return d
+
+src = jload(srcstat, {"sources": []})
+audit = jload(auditf, {"items": []})
+ev = jload(evalf, {})
+
+lines = ["# 주간 브리핑 %s" % today, "run_id: %s" % run_id, ""]
+lines.append(ev.get("decision") or ("판정 없음 — " + (ev.get("state") or "사유 미상")))
+lines += ["", "## 출처별 수집 상태"]
+for s in src.get("sources", []):
+    lines.append("- %s: %s %d건%s" % (s.get("source"), s.get("state"),
+                                      s.get("count", 0),
+                                      (" (" + s["note"] + ")") if s.get("note") else ""))
+lines.append("- 원본 %s / 묶음 %s / 최근 소개로 억제 %s / 평가에 올린 것 %s"
+             % (src.get("raw", 0), src.get("merged", 0),
+                src.get("suppressed", 0), src.get("selected", 0)))
+lines += ["", "## 평가 입력",
+          "- 바이트 %s, 후보 %s, 설치물 %s, 상태 %s"
+          % (ev.get("input_bytes", 0), ev.get("candidates", 0),
+             ev.get("installs", 0), ev.get("state", "?"))]
+if ev.get("fit_note"):
+    lines.append("- " + ev["fit_note"])
+if ev.get("deficit"):
+    lines.append("- 토론 결손: " + ev["deficit"])
+if ev.get("run_dir"):
+    lines.append("- 토론 원문: " + ev["run_dir"])
+if audit.get("problems"):
+    lines.append("- 설치 목록 결손: " + "; ".join(audit["problems"]))
+
+rows = []
+if os.path.exists(appendix):
+    with open(appendix, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+if rows:
+    lines += ["", "## 부록 — 이번에 평가로 안 올린 후보 %d건" % len(rows)]
+    for r in rows[:120]:
+        lines.append("- [%s] %s — %s — %s"
+                     % (r.get("drop_reason", ""), r.get("title", "")[:90],
+                        r.get("source", ""), r.get("url", "")))
+
+with open(report, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines) + "\n")
+print(report)
+PY
+log "보고서: $REPORT_FILE"
+
+# ── 5. 이력 기록 (평가에 올린 것만 — 억제는 다음 회차부터) ──
+python3 - "$CAND" "$HISTORY_FILE" "$TODAY" <<'PY' 2>>"$LOG_FILE"
+import json, sys
+cand, hist, today = sys.argv[1:4]
+n = 0
+with open(hist, "a", encoding="utf-8") as out:
+    try:
+        f = open(cand, encoding="utf-8", errors="replace")
+    except OSError:
+        f = []
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            c = json.loads(line)
+        except Exception:
+            continue
+        out.write(json.dumps({"work_id": c.get("work_id"), "event": c.get("event"),
+                              "url": c.get("url"), "date": today},
+                             ensure_ascii=False) + "\n")
+        n += 1
+print(n)
+PY
+
+# ── 6. 전달: 본문 + 전체 보고서 첨부. 둘의 성공을 각각 확인한다 ──
+BOT_TOKEN=""
+if [ -f "$TELEGRAM_ENV" ]; then
+    # shellcheck disable=SC1090
+    source "$TELEGRAM_ENV"
+fi
+BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${BOT_TOKEN:-}}"
+if [ -z "$BOT_TOKEN" ]; then
+    log "ERROR 봇 토큰 없음 — 보고서는 $REPORT_FILE 에 남았다"
+    status telegram false "\"error\":\"no_token\""
+    exit 1
+fi
+
+# 운영자에게 목록을 통째로 보내지 않는다. 목록만 오면 무엇을 할지는 여전히
+# 사람이 골라야 해서 전달이 안 된 것과 같다(운영자 지시). 채팅에는 회차가
+# 끝났다는 것과 규모만 알리고, 전체 목록은 첨부 보고서가 가진다. 무엇을 할지는
+# 주입받은 세션이 판단해서 따로 보낸다.
+BODY=$(python3 - "$REPORT_FILE" <<'PY'
+import sys
+head = []
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    for line in f:
+        if line.startswith("## 출처별"):
+            break
+        head.append(line.rstrip())
+flow = next((l for l in head if l.startswith("이번 주 흐름:")), "")
+# 추천 줄은 '#1' 처럼 번호가 바로 붙는다. 문서 제목('# 주간 브리핑')과
+# 절 제목('## ...')을 같이 세면 한 건이 더 잡힌다.
+n_rec = sum(1 for l in head if len(l) > 1 and l[0] == "#" and l[1].isdigit())
+n_check = sum(1 for l in head if l.startswith("확인 필요:"))
+print("\n".join(x for x in [
+    "주간 브리핑 회차가 끝났다. 추천 %d건, 확인 필요 %d건." % (n_rec, n_check),
+    flow,
+    "전체 목록은 첨부 보고서에 있다. 무엇을 할지는 읽고 판단해서 따로 보낸다.",
+] if x))
+PY
+)
+
+send_ok() {  # 응답의 ok 필드까지 본다. HTTP 200 이어도 ok=false 가 있다.
+    python3 -c "
+import json,sys
+try:
+    print('true' if json.loads(sys.argv[1]).get('ok') else 'false')
+except Exception:
+    print('false')" "$1"
+}
+
+resp=$(curl -sS --max-time 60 -X POST \
+    "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+    -d chat_id="$CHAT_ID" --data-urlencode "text=$BODY" \
+    -d disable_web_page_preview=true 2>>"$LOG_FILE")
+body_ok=$(send_ok "$resp")
+log "본문 전송 ok=$body_ok"
+status telegram_body "$body_ok" "\"bytes\":${#BODY}"
+
+resp2=$(curl -sS --max-time 120 -X POST \
+    "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
+    -F chat_id="$CHAT_ID" -F document=@"$REPORT_FILE" 2>>"$LOG_FILE")
+file_ok=$(send_ok "$resp2")
+log "첨부 전송 ok=$file_ok"
+status telegram_file "$file_ok" "\"path\":\"$REPORT_FILE\""
+
+# ── 6-b. 링크드인 대기열 소비 — 본문이 실제로 나간 회차만 ──
+# 수집(하루 한 번)과 소비(주 1회)를 나눠 둔 이유가 여기다. 보고서가 못 나간 회차에
+# 대기열을 비우면 그 주에 저장한 글이 통째로 사라진다.
+LKD_QUEUE="$HOME/dotfiles/state/linkedin/queue.jsonl"
+if [ "$body_ok" = "true" ] && [ -s "$LKD_QUEUE" ]; then
+    cat "$LKD_QUEUE" >> "$HOME/dotfiles/state/linkedin/consumed.jsonl"
+    : > "$LKD_QUEUE"
+    log "링크드인 대기열 소비 완료"
+fi
+
+if [ "$file_ok" != "true" ] && [ "$body_ok" = "true" ]; then
+    curl -sS --max-time 30 -X POST \
+        "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        --data-urlencode "text=첨부 전송 실패. 보고서는 이 경로에 있다: $REPORT_FILE" \
+        > /dev/null 2>&1
+fi
+
+# ── 7. 세션 주입: 판단할 세션이 받아야 움직인다 ──
+# 본문이 아니라 경로와 짧은 요약만 보낸다. 주입된 글은 압축 전까지 매 턴 다시
+# 실려서 비용이 남은 턴 수만큼 곱해진다(전역 규칙 R31).
+INJECT=$(python3 - "$REPORT_FILE" "$RUN_DIR/evaluation.json" <<'PY' 2>>"$LOG_FILE"
+import json, os, sys
+report, evaljson = sys.argv[1], sys.argv[2]
+state, run_dir = "미상", ""
+try:
+    with open(evaljson, encoding="utf-8") as f:
+        e = json.load(f)
+    state = e.get("state", "미상")
+    run_dir = e.get("run_dir", "")
+except Exception:
+    pass
+head = []
+try:
+    with open(report, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.startswith("## 출처별"):
+                break
+            head.append(line.rstrip())
+except OSError:
+    pass
+flow = next((l for l in head if l.startswith("이번 주 흐름:")), "")
+n_rec = sum(1 for l in head if len(l) > 1 and l[0] == "#" and l[1].isdigit())
+n_check = sum(1 for l in head if l.startswith("확인 필요:"))
+print("\n".join([
+    "주간 브리핑 회차가 끝났다. 운영자에게는 끝났다는 알림과 첨부 보고서만 갔다 —",
+    "목록 본문은 안 보냈다. 정리해서 보내는 것이 네 몫이고 그게 전달이다.",
+    "보고서: " + report,
+    "평가 상태: %s / 추천 %d건 / 확인 필요 %d건" % (state, n_rec, n_check),
+    flow,
+    "토론 원문: " + (run_dir or "(없음)"),
+    "",
+    "할 일: 이 보고서를 읽고 판단해라.",
+    "1) 추천 중에 실제로 해볼 것이 있으면 progress.md 태스크 목록에 한 줄로 넣는다.",
+    "2) 확인 필요 중에 진짜 확인할 것이 있으면 그것도 넣는다.",
+    "3) 걸릴 게 없으면 넣지 않는다 — 매주 할 일을 만들어내지 않는다.",
+    "4) 운영자에게 텔레그램으로 정리본을 반드시 한 번 보낸다. 가져갈 것과 그 이유,",
+    "   안 가져가는 것과 그 이유, 그래서 무엇을 할지를 적는다. 걸릴 게 없으면",
+    "   없다고 한 줄로 보낸다 — 아무것도 안 보내면 운영자는 첨부만 받은 셈이 된다.",
+    "원본을 그대로 옮겨 적지 말고 판단만 전해라.",
+]))
+PY
+)
+inject_ok=false
+if [ -n "$INJECT" ] && command -v claude-userbot-send > /dev/null 2>&1; then
+    if claude-userbot-send --session "$INJECT_SESSION" "$INJECT" >> "$LOG_FILE" 2>&1; then
+        inject_ok=true
+    fi
+fi
+log "세션 주입 ok=$inject_ok (대상 $INJECT_SESSION)"
+status inject "$inject_ok" "\"session\":\"$INJECT_SESSION\""
+
+status done true "\"candidates\":$cand_count,\"body_ok\":$body_ok,\"file_ok\":$file_ok"
+log "=== 회차 끝 ==="
+[ "$body_ok" = "true" ] || exit 1
+exit 0

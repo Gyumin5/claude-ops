@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""claude-nudge-audit — 넛지 장치 자신이 돌고 있는지 주기적으로 재고, 이상할 때만 알린다.
+
+넛지는 "세션이 멈췄는지" 를 보는 장치인데, 그 장치가 죽으면 아무도 모른다. 데몬이 꺼져도
+조용하고, 전송이 실패해도 로그 한 줄로 끝나고, 관측 실패 갈래(no-assistant-record)가 진짜로
+멈춘 세션을 가려도 그대로 넘어간다. 셋 다 "안 일어나는 일" 이라 사람 눈에는 평소와 같다.
+
+읽는 것은 넛지 상태파일과 회차 기록(nudge-ticks.log)이다. 사람이 읽는 문장 로그는 안 쓴다 —
+문구가 바뀌면 집계가 깨지고, 실제로 옛 기록은 사유 칸이 없어 "왜 안 보냈나" 를 셀 수 없다.
+전부 기록·상태로 증명되는 것만 보고, 추측으로 판정하는 항목은 넣지 않았다.
+
+  1) 데몬 정지   — 등록이 살아 있는데 그 세션의 넛지 유닛이 active 가 아니다
+  2) 회차 누락   — 등록이 살아 있는데 그 세션의 마지막 회차가 간격의 2.5배보다 오래됐다
+  3) 전송 실패   — 주입이 실패했다(말을 건 적이 없으므로 무응답 추적도 안 열린다)
+  4) 관측 실패 지속 — 같은 세션의 최근 회차가 연속 3회 이상 no-assistant-record 다.
+                     그 갈래는 "못 봤다" 라서 건너뛰는 자리인데, 계속되면 진짜로 멈춘 세션을
+                     가리고 있는 것과 구분이 안 된다.
+
+알림은 이상이 있을 때만, 같은 이상이면 한 번만 간다(6시간 지나면 한 번 더). 이상이 사라지면
+해소를 한 번 알리고 조용해진다. 수신처는 사람이 아니라 그 호스트의 저장소 세션이다 — 사람이
+할 일이 아니라 그 호스트가 고칠 일이기 때문이다(history #201 과 같은 기준).
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HOME = Path(os.path.expanduser("~"))
+# 저장소 안 자리는 자기 위치에서 뽑는다. 심링크로 배포되니 resolve 로 실체를 먼저 푼다.
+REPO = Path(__file__).resolve().parent.parent
+STATE_DIR = Path(os.environ.get("CLAUDE_NUDGE_STATE_DIR", HOME / ".claude" / "state"))
+NUDGE_DIR = STATE_DIR / "session-nudge"
+TICK_LOG = Path(os.environ.get("CLAUDE_NUDGE_TICKLOG",
+                               HOME / ".claude" / "logs" / "nudge-ticks.log"))
+AUDIT_STATE_DIR = Path(os.environ.get("CLAUDE_NUDGE_AUDIT_STATE_DIR",
+                                      HOME / ".local" / "state" / "claude-nudge-audit"))
+AUDIT_STATE = AUDIT_STATE_DIR / "state.json"
+NOTIFY_BIN = os.environ.get("CLAUDE_NUDGE_AUDIT_NOTIFY",
+                            str(HOME / ".local" / "bin" / "claude-userbot-send"))
+MACHINE_FILE = Path(os.environ.get("CLAUDE_MACHINE_ID_FILE",
+                                   HOME / ".config" / "claude-machine-id"))
+TG_ENV = os.environ.get("CLAUDE_NUDGE_TG_ENV",
+                        str(REPO / ".claude" / "telegram" / ".env"))
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from operator_chat import chat_id   # noqa: E402  (방 번호 단일 출처)
+
+TG_CHAT = chat_id()
+# 유닛 조회 명령. 검사가 실제 유닛 상태에 기대지 않고 정상·정지·조회불가 셋을 다 돌려볼
+# 수 있게 바깥에서 갈아끼운다(운영 기본값은 systemctl 그대로).
+SYSTEMCTL = os.environ.get("CLAUDE_NUDGE_AUDIT_SYSTEMCTL", "systemctl")
+
+# 그 호스트에서 저장소를 들고 있는 세션. 기계 이름이 키다. 모르는 머신이면 알리지
+# 않고 출력만 한다 — 남의 세션에 남의 호스트 이야기를 꽂는 것보다 조용한 쪽이 낫다
+# (머신 가드와 같은 취지).
+#
+# 수신처는 <기계>/<세션> 완전 주소로 적는다. 짧은 이름은 기계마다 같은 이름이 있으면
+# 보내는 호스트 기준으로 조용히 풀려서 엉뚱한 세션으로 간다 — claude-userbot-send 가
+# 그런 이름을 거절한다.
+#
+# 표는 저장소 밖 설정에서 읽는다. 기계 이름도 세션 이름도 쓰는 사람마다 달라서,
+# 코드에 박으면 그 이름이 아닌 기계에서는 매번 알림이 안 가고 그 사실이 안 보인다.
+#   cat ~/.config/claude-audit-sessions.json
+#   {"machine-a": "machine-a/dotfiles", "machine-b": "machine-b/dotfiles"}
+SESSIONS_FILE = os.environ.get(
+    "CLAUDE_NUDGE_AUDIT_SESSIONS",
+    str(HOME / ".config" / "claude-audit-sessions.json"))
+
+
+def repo_session(mid):
+    """그 기계의 수신 세션 완전 주소. 설정이 없거나 그 기계가 없으면 None."""
+    try:
+        with open(SESSIONS_FILE, encoding="utf-8") as f:
+            table = json.load(f)
+    except (OSError, ValueError):
+        return None
+    v = table.get(mid)
+    return v if isinstance(v, str) and v else None
+
+# "못 봤다" 로 건너뛰는 갈래들. 사유는 달라도 결과가 같다 — 그 회차에 넛지가 안 간다.
+# quota-blocked 는 뺐다(한도 해제 뒤 복구는 claude-stall-guard 가 맡는다). tool-running 도
+# 뺐다(도는 중인 게 정상이고, 오래 열리면 넛지 자신이 30분에 사람을 부른다).
+BLIND_TAGS = ("no-assistant-record", "no-transcript", "unit-not-active", "probe-fail")
+
+GAP_FACTOR = 2.5          # 마지막 회차 허용 공백 = 간격 × 이 값
+UNIT_RECHECK_SEC = int(os.environ.get("CLAUDE_NUDGE_AUDIT_RECHECK_SEC", "15"))
+UNIT_GRACE_SEC = 120      # 등록을 막 손댄 구간은 유닛 상태를 안 센다
+NO_TICK_GRACE_SEC = int(os.environ.get("CLAUDE_NUDGE_AUDIT_NOTICK_GRACE", "10800"))
+WINDOW_MIN = 60           # 로그를 거슬러 보는 구간(분)
+NO_RECORD_RUN = 3         # 관측 실패가 연속 몇 회면 이상으로 보나
+REPEAT_SEC = 6 * 3600     # 같은 이상을 다시 알리기까지
+TAIL_BYTES = 512 * 1024   # 로그 꼬리만 읽는다(통째 읽기 금지)
+NOW = int(time.time())
+
+
+def read_tail(path, nbytes):
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - nbytes))
+            data = fh.read()
+    except FileNotFoundError:
+        return []        # 아직 한 줄도 안 쌓인 것(배포 직후) — 유예 안에서 다룬다
+    except OSError:
+        return None      # 있는데 못 읽는 것 — 관측 불능이라 조용히 넘기지 않는다
+    text = data.decode("utf-8", "replace")
+    if size > nbytes:
+        text = text.split("\n", 1)[-1]   # 잘린 첫 줄은 버린다
+    return text.splitlines()
+
+
+def parse_line(line):
+    """회차 기록 한 줄 → dict. 칸이 안 맞으면 None(옛 줄·쓰다 만 줄)."""
+    parts = line.split("\t")
+    if len(parts) < 3:
+        return None
+    stamp = parts[0].replace(" KST", "").strip()
+    try:
+        ts = int(time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S")))
+    except ValueError:
+        return None
+    rec = {"ts": ts}
+    for kv in parts[1:]:
+        k, sep, v = kv.partition("=")
+        if sep:
+            rec[k] = v
+    if not rec.get("session") or not rec.get("tag"):
+        return None
+    return rec
+
+
+def num(rec, key):
+    try:
+        return int(rec.get(key) or "")
+    except ValueError:
+        return None
+
+
+def live_registrations(broken=None):
+    """지금 살아 있는 등록만. 꺼졌거나 종료시각이 지난 것은 감시 대상이 아니다.
+
+    못 읽는 상태파일은 조용히 건너뛰지 않는다 — 그 세션이 감시 대상에서 통째로
+    빠지는데 아무 표시가 없으면, 감시가 사라진 것과 이상이 없는 것이 같아 보인다.
+    """
+    out = {}
+    try:
+        files = sorted(NUDGE_DIR.glob("*.json"))
+    except OSError:
+        return out
+    for f in files:
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError) as e:
+            if broken is not None:
+                broken.append((f.stem, type(e).__name__))
+            continue
+        if not isinstance(d, dict):
+            if broken is not None:
+                broken.append((f.stem, "not-a-dict"))
+            continue
+        if not d.get("enabled"):
+            continue
+        try:
+            end = int(d.get("end_ts") or 0)
+        except (TypeError, ValueError):
+            if broken is not None:
+                broken.append((f.stem, "bad-end_ts"))
+            continue
+        if end <= NOW:
+            continue
+        out[f.stem] = d
+    return out
+
+
+def unit_active(session):
+    """active / inactive / 모름 셋으로 가른다. 모름은 고장이 아니다(fail-open)."""
+    try:
+        r = subprocess.run(
+            [SYSTEMCTL, "--user", "is-active",
+             "claude-session-nudge@%s.service" % session],
+            capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return True   # 못 물어봤으면 고장났다고 단정하지 않는다
+    state = r.stdout.strip()
+    if not state:
+        return True   # 답이 비었으면 조회가 안 된 것이다 — 꺼졌다고 읽지 않는다
+    return state == "active"
+
+
+def unit_down(session):
+    """정말 꺼졌나. 한 번 더 묻고, 그 사이 등록이 꺼졌으면 정상 종료로 본다.
+
+    등록과 유닛은 원자적으로 안 바뀐다 — 시작은 상태 저장 뒤 유닛 켜기, 중지는 유닛
+    끄기 뒤 상태 저장이다. 그 사이를 그대로 읽으면 정상 시작·정상 중지가 이상이 된다.
+    다음 회차(30분 뒤)까지 미루는 대신 같은 실행에서 짧게 다시 묻는다.
+    """
+    if unit_active(session):
+        return False
+    time.sleep(UNIT_RECHECK_SEC)
+    if unit_active(session):
+        return False
+    return session in live_registrations()
+
+
+def collect():
+    """(키, 사람이 읽는 한 줄) 목록. 키는 중복 알림을 가르는 데 쓴다."""
+    findings = []
+    broken = []
+    regs = live_registrations(broken)
+    lines = read_tail(TICK_LOG, TAIL_BYTES)
+    if lines is None:
+        findings.append(("tickread",
+                         "넛지 회차 기록을 못 읽는다(%s) — 지금은 넛지가 도는지 "
+                         "셀 수가 없다" % TICK_LOG))
+        lines = []
+    ticks = [r for r in (parse_line(ln) for ln in lines) if r]
+    for sess, why in broken:
+        findings.append(("reg:%s" % sess,
+                         "%s: 넛지 상태파일을 못 읽는다(%s) — 그 세션은 감시에서 빠진다"
+                         % (sess, why)))
+    # 창 안의 판정은 지금 등록이 살아 있는 세션만 본다. 끝난 등록의 옛 회차를 세면
+    # 이미 정리된 세션 때문에 알림이 간다.
+    window = [r for r in ticks
+              if r["ts"] >= NOW - WINDOW_MIN * 60 and r["session"] in regs]
+
+    last_tick, by_sess = {}, {}
+    for r in ticks:
+        last_tick[r["session"]] = max(last_tick.get(r["session"], 0), r["ts"])
+        by_sess.setdefault(r["session"], []).append(r)
+
+    # 회차 기록이 아예 없는 것은 배포 직후에는 정상이지만 영원히 정상일 수는 없다.
+    # 기록기가 고장나면 이 파일이 그대로 비어 있고, 그러면 아래 공백·연속 판정이
+    # 전부 "볼 게 없다" 로 조용해진다 — 감시가 사라진 자리가 가장 조용하다.
+    oldest = min([int(d.get("started_ts") or d.get("registered_ts") or NOW)
+                  for d in regs.values()] or [NOW])
+    if regs and not ticks and NOW - oldest >= NO_TICK_GRACE_SEC:
+        findings.append(("norec",
+                         "넛지 회차 기록이 %d시간째 한 줄도 없다(%s) — 기록기가 안 돌거나 "
+                         "데몬이 옛 코드로 돈다"
+                         % ((NOW - oldest) // 3600, TICK_LOG)))
+
+    for sess, d in sorted(regs.items()):
+        interval = int(d.get("interval_min") or 10)
+        started = max(int(d.get("started_ts") or 0), int(d.get("registered_ts") or 0))
+        gap_limit = int(interval * 60 * GAP_FACTOR)
+
+        # 사람에게 알리려다 실패한 채 멈춘 자리. 넛지는 멈췄는데(suspended) 그걸 알린
+        # 메시지가 없다 — 세션도 안 깨우고 사람도 모르는 상태라 아무 신호가 없다.
+        if d.get("suspended") and not d.get("alert_msg_id"):
+            findings.append(("mute:%s" % sess,
+                             "%s: 넛지가 멈춰 있는데 그 사실을 알린 메시지가 없다 "
+                             "(알림 전송이 실패한 채 고착)" % sess))
+
+        # 방금 등록을 손댄 구간은 유닛 상태를 안 센다 — 시작·중지는 원자적이지 않다.
+        if NOW - started >= UNIT_GRACE_SEC and unit_down(sess):
+            findings.append(("unit:%s" % sess,
+                             "%s: 등록은 살아 있는데 넛지 유닛이 안 돈다 "
+                             "(systemctl --user restart claude-session-nudge@%s.service)"
+                             % (sess, sess)))
+            continue
+        # 막 등록한 세션은 아직 회차가 없는 게 정상이다. 회차 기록이 아직 하나도 없는
+        # 호스트(배포 직후)도 마찬가지로 안 센다 — 기록이 없는 것과 회차가 끊긴 것은
+        # 다르고, 전자를 이상으로 읽으면 배포하자마자 거짓 알림이 간다.
+        if ticks and NOW - started >= gap_limit:
+            seen = last_tick.get(sess, 0)
+            if NOW - seen > gap_limit:
+                ago = "기록 없음" if not seen else "%d분 전" % ((NOW - seen) // 60)
+                findings.append(("gap:%s" % sess,
+                                 "%s: 마지막 넛지 회차가 %s 다(간격 %d분, 허용 %d분)"
+                                 % (sess, ago, interval, gap_limit // 60)))
+                continue
+
+        # 아래 둘은 이 등록의 회차만 본다. 끝난 등록의 옛 회차를 같이 세면 이미
+        # 정리된 사건이 지금 고장으로 되살아난다. 창 길이로 자르지 않는 이유는
+        # 간격이 길면 창 안에 연속 판정에 필요한 회차 수가 안 들어오기 때문이다 —
+        # 창이 아니라 "마지막 성공 이후" 로 센다.
+        mine = [r for r in by_sess.get(sess, []) if r["ts"] >= started - 60]
+        if not mine or NOW - mine[-1]["ts"] > gap_limit:
+            continue   # 회차 자체가 끊긴 상태는 위 공백 판정이 맡는다
+
+        fails = []
+        for r in reversed(mine):
+            if r["tag"] == "send-fail":
+                fails.append(r)
+            elif r["tag"] in ("send", "resend"):
+                break   # 그 뒤로 성공했으면 지금 끊겨 있는 게 아니다
+        # 한 번짜리 실패는 스스로 낫는다 — 창이 안 열려 다음 회차에 다시 보낸다.
+        # 두 번째부터가 "주입 경로가 끊겼다" 이고, 그게 09-17~19 의 56시간이다.
+        if len(fails) >= 2:
+            when = time.strftime("%H:%M", time.localtime(fails[0]["ts"]))
+            findings.append(("send:%s" % sess,
+                             "%s: 마지막 성공 뒤로 넛지 주입이 %d번 이어서 실패했다"
+                             "(마지막 rc=%s, %s 회차)"
+                             % (sess, len(fails), fails[0].get("rc") or "미상", when)))
+
+        # 못 보고 건너뛴 갈래가 이어지면 넛지는 영영 안 간다. 사유가 섞여도 결과는
+        # 같다 — 그 세션은 깨워지지 않는데 아무도 모른다.
+        run, kinds = 0, set()
+        for r in reversed(mine):
+            if r["tag"] in BLIND_TAGS:
+                run += 1
+                kinds.add(r["tag"])
+            else:
+                break
+        if run >= NO_RECORD_RUN:
+            findings.append(("blind:%s" % sess,
+                             "%s: 못 보고 건너뛴 회차가 연속 %d번이다(%s) — 그 세션은 "
+                             "그동안 넛지를 한 번도 못 받았다"
+                             % (sess, run, ", ".join(sorted(kinds)))))
+
+    # 같은 키가 여러 회차에서 나오면 한 번만 남긴다(문구는 처음 것).
+    seen_keys, uniq = set(), []
+    for key, text in findings:
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        uniq.append((key, text))
+
+    # 회차 집계 한 줄. 이상이 없어도 남긴다 — 나중에 "그때 넛지가 뭘 하고 있었나" 를
+    # 되짚을 근거가 이 줄뿐이고, 이상만 적으면 조용한 구간이 통째로 안 보인다.
+    tags = {}
+    for r in window:
+        tags[r["tag"]] = tags.get(r["tag"], 0) + 1
+    tally = ("점검: 등록 %d · 최근 %d분 회차 %d (%s) · 이상 %d"
+             % (len(regs), WINDOW_MIN, len(window),
+                ", ".join("%s %d" % kv for kv in sorted(tags.items())) or "없음",
+                len(uniq)))
+    return uniq, tally
+
+
+def load_state():
+    try:
+        return json.loads(AUDIT_STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(d):
+    try:
+        AUDIT_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = AUDIT_STATE.with_suffix(".tmp.%d" % os.getpid())
+        tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+        os.replace(tmp, AUDIT_STATE)
+    except OSError:
+        pass
+
+
+def machine():
+    try:
+        return MACHINE_FILE.read_text().strip()
+    except OSError:
+        return ""
+
+
+def telegram(text):
+    """사람에게 직접 보내는 대체 경로. 점검기가 잡는 고장 중 하나가 바로 주입 경로
+    고장이라, 알림을 그 경로 하나에만 묶으면 가장 알려야 할 순간에 같이 죽는다."""
+    tok = ""
+    try:
+        for ln in open(TG_ENV, errors="replace"):
+            k, sep, v = ln.partition("=")
+            if sep and k.strip() in ("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"):
+                tok = v.strip().strip('"').strip("'")
+    except OSError:
+        return False
+    if not tok:
+        return False
+    data = urllib.parse.urlencode({"chat_id": TG_CHAT, "text": text}).encode()
+    try:
+        with urllib.request.urlopen(
+                "https://api.telegram.org/bot%s/sendMessage" % tok, data=data,
+                timeout=20) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception:
+        return False
+
+
+def notify(text):
+    target = repo_session(machine())
+    rc, err = None, ""
+    if target:
+        try:
+            r = subprocess.run([NOTIFY_BIN, "--session", target, "--", text],
+                               capture_output=True, text=True, timeout=60)
+            rc, err = r.returncode, (r.stderr or "").strip()[:200]
+        except (OSError, subprocess.SubprocessError) as e:
+            rc, err = -1, str(e)[:200]
+        if rc == 0:
+            return True
+        print("세션 알림 실패 rc=%s %s — 사람에게 직접 보낸다." % (rc, err))
+    else:
+        print("알릴 세션을 모른다(machine=%s) — 사람에게 직접 보낸다."
+              % (machine() or "미확인"))
+    if telegram("[넛지 점검] 세션으로 알리지 못해 직접 보낸다.\n" + text):
+        return True
+    print("알림이 두 경로 다 실패했다.")
+    return False
+
+
+def main():
+    dry = "--dry-run" in sys.argv[1:]
+    findings, tally = collect()
+    print("[%s] %s" % (time.strftime("%Y-%m-%d %H:%M KST"), tally))
+    for _, text in findings:
+        print(text)
+    if not findings:
+        print("이상 없음")
+    if dry:
+        return 0
+
+    st = load_state()
+    sig = "|".join(k for k, _ in findings)
+    prev = st.get("sig", "")
+    last = int(st.get("notified_ts") or 0)
+
+    if findings:
+        if sig != prev or NOW - last >= REPEAT_SEC:
+            body = "\n".join("- " + t for _, t in findings)
+            if notify("[넛지 점검] 이상 %d건\n%s" % (len(findings), body)):
+                st["notified_ts"] = NOW
+                st["sig"] = sig
+            # 알림이 실패했으면 표식을 갱신하지 않는다. 갱신해 버리면 "이미 알렸다" 로
+            # 읽혀 그 이상은 영영 안 나간다 — 조용한 실패를 잡으려는 장치가 조용해진다.
+        else:
+            st["sig"] = sig
+    else:
+        if prev:
+            # 해소 알림도 실패하면 표식을 안 지운다. 지워 버리면 다음 회차에 "알릴 게
+            # 없다" 가 되어, 사람은 직전 이상이 아직 살아 있다고 믿은 채로 남는다.
+            if notify("[넛지 점검] 직전 이상은 해소됐다. "
+                      "지금은 등록된 넛지가 모두 정상이다."):
+                st["sig"] = ""
+                st["notified_ts"] = 0
+        else:
+            st["sig"] = ""
+            st["notified_ts"] = 0
+    st["checked_ts"] = NOW
+    save_state(st)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

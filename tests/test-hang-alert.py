@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """claude-session-healthcheck 무진행 알림 테스트.
 
-왜 있나: 2026-08-11 옆 기계 dotfiles 세션이 2시간 40분 멈췄는데 아무도 몰랐다. 조사해
+왜 있나: 2026-08-11 둘째 기계 dotfiles 세션이 2시간 40분 멈췄는데 아무도 몰랐다. 조사해
 보니 healthcheck 가 11:40 부터 12:56 까지 6회 정확히 잡아서 ~/.claude/state/auto-restart/
 에 shadow 스냅샷을 남겼고, 그게 전부였다 — 사람에게 가는 경로가 없었다. 감지가 아니라
 출력이 없던 것이다(history #56).
@@ -29,9 +29,20 @@ def check(name, cond, detail: object = ""):
           (("  — " + str(detail)) if detail and not cond else ""))
 
 
+def _plant_chat_id(home):
+    """방 번호는 추적 밖 설정에서 읽는다. 가짜 HOME 에 그 파일을 세워 실제 읽는 길을
+    그대로 지나가게 한다 — 없으면 모듈이 import 자리에서 거절하고 죽는다.
+    진짜 방 번호는 안 쓴다(지어낸 값이면 통로 판정에 충분하다)."""
+    d = os.path.join(home, ".config", "dotfiles-private")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "telegram.json"), "w", encoding="utf-8") as f:
+        f.write('{"operator_chat_id": "1234509876"}\n')
+
+
 def load(home):
     """HOME 을 갈아끼운 뒤 모듈을 새로 읽는다(경로 상수가 import 시점에 굳는다)."""
     os.environ["HOME"] = home
+    _plant_chat_id(home)
     loader = importlib.machinery.SourceFileLoader("hc", os.path.realpath(SCRIPT))
     spec = importlib.util.spec_from_loader("hc", loader)
     assert spec is not None
@@ -54,7 +65,7 @@ def main():
         hc = load(home)
 
         print("발송 판정")
-        # 08-11 옆 기계 실제 스냅샷 값(11:40:15 KST, assistant_age 4823s, 큐 3건).
+        # 08-11 둘째 기계 실제 스냅샷 값(11:40:15 KST, assistant_age 4823s, 큐 3건).
         check("실제 사고 값이면 알린다", hc.hang_alert_due("claude-dotfiles.service", 4823))
         check("같은 세션은 쿨다운 안에 다시 안 알린다",
               not hc.hang_alert_due("claude-dotfiles.service", 5723))
@@ -62,11 +73,11 @@ def main():
 
         print("상한")
         check("24시간 넘으면 방치된 세션으로 보고 안 알린다",
-              not hc.hang_alert_due("claude-session-e.service", 51951 * 60))
+              not hc.hang_alert_due("claude-albert.service", 51951 * 60))
         check("상한에 걸린 세션은 도장도 안 찍는다",
-              not (hc.STATE_DIR / "hang-alert-claude-session-e.service.flag").exists())
+              not (hc.STATE_DIR / "hang-alert-claude-albert.service.flag").exists())
         check("상한 바로 아래는 알린다",
-              hc.hang_alert_due("claude-session-a.service", hc.HANG_ALERT_MAX_AGE_SEC - 60))
+              hc.hang_alert_due("claude-alpha.service", hc.HANG_ALERT_MAX_AGE_SEC - 60))
 
         print("쿨다운 만료")
         flag = hc.STATE_DIR / "hang-alert-claude-dotfiles.service.flag"

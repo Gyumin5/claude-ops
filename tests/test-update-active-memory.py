@@ -14,7 +14,7 @@ GEN = str(Path(__file__).resolve().parent.parent / "claude" / "hooks" / "update_
 results = []
 
 
-def check(name, cond, detail=""):
+def check(name, cond, detail: object = ""):
     results.append(bool(cond))
     print(f"{'PASS' if cond else 'FAIL'}  {name}" + (f"\n      {detail}" if not cond and detail else ""))
 
@@ -40,7 +40,7 @@ def gen(tmp, *, history="", progress="# progress.md\nstatus: active\ntask: t\n",
 
 
 def hist(n_decisions=5, n_neg=0, prepend=False):
-    """history.md 픽스처. prepend=True 면 최신이 맨 위(session-j 형태)."""
+    """history.md 픽스처. prepend=True 면 최신이 맨 위(251229 형태)."""
     idx = range(n_decisions, 0, -1) if prepend else range(1, n_decisions + 1)
     out = []
     for i in idx:
@@ -90,7 +90,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
 with tempfile.TemporaryDirectory() as tmp:
     # 정렬 방향 실측. 규약은 append 지만 prepend(최신이 맨 위)로 쓰는 프로젝트가
-    # 있다(session-j). 방향을 가정하고 tail 을 쓰면 가장 오래된 것을 집어서 최신 기각이
+    # 있다(251229). 방향을 가정하고 tail 을 쓰면 가장 오래된 것을 집어서 최신 기각이
     # 조용히 빠진다 — 증상이 안 보이는 종류의 실패라 고정해 둔다.
     out = gen(tmp, history=hist(20, 20, prepend=True))
     check("prepend 에서 최신 기각을 집는다", "실패사례20" in out and "실패사례1 " not in out,
@@ -112,7 +112,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("판정 불가면 기본 동작", "하나뿐" in out, out)
 
 with tempfile.TemporaryDirectory() as tmp:
-    # 분리 로그. 결정 로그를 history/<이름>.md 로 쪼개는 프로젝트가 있고(proj-b 는
+    # 분리 로그. 결정 로그를 history/<이름>.md 로 쪼개는 프로젝트가 있고(raise 는
     # history/lidar.md 에 기각 103건), 루트만 읽으면 통째로 시야 밖이었다.
     out = gen(tmp, history=hist(3, 2),
               extra={"lidar.md": "## [2026-05-01] #1 결정\n- 실험/실패: 분리로그기각 A\n"})
@@ -201,8 +201,8 @@ with tempfile.TemporaryDirectory() as tmp:
 
 with tempfile.TemporaryDirectory() as tmp:
     # 수기 관리본을 말없이 덮지 않는다. allowlist 에 트리를 추가하는 순간 이 스크립트가
-    # 처음 돌면서 사람이 써온 active.md 를 통째로 갈아치운다(proj-b 363줄·
-    # session_c_work 592줄). history/ 를 gitignore 한 저장소면 복구 경로가 없다.
+    # 처음 돌면서 사람이 써온 active.md 를 통째로 갈아치운다(raise 363줄·
+    # gamma_work 592줄). history/ 를 gitignore 한 저장소면 복구 경로가 없다.
     d = Path(tmp)
     (d / "history").mkdir()
     manual = "# 손으로 관리하는 요약\n- 아직 유효한 결정 하나\n"
@@ -247,9 +247,9 @@ with tempfile.TemporaryDirectory() as tmp:
     check("예산 안이면 절단 문구 없음", "주입 예산" not in out, out)
 
 with tempfile.TemporaryDirectory() as tmp:
-    # 고정 서문. 프로젝트마다 매 세션 맨 위에 보여야 하는 상시 제약이 있는데(peer 의
-    # sudo 금지·공용 계정 등) 생성기는 history.md 에서 뽑은 것만 실을 수 있어 그게
-    # 재생산되지 않았다. 그래서 peer 이 자동생성을 못 켰다.
+    # 고정 서문. 프로젝트마다 매 세션 맨 위에 보여야 하는 상시 제약이 있는데(한 로봇
+    # 저장소의 sudo 금지·공용 계정 등) 생성기는 history.md 에서 뽑은 것만 실을 수 있어
+    # 그게 재생산되지 않았다. 그래서 그 저장소가 자동생성을 못 켰다.
     out = gen(tmp, history=hist(5, 2),
               extra={"active-preamble.md": "## 상시 제약\n- SUDO_SENTINEL 금지\n"})
     check("서문을 그대로 싣는다", "SUDO_SENTINEL" in out, out[:300])
@@ -263,6 +263,20 @@ with tempfile.TemporaryDirectory() as tmp:
     out = gen(tmp, history=hist(5, 2), extra={"active-preamble.md": big})
     check("긴 서문은 자르고 밝힌다", "앞 40줄만 실었다" in out, out[:600])
     check("서문을 잘라도 기각 목록은 남는다", "이미 기각됨" in out, out[:600])
+
+with tempfile.TemporaryDirectory() as tmp:
+    # 기각 한 줄이 통째로 길다 — 기각 사유는 문단으로 적힌다. 그대로 실으면 열 줄이
+    # 예산을 거의 다 먹고 최근 결정이 잘려 나간다(11-05 실측 6781바이트, 12줄 절단).
+    # 앞머리만 싣고 원문은 history.md 로 보낸다.
+    long_one = "- 실험/실패: " + "나" * 400 + " 끝표식"
+    out = gen(tmp, history=hist(20, 0) + long_one + "\n")
+    body = [ln for ln in out.splitlines() if ln.startswith("- 실험/실패")]
+    check("긴 기각 줄은 앞머리만 싣는다",
+          body and len(body[0]) < 260 and "원문은 history.md" in body[0],
+          body[:1])
+    check("기각 줄을 잘라도 최근 결정이 남는다",
+          "최근 결정" in out and "줄 절단됨" not in out, out[-300:])
+    check("긴 기각 줄을 잘라도 글자가 안 깨진다", "나나나" in out, out[:200])
 
 with tempfile.TemporaryDirectory() as tmp:
     # 한글이 깨지지 않는다. 바이트 절단으로 문자를 반토막 내면 SessionStart

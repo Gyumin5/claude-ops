@@ -9,12 +9,12 @@
 #
 # 사용법(2026-07-09 개정 — launch entrypoint 패턴, ai-debate run-20260708T220504Z):
 #   세션 문맥에서 systemd-run 을 손으로 조립하지 말고 이 스크립트를 직접 호출한다:
-#     $HOME/dotfiles/bin/claude-job-detach --slug <slug> \
+#     ~/dotfiles/bin/claude-job-detach --slug <slug> \
 #       [--notify-start] [--notify-success] -- <cmd...>
 #   내부에서 발신 세션 신원(CLAUDE_SESSION_NAME 또는 cgroup)과 호스트를 캡처해
 #   systemd-run --setenv 로 각인한 뒤 자기 자신을 --inner 모드로 재실행 detach한다.
 #
-#   배경: 2026-07-08 peer 실사례(claude-job-mono-lag-sweep-...) — 유닛명 규약
+#   배경: 2026-07-08 둘째 기계 실사례(claude-job-mono-lag-sweep-...) — 유닛명 규약
 #   (claude-job-<session>-<slug>-<ts>)을 어기고 슬러그 자리에 세션명처럼 보이는
 #   문자열("mono")이 들어가자, 완료보고 시점(이미 detach된 유닛 안 = 발신 세션
 #   문맥이 사라진 뒤)엔 유닛명에서 역산하는 것 외엔 발신 세션을 복원할 방법이
@@ -35,7 +35,7 @@
 # 세션명 해석 우선순위(완료측, --inner 모드 안):
 #   1) CLAUDE_DETACH_ORIGIN_SESSION 환경변수(launch 시점에 --setenv 로 각인, 가장 신뢰).
 #   2) legacy: 유닛명에서 등록된 세션명(targets.json ∪ relay-alias.json 키)과
-#      최장 접두사 일치(하이픈 섞인 세션명, 예: peer-dotfiles, 잘못 잘리는 것 방지).
+#      최장 접두사 일치(하이픈 섞인 세션명, 예: <호스트>-dotfiles, 잘못 잘리는 것 방지).
 #   3) legacy 최후: 옛 방식(첫 하이픈까지만) — 등록 안 된 신규/규약위반 유닛명이면
 #      결과적으로 relay-alias 조회가 실패해 tier-3(사람 직접)로 자연히 떨어짐.
 #   각 경로에서 어떤 근거로 세션명을 골랐는지 SESSION_FALLBACK_REASON 에 남겨서
@@ -49,7 +49,7 @@ set -uo pipefail
 # 고정 배포경로를 그대로 씀(이 저장소 관례 — USERBOT_SEND 등 다른 절대경로들과
 # 동일 패턴) — $0 기반 계산은 bare PATH 호출("claude-job-detach"만, 슬래시 없음)
 # 시 dirname이 "."로 떨어져 CWD 기준으로 잘못 풀리는 실사용 결함이 있었음
-# (ai-debate run-20260708T222719Z 지적). 심링크(peer ~/.local/bin/ 경유 호출)로
+# (ai-debate run-20260708T222719Z 지적). 심링크(둘째 기계의 ~/.local/bin/ 경유 호출)로
 # 불려도 항상 이 고정 경로가 맞다.
 SELF="$HOME/dotfiles/bin/claude-job-detach"
 ENV_FILE="$(pwd)/.claude/telegram/.env"
@@ -57,7 +57,8 @@ ENV_FILE="$(pwd)/.claude/telegram/.env"
 # 안 붙어 있을 수도 있으므로 확실히 도달하는 채널로 보낸다, 2026-07-22 사용자 확정).
 # 대신 "어느 세션/폴더에서 온 잡인지"를 메시지에 반드시 실어보낸다(tier3_suffix).
 [ -f "$ENV_FILE" ] || ENV_FILE="$HOME/dotfiles/.claude/telegram/.env"
-CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/operator_chat.sh"   # 방 번호 단일 출처
+CHAT_ID="$(operator_chat_id)" || exit 1
 USERBOT_SEND="$HOME/dotfiles/bin/claude-userbot-send"
 USERBOT_TARGETS="$HOME/.claude/userbot/targets.json"
 RELAY_CONF="$HOME/.claude/userbot/relay.conf"
@@ -115,8 +116,8 @@ if [ "${1:-}" != "--inner" ]; then
         ORIGIN_SESSION=$(grep -oE 'claude-[^/]+\.service' /proc/self/cgroup 2>/dev/null | head -1 | sed 's/^claude-//; s/\.service$//')
     fi
     # 발신 호스트는 machine-id 로 판정한다. `~/.claude/userbot/host` 는 "유저봇이 있는
-    # 호스트"(= 릴레이 대상)라 자기 신원이 아니다 — peer 에서 그 파일은 "home" 이어서
-    # peer 이 띄운 잡의 발신호스트가 home 으로 보고됐다(2026-07-28 사용자 신고).
+    # 호스트"(= 릴레이 대상)라 자기 신원이 아니다 — 둘째 기계에서 그 파일은 "home" 이어서
+    # 둘째 기계가 띄운 잡의 발신호스트가 home 으로 보고됐다(2026-07-28 사용자 신고).
     ORIGIN_HOST=$(cat "$HOME/.config/claude-machine-id" 2>/dev/null)
     ORIGIN_HOST=${ORIGIN_HOST:-$(hostname -s 2>/dev/null || echo unknown)}
 
@@ -176,7 +177,7 @@ JOB_ID="${UNIT_NAME%.service}"
 REST="${JOB_ID#claude-job-}"
 
 # legacy: 등록된 세션명(targets.json ∪ relay-alias.json)과 REST 의 최장 접두사
-# 일치를 찾는다 — 하이픈 섞인 세션명(peer-dotfiles 등)이 첫 하이픈 컷으로
+# 일치를 찾는다 — 하이픈 섞인 세션명(<호스트>-dotfiles 등)이 첫 하이픈 컷으로
 # 잘못 잘리는 걸 방지. 못 찾으면 옛 방식(첫 하이픈까지)으로 최종 폴백.
 legacy_match_session() {
     local rest="$1"
@@ -218,13 +219,13 @@ LOG_FILE="$LOG_DIR/${JOB_ID}.log"
 CWD="$(pwd)"
 START_TS=$(date +%s)
 
-# 로컬 세션명 -> 릴레이 대상 머신에서의 별칭 변환(예: peer 머신의 로컬 "dotfiles"
+# 로컬 세션명 -> 릴레이 대상 머신에서의 별칭 변환(예: 둘째 기계의 로컬 "dotfiles"
 # 세션은 home targets.json 의 "dotfiles" 키(=home 자기 세션)와 겹쳐 오배송되므로
-# "peer-dotfiles" 로 바꿔야 함). ~/.claude/userbot/relay-alias.json(머신 로컬,
+# "<호스트>-dotfiles" 로 바꿔야 함). ~/.claude/userbot/relay-alias.json(머신 로컬,
 # git 비추적)에 명시적으로 등록된 세션만 릴레이 허용 — 파일이 없거나 이 세션의
 # 키가 없으면 실패를 반환해 릴레이를 포기시킨다(아래 inject_session 참고).
 # ai-debate run-20260708T125143Z 지적 반영: "매핑 없으면 이름 그대로 릴레이"는
-# 다른 머신의 동명 세션으로 조용히 오배송될 위험이 있어(예: peer 로컬 dotfiles가
+# 다른 머신의 동명 세션으로 조용히 오배송될 위험이 있어(예: 둘째 기계 로컬 dotfiles가
 # home 자기 dotfiles로) fail-open 대신 fail-closed 로 바꿈 — 새 세션은 릴레이
 # 전에 relay-alias.json 에 명시 등록 필요(등록 전엔 최후 fallback으로 안전하게
 # 떨어질 뿐, 무동작은 아님).
@@ -252,7 +253,7 @@ except Exception:
 # 세션이 먼저 해석하게 한다(2026-07-07 사용자 지적). 주입 자체가 실패하면(세션 못 찾음
 # 등) send_tg 로 사람에게 직접 알리는 걸 최후 fallback 으로만 남긴다.
 #
-# 3단 경로(2026-07-08 peer 신고 반영 — peer 머신엔 telethon userbot 미설정이라
+# 3단 경로(2026-07-08 둘째 기계 신고 반영 — 그 기계엔 telethon userbot 미설정이라
 # 로컬 claude-userbot-send --session 이 항상 실패해 완료보고가 사람에게 raw 로
 # 떨어짐):
 #   1) 로컬에 userbot 설정(targets.json) 있으면 그대로 로컬 claude-userbot-send.
@@ -292,10 +293,13 @@ inject_session() {
     fi
 
     if [ -x "$USERBOT_SEND" ] && [ -f "$USERBOT_TARGETS" ]; then
-        if "$USERBOT_SEND" --session "$SESSION_NAME" --origin "$(origin_tag)" "$text" >/dev/null 2>&1; then
+        # 수신처는 <기계>/<세션> 완전 주소(=origin_tag 와 같은 문자열). 잡을 띄운 세션은
+        # 언제나 이 호스트에 있다. 짧은 이름 'dotfiles' 는 두 기계에 다 있어
+        # claude-userbot-send 가 거절한다.
+        if "$USERBOT_SEND" --session "$(origin_tag)" --origin "$(origin_tag)" "$text" >/dev/null 2>&1; then
             return 0
         fi
-        INJECT_FAIL_REASON="로컬 userbot-send 실패(세션 '${SESSION_NAME}' targets.json 미등록 가능)"
+        INJECT_FAIL_REASON="로컬 userbot-send 실패(수신처 '$(origin_tag)' targets.json 미등록 가능)"
         return 1
     fi
 

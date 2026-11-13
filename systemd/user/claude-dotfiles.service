@@ -8,7 +8,7 @@ ConditionPathExists=%h/dotfiles/.claude/telegram/.env
 Type=simple
 WorkingDirectory=%h/dotfiles
 Environment="CLAUDE_SESSION_NAME=dotfiles"
-Environment="PATH=%h/.bun/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PATH=%h/.bun/bin:%h/.nvm/versions/node/v22.17.0/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="TELEGRAM_STATE_DIR=%h/dotfiles/.claude/telegram"
 Environment="TERM=xterm-256color"
 ExecStart=%h/.local/bin/claude-service-exec

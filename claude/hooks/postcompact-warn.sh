@@ -1,12 +1,25 @@
 #!/bin/bash
-# postcompact-warn: UserPromptSubmit 훅. 직전에 압축이 일어났으면 다음 메시지 처리 전에 강한 경고를 컨텍스트에 주입 (one-shot).
+# postcompact-warn: UserPromptSubmit 훅. 그 세션이 직전에 압축됐으면 다음 메시지
+# 처리 전에 경고를 컨텍스트에 주입하고 그 표식을 지운다(one-shot).
+#
+# 지우는 것은 자기 세션의 경고 표식 하나다. 차단 표식(.block)은 안 건드린다 —
+# 평범한 메시지 하나가 차단 창까지 닫으면 압축 직후 재호출 가드가 통째로 비켜간다.
 
 set -uo pipefail
-FLAG="$HOME/.claude/state/just-compacted.flag"
 
-if [ ! -f "$FLAG" ]; then
+INPUT=$(cat 2>/dev/null || true)
+"$HOME/.claude/hooks/hook-identity-log.sh" UserPromptSubmit "$INPUT" 2>/dev/null || true
+
+# shellcheck source=/dev/null
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/compact-flag-lib.sh" 2>/dev/null || exit 0
+
+if ! SID=$(compact_flag_sid "$INPUT"); then
+    compact_flag_nosid postcompact-warn
     exit 0
 fi
+
+FLAG=$(compact_flag_path "$SID" warn)
+[ -f "$FLAG" ] || exit 0
 
 # 10분(600초) 이상 묵었으면 무효화
 now=$(date +%s)
@@ -17,7 +30,7 @@ if [ "$age" -gt 600 ]; then
     exit 0
 fi
 
-# additionalContext 주입 + 플래그 삭제 (one-shot)
+# additionalContext 주입 + 경고 표식 삭제 (one-shot)
 rm -f "$FLAG"
 
 cat <<'JSON'

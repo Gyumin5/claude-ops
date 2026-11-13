@@ -11,8 +11,8 @@ claude-api-5xx-watcher
   받게 하려면 "사용자 계정→봇" 메시지가 필요 → 유저봇(claude-userbot-send).
   - 로컬에 유저봇(userbot.session) 있으면 로컬 실행(home).
   - 없으면 ~/.claude/userbot/host 에 적힌 호스트로 ssh 해서 거기 유저봇 실행
-    (peer = 회사 머신, 개인 유저봇 미설치 → ssh home). 봇은 Telegram 으로
-    어느 머신에서든 접근되므로 home 유저봇이 peer 세션 봇에도 쏠 수 있다.
+    (둘째 기계 = 회사 머신, 개인 유저봇 미설치 → ssh home). 봇은 Telegram 으로
+    어느 머신에서든 접근되므로 home 유저봇이 둘째 기계 세션 봇에도 쏠 수 있다.
 
 폭주 방지(기존 retry-dead-loop 가드를 안전하게 대체):
   - 백오프: 60 → 180 → 420 초.
@@ -35,15 +35,15 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from operator_chat import chat_id   # noqa: E402  (방 번호 단일 출처)
+
+CHAT_ID = chat_id()
 STATE_DIR = Path.home() / ".claude" / "state" / "api-5xx-watcher"
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import claude_session_lib as csl   # noqa: E402  (transcript 선택 규칙 단일 출처)
-
-# 저장소 뿌리를 이 파일 위치에서 찾는다. 예전엔 홈 아래 고정 경로였는데,
-# 그러면 다른 자리에 받은 사람은 그대로 못 돌린다.
-REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 USERBOT_SESSION = Path.home() / ".claude" / "userbot" / "userbot.session"
@@ -74,7 +74,7 @@ def warn(msg, key=None):
     """stderr(=journal) 로 신호. key 를 주면 그 키당 1시간에 한 번만.
 
     '조용히 return' 이 사각지대를 만든 게 이 스크립트의 실제 사고였다
-    (session_c, 도입 후 내내 미감시). 알림은 늘리지 않되 로그는 남긴다.
+    (gamma, 도입 후 내내 미감시). 알림은 늘리지 않되 로그는 남긴다.
     """
     if key:
         stamp = STATE_DIR / ("warn-%s.stamp" % re.sub(r"[^a-zA-Z0-9]", "-", key))
@@ -105,7 +105,7 @@ def list_services():
             # claude-job-*(detach 잡)와 템플릿 인스턴스(claude-session-nudge@x)는
             # 세션이 아니다. 잡은 발신 세션의 cwd 를 물려받아 그 세션의 jsonl 을
             # 자기 것처럼 보게 되고, 그래서 잡 이름으로 된 유령 retry 상태가 남는다
-            # (peer 에서 job-session-a-... retry.json 이 7-27 부터 방치돼 있었다).
+            # (둘째 기계에서 job-alpha-... retry.json 이 7-27 부터 방치돼 있었다).
             if proj.startswith("job-") or "@" in proj:
                 continue
             if proj not in SKIP:
@@ -217,7 +217,7 @@ def do_resend(username):
             host = USERBOT_HOST_FILE.read_text(errors="ignore").strip()
         if not host:
             return False, "로컬 유저봇 없음 + host 미설정"
-        remote = fos.path.join(REPO, "bin/claude-userbot-send {shlex.quote(username)} {shlex.quote(PAYLOAD)}")
+        remote = f"~/dotfiles/bin/claude-userbot-send {shlex.quote(username)} {shlex.quote(PAYLOAD)}"
         cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, remote]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
@@ -340,7 +340,7 @@ def process(proj):
     #
     # 예전에는 '텍스트가 있는 마지막 assistant 레코드'만 봤다. 그런데 도구를 연속으로
     # 쓰는 동안 쌓이는 assistant 레코드는 tool_use/thinking 뿐이라 텍스트가 없어 전부
-    # 건너뛰고, 한참 전에 지나간 5xx 가 계속 현재 상태로 읽혔다(peer session_c
+    # 건너뛰고, 한참 전에 지나간 5xx 가 계속 현재 상태로 읽혔다(둘째 기계 gamma
     # 실측: 06:53 까지 정상 작업 중인데 06:14 의 500 을 골랐다). 그 상태에서 에러가
     # STALE_SEC 이내였으면 멀쩡히 일하는 세션에 '계속 진행해' 를 최대 3회 밀어넣는다.
     # 텍스트 유무가 아니라 시간 순서가 기준이어야 한다.

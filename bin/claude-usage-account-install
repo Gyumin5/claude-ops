@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""사용량 보기를 전용 계정으로 옮긴다 — 내 계정에는 아예 못 붙게.
+
+왜 옮기나. 열쇠에 명령을 못 박으면 그 열쇠로는 수치 보기밖에 안 되지만, 붙는
+자리는 여전히 내 계정이다. 쓰는 쪽도 보는 쪽도 그게 안심이 안 된다. 권한 없는
+전용 계정을 하나 만들어 그 아래로 옮기면, 열쇠를 받은 사람이 닿는 곳이 그 계정
+하나뿐이 된다.
+
+이미 나눠 준 열쇠 파일은 그대로 쓴다 — 공개키를 옮겨 적을 뿐이라 받은 사람 쪽은
+주소의 사용자 이름만 바뀐다.
+
+계정을 만들려면 관리자 권한이 필요하므로 이 도우미는 root 로 돌린다.
+
+  sudo python3 ~/dotfiles-snapshot/bin/claude-usage-account-install
+
+끝나면 쓰는 법 한 줄을 찍는다.
+"""
+import argparse
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+OPT = "restrict,no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-user-rc"
+
+USAGE = """#!/bin/sh
+# 다시 재고 그 결과를 보여 준다. 이 열쇠로 붙으면 무엇을 치든 이것만 돈다.
+# 연달아 누른 회차는 쪽이 막고, 그때는 이미 방금 잰 값이라 그대로 보여 준다.
+t=$(cat "$HOME/.config/claude-usage/token")
+curl -sS --max-time 120 -X POST "localhost:{port}/measure?t=$t" >/dev/null 2>&1 || true
+exec curl -sS --max-time 20 "localhost:{port}/usage.txt?t=$t"
+"""
+
+
+def own(path, user, enabled):
+    """전용 계정 소유로 돌린다. 검사에서는 건너뛴다."""
+    if not enabled:
+        return
+    ent = pwd.getpwnam(user)
+    os.chown(path, ent.pw_uid, ent.pw_gid)
+
+
+def make_account(user, home, enabled):
+    if not enabled:
+        home.mkdir(parents=True, exist_ok=True)
+        return "건너뜀"
+    try:
+        pwd.getpwnam(user)
+        return "이미 있다"
+    except KeyError:
+        pass
+    subprocess.run(["useradd", "--system", "--create-home", "--home-dir", str(home),
+                    "--shell", "/bin/sh", user], check=True)
+    # 암호로는 못 들어온다 — 들어오는 길은 못 박힌 열쇠뿐이다.
+    subprocess.run(["passwd", "-l", user], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return "새로 만들었다"
+
+
+def strip_owner_lines(ak):
+    """소유자 쪽에 남은 사용량 열쇠 줄을 뺀다 — 안 빼면 같은 열쇠로 두 계정에 붙는다."""
+    if not ak.exists():
+        return 0
+    lines = ak.read_text(encoding="utf-8").splitlines()
+    keep = [l for l in lines if "claude-usage" not in l]
+    if len(keep) == len(lines):
+        return 0
+    shutil.copy2(ak, ak.with_name(ak.name + ".bak-" + time.strftime("%Y%m%d-%H%M%S")))
+    ak.write_text("".join(l + "\n" for l in keep), encoding="utf-8")
+    return len(lines) - len(keep)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--owner", default="gmoh", help="쪽을 돌리는 계정")
+    ap.add_argument("--user", default="claude-usage", help="새로 만들 전용 계정")
+    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--owner-home", help="기본은 소유자 계정의 홈")
+    ap.add_argument("--target-root", default="/", help="검사용 가상 루트")
+    ap.add_argument("--no-system", action="store_true",
+                    help="계정 만들기와 소유자 바꾸기를 건너뛴다(검사용)")
+    a = ap.parse_args()
+    sysops = not a.no_system
+
+    if sysops and os.geteuid() != 0:
+        print("관리자 권한으로 돌려야 한다 — 앞에 sudo 를 붙인다.", file=sys.stderr)
+        return 2
+
+    root = Path(a.target_root)
+    oh = Path(a.owner_home) if a.owner_home else root / "home" / a.owner
+    src = oh / ".config" / "claude-usage"
+    token = src / "token"
+    if not token.exists():
+        print(f"열쇠글이 없다: {token} — 먼저 claude-usage-serve-install 를 돌린다.",
+              file=sys.stderr)
+        return 1
+    pub = src / "keys" / "usage.pub"
+    if not pub.exists():
+        print(f"공개 열쇠가 없다: {pub}", file=sys.stderr)
+        return 1
+    pubkey = pub.read_text(encoding="utf-8").strip()
+
+    home = root / "home" / a.user
+    state = make_account(a.user, home, sysops)
+
+    os.umask(0o077)
+    for sub in (".ssh", ".config/claude-usage", "bin"):
+        (home / sub).mkdir(parents=True, exist_ok=True)
+        (home / sub).chmod(0o700)
+        own(home / sub, a.user, sysops)
+    own(home, a.user, sysops)
+    (home / ".config").chmod(0o700)
+    own(home / ".config", a.user, sysops)
+
+    # 열쇠글은 복사한다 — 소유자 홈은 주인만 읽게 잠겨 있어 전용 계정이 못 본다.
+    dst_token = home / ".config" / "claude-usage" / "token"
+    dst_token.write_text(token.read_text(encoding="utf-8"), encoding="utf-8")
+    dst_token.chmod(0o600)
+    own(dst_token, a.user, sysops)
+
+    cmd = home / "bin" / "usage"
+    cmd.write_text(USAGE.format(port=a.port), encoding="utf-8")
+    cmd.chmod(0o700)
+    own(cmd, a.user, sysops)
+
+    ak = home / ".ssh" / "authorized_keys"
+    ak.write_text(f'command="{cmd}",{OPT} {pubkey}\n', encoding="utf-8")
+    ak.chmod(0o600)
+    own(ak, a.user, sysops)
+
+    removed = strip_owner_lines(oh / ".ssh" / "authorized_keys")
+
+    print(f"전용 계정 {a.user}: {state}")
+    print(f"열쇠를 그 계정에 걸었다. 소유자({a.owner}) 쪽에서 뺀 줄 {removed}개.")
+    print("쓰는 법 — 받은 열쇠 파일이 ~/usage 라면")
+    print(f"  ssh -i ~/usage -o IdentitiesOnly=yes -p <포트> {a.user}@<주소>")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

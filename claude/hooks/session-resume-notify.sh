@@ -15,6 +15,7 @@
 #  - 항상 exit 0 (세션 시작을 절대 방해하지 않음, defensive).
 
 set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../lib/operator_chat.sh"   # 방 번호 단일 출처
 
 # 헤드리스 자동화(claude-progress-updater 등)가 CLAUDE_AUTOMATED=1 로 자식 claude -p 를
 # 띄우는 기존 관례 — 다른 6개 훅(telegram-reply-injector 등)은 전부 이 체크가 있는데
@@ -28,14 +29,14 @@ CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
 
 # 홈 루트($HOME)는 프로젝트가 아님 — 여기서 발동 금지. control-bot·유틸 서비스들이
 # WorkingDirectory=$HOME 라 SessionStart 훅이 홈 루트의 stray progress.md 를 읽고
-# "USER" 같은 잘못된 알림을 내던 버그 차단. progress.md 는 프로젝트 WD 에만 있어야 함.
+# "gmoh" 같은 잘못된 알림을 내던 버그 차단. progress.md 는 프로젝트 WD 에만 있어야 함.
 [ "$CWD" = "$HOME" ] && exit 0
 
 # kill-switch (전역 즉시 비활성화)
 [ -f "$HOME/.claude/state/auto-resume.disabled" ] && exit 0
 
 # 2026-07-08 사용자 신고: systemd 유닛 없이 터미널에서 직접 띄운 임시 claude
-# 세션(인바운드 경로 없음, 예: peer의 session_c_work cwd)이 재시작
+# 세션(인바운드 경로 없음, 예: 둘째 기계의 한 작업 폴더)이 재시작
 # 감지 알림을 운영 챗으로 쏴서 스팸이 됨 — ai-debate run-20260708T071716Z
 # 결론(안1): CLAUDE_SESSION_NAME env도 cgroup claude-*.service 매치도 없으면
 # 유닛 밖 임시 세션으로 보고 조용히 skip. rate-limit-guard.sh와 동일 판정 재활용.
@@ -58,7 +59,7 @@ PROG="$CWD/progress.md"
 
 # ai-debate run-20260708T071716Z 2단계(경고형): 세션 루트에 progress.md가
 # 없는데 하위 디렉토리(서브레포 등)에 잘못 놓인 후보가 있으면 경고만 하고
-# 넘어간다(자동 이동·삭제 안 함) — peer 세션이 sub-repo/
+# 넘어간다(자동 이동·삭제 안 함) — 한 세션이 하위 저장소 폴더
 # 밑에 써서 재시작 때마다 stale 컨텍스트를 물려받은 사고 재발 방지용 진단.
 if [ ! -f "$PROG" ]; then
     STRAY=$(find "$CWD" -mindepth 2 -maxdepth 4 -name progress.md -not -path '*/.git/*' 2>/dev/null | head -3)
@@ -70,10 +71,11 @@ if [ ! -f "$PROG" ]; then
                 # shellcheck disable=SC1090
                 . "$WENV"
                 [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || exit 0
+                WCHAT="$(operator_chat_id)" || exit 0
                 WMSG="세션 루트($CWD)에 progress.md가 없는데 하위 경로에서 발견됨(경로 오배치 의심, 자동 이동 안 함):
 $(printf '%s' "$STRAY" | sed 's/^/· /')"
                 curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+                    --data-urlencode "chat_id=$WCHAT" \
                     --data-urlencode "text=${WMSG}" >/dev/null 2>&1
             )
         fi
@@ -104,24 +106,28 @@ ENV_FILE="$CWD/.claude/telegram/.env"
 [ -f "$ENV_FILE" ] || ENV_FILE="$HOME/dotfiles/.claude/telegram/.env"
 [ -f "$ENV_FILE" ] || exit 0
 
-CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+CHAT_ID="$(operator_chat_id)" || exit 0
 PROJ=$(basename "$CWD")
 
 # progress.md ## Blockers 섹션에서 미완료 항목 전부 추출(각 줄 120자 컷).
 # "(대기)" 문자열 리터럴 매칭이었던 예전 버전은 버그였음(2026-07-03) — CLAUDE.md 의
 # "(대기)"는 예시 표기일 뿐인데 정규식이 그걸 필수 태그처럼 취급해, "(대기)" 없이
 # ✅/진행/할일 등 다른 마커를 쓰는 (이 표기 이전에 작성된) progress.md 에서는 Blockers
-# 에 실제 항목이 있어도 [대기] 섹션이 항상 비어보였다(peer 에서 재현). 완료 표시
+# 에 실제 항목이 있어도 [대기] 섹션이 항상 비어보였다(둘째 기계에서 재현). 완료 표시
 # (줄 앞머리 ✅)가 없는 모든 Blockers 줄을 태스크로 취급하도록 수정. "완료" 문자열
 # 자체로 거르면 "텍스처 우회 완료 → 다음 단계 필요" 같은 하위절 언급까지 오탈락하므로
 # 반드시 줄 앞머리 ✅ 만으로 판정.
 # 개수 제한 없음 — 사용자가 재시작 시 전체 목록을 보고 진행/삭제 triage 하도록.
 # (텔레그램 4096자 한도는 API 가 자체 처리; 항목은 통상 소수라 문제 없음.)
 # 2026-07-03 태스크 목록 규칙으로 Blockers 각 줄 맨앞에 "N. " 순번이 붙게 됐는데
-# 이 awk가 대시 불릿("- ")만 매칭해 번호형 줄은 전부 0건으로 누락됐다(peer 세션이
+# 이 awk가 대시 불릿("- ")만 매칭해 번호형 줄은 전부 0건으로 누락됐다(둘째 기계의 세션이
 # 실측 발견·보고, 2026-07-08). 대시/번호 둘 다 최상위 항목으로 인정하도록 수정 —
 # 들여쓴 하위불릿은 앞머리가 공백이라 여전히 자연히 제외됨.
-PENDING=$(awk '/^## Blockers/{f=1;next} /^## /{f=0} f && (/^- /||/^[0-9]+\. /){print}' "$PROG" \
+# 섹션 종결자가 /^## / 이던 판본은 Blockers 아래 '### 완료(최근)'(R51) 을 끝으로 못 봤다
+# — 세 번째 글자가 공백이 아니라 # 이라 안 맞는다. 그래서 완료 구역 전체가 대기로 올라왔다
+# (velocity 재시작 알림이 대기 18건을 띄웠고 그중 17건이 완료 항목, 2026-10-09).
+# 종결자를 /^#+ / 로 넓혀 어느 깊이의 제목이든 섹션을 닫게 한다.
+PENDING=$(awk '/^## Blockers/{f=1;next} /^#+ /{f=0} f && (/^- /||/^[0-9]+\. /){print}' "$PROG" \
     | grep -Ev '^(- |[0-9]+\. )✅' \
     | sed -E -e 's/^- *//' -e 's/^[0-9]+\. *//' | cut -c1-240)
 

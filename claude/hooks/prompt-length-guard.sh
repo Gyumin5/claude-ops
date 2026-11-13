@@ -1,7 +1,8 @@
 #!/bin/bash
 # prompt-length-guard.sh: UserPromptSubmit hook.
 #
-# 목적: session-p 같은 "Prompt is too long" 영구 stuck 사고 방지.
+# 목적: "Prompt is too long" 으로 그 요청 하나가 실패하는 것을 미리 막는다.
+#       (세션이 영구히 멈추는 게 아니다 — 큰 요청 하나만 줄여 다시 한다. R66)
 # 사용자 prompt + 자동 주입(progress/active/CLAUDE.md) + 현재 컨텍스트 사용량을
 # 합산 추정해서 1M 토큰 한계 근처면 경고/차단.
 #
@@ -96,14 +97,14 @@ if [ "$TOTAL_TOK" -ge "$BLOCK_TOKENS" ]; then
 
 내역: 사용자 ${PROMPT_TOK} + 주입 ${INJ_TOK} + 누적 ${CACHE_CTX_TOK}
 
-대처: 큰 PDF/로그는 ctx_read mode=lines:N-M 또는 offset/limit 사용. 통째 paste 금지, 파일 path만. 본문 요약 후 재전송도 가능."
+대처: 큰 PDF/로그는 Read 의 offset/limit 또는 pages 로 잘라 읽기. 통째 paste 금지, 파일 path만. 본문 요약 후 재전송도 가능."
             curl -s --max-time 5 \
                 -d "chat_id=${TELEGRAM_CHAT_ID}" \
                 --data-urlencode "text=${MSG}" \
                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >/dev/null 2>&1 || true
         fi
     fi
-    echo "[prompt-length-guard] BLOCK: 추정 ${TOTAL_TOK}/${BLOCK_TOKENS} 토큰 (사용자 ${PROMPT_TOK} + 주입 ${INJ_TOK} + 누적 ${CACHE_CTX_TOK}). ctx_read lines:N-M 또는 분할로 재전송." >&2
+    echo "[prompt-length-guard] BLOCK: 추정 ${TOTAL_TOK}/${BLOCK_TOKENS} 토큰 (사용자 ${PROMPT_TOK} + 주입 ${INJ_TOK} + 누적 ${CACHE_CTX_TOK}). Read 의 offset/limit 또는 분할로 재전송." >&2
     exit 2
 fi
 
@@ -114,7 +115,7 @@ import json
 out = {
     "hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
-        "additionalContext": "[prompt-length-guard 경고] 추정 컨텍스트 ${TOTAL_TOK} 토큰 (한계 ${CONTEXT_LIMIT}, 차단선 ${BLOCK_TOKENS}). 이번 턴은 큰 read/tool_result 자제. ctx_read mode=lines:N-M 또는 ctx_search로 좁혀서 호출. 답변 마치면 progress.md 갱신 권고."
+        "additionalContext": "[prompt-length-guard 경고] 추정 컨텍스트 ${TOTAL_TOK} 토큰 (한계 ${CONTEXT_LIMIT}, 차단선 ${BLOCK_TOKENS}). 이번 턴은 큰 read/tool_result 자제. Read 의 offset/limit 으로 구간을 잡거나 Grep·rg 로 좁혀서 호출. 답변 마치면 progress.md 갱신 권고."
     }
 }
 print(json.dumps(out, ensure_ascii=False))

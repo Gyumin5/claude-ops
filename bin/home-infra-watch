@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""home-infra-watch: 홈에서만 도는 인프라 감시 5종.
+
+왜 있나 (ai-debate run-20260818T043624Z 판정):
+  A) codex 버전 — ai-debate 의 최종 판정은 codex 단독이다. codex 는 자동 업데이트를
+     안 해서 2026-08-14 에 홈만 0.136.0 에 묶인 채 설정 모델(gpt-5.6-sol)이 계속
+     거부되고 있었고, 사용할 때까지 아무도 몰랐다. 자동 업데이트는 안 넣는다 —
+     나쁜 릴리스 하나가 전 세션의 아비터를 죽인다. 주기적 모델 dry-run 도 안 넣는다 —
+     쿼터·인증·서버 일시장애가 새 오탐면이 된다. 최소버전 하한과 장기 드리프트만 본다.
+  B) todo-rearm — 둘째 기계 todo cron 이 만료되면 홈의 todo-rearm.timer 가 복구를
+     트리거한다. 그 타이머 자신이 죽으면 복구 경로 전체가 조용히 사라진다. 주입
+     성공 여부는 todo-rearm-trigger 가 이미 감시하므로(세대·하트비트·3회 후 경보)
+     여기서는 타이머와 서비스가 계속 도는지만 바깥에서 본다 — 이중 알림을 피한다.
+  C) codex 한도 사용률 — 한도는 계정 하나이고 두 호스트가 같이 쓴다. 사용률은 codex 가
+     돌 때마다 rollout 에 찍히므로 따로 수집기를 두지 않는다. 임계를 넘으면 그 창에
+     한 번만 알린다. 관측이 오래됐으면 알리지 않는다 — 조용한 것은 여유의 증거가 아니다.
+  D) 공유 저장소 어긋남 — 두 호스트가 같은 저장소를 각자 시점에 받아 쓰고 배포는
+     심링크다. 2026-09-22 에 둘째 기계의 안 올린 커밋과 홈의 안 받은 커밋 넷이 동시에
+     있었는데 아무것도 그것을 알리지 않았고, 안 받은 쪽은 고친 줄 아는 코드를 옛날
+     것으로 돌고 있었다. 자동으로 push·pull 하지 않는다 — 어느 쪽이 맞는지는 사람이
+     정한다. 짧은 어긋남은 커밋과 올리기 사이의 정상 구간이라 지속될 때만 알린다.
+  E) 코덱스 모델 설정 갈림 — ai-debate 의 최종 정리자는 codex 단독인데, 그 모델과
+     강도는 저장소 밖 파일 하나가 단일 출처다. 코덱스 화면에서 바꾸면 한쪽만 바뀌고
+     갈린 채로 돌아도 결과만 보고는 못 가린다. 두 키만 읽는다 — 같은 폴더에 자격증명
+     파일이 있으므로 파일을 통째로 가져오지 않는다. 사람이 양쪽을 고치는 사이가
+     정상 구간이라 지속될 때만 알리고, 원격 접속 실패는 어긋남이 아니라 미관측이다.
+
+판정 원칙:
+  - 로그 파일의 존재·크기·mtime 은 성공의 증거가 아니다. 쓰다 만 파일도 0바이트가 아니다.
+    타이머는 발화 시각, 서비스는 종료 결과로 본다.
+  - 버전 불일치는 정상 배포 시차일 수 있다 → 같은 조합이 24시간 지속될 때만 알린다.
+  - ssh 실패는 드리프트로 판정하지 않는다. 그건 todo-rearm-trigger 의 ssh 데드맨 몫이다.
+  - 알림은 연속 2회 관측일 때만 1건. 정상으로 돌아오면 상태를 지우고 해소를 알린다.
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+MIN_CODEX = (0, 147, 0)          # 2026-08-14 사고(모델 거부) 재발 하한. 능력의 증명은 아니다.
+DRIFT_PERSIST_S = 24 * 3600      # 호스트간 버전차를 사고로 부르기까지 기다리는 시간
+BOOT_GRACE_S = 20 * 60           # 부팅 직후 타이머가 아직 안 돈 구간
+TRIGGER_STALE_S = 30 * 60        # 10분 주기 타이머가 이만큼 조용하면 이상
+SERVICE_MAX_RUN_S = 180          # 서비스 상한 120초 + 여유. 이 안에서 실행중은 정상 진행.
+
+STATE_DIR = Path(os.environ.get("HOME_INFRA_WATCH_STATE_DIR",
+                                Path.home() / ".local/state/home-infra-watch"))
+NOTIFY_BIN = os.environ.get("HOME_INFRA_WATCH_NOTIFY",
+                            str(Path.home() / ".local/bin/claude-userbot-send"))
+# 수신처는 프로젝트 세션이 아니라 인프라를 맡는 세션이다 — 프로젝트 세션으로 보내면
+# 그 세션은 자기 작업 중이라 이 경보를 처리할 맥락이 없고, 사람이 손으로 옮겨 붙이게 된다.
+# 이 기계가 스스로 못 알리는 상황을 대비해 수신자는 상대 기계의 인프라 세션이다
+# (home-claude-health 와 같은 설계). 이름은 기계마다 다르므로 설정에서 읽는다 —
+# 없는 세션으로 보내면 보내는 쪽이 성공을 찍고 아무 데도 안 가기 때문에 기본값을
+# 지어 두지 않는다. 설정이 없으면 알림을 건너뛰고 그 사실을 로그에 남긴다.
+#   echo "<기계>/dotfiles" > ~/.config/claude-health-session
+def _read_conf(name):
+    try:
+        return (Path.home() / ".config" / name).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+NOTIFY_SESSION = os.environ.get("HOME_INFRA_WATCH_SESSION",
+                                _read_conf("claude-health-session"))
+
+# 짝지어 보는 상대 기계의 ssh 주소. 이 감시의 절반은 두 기계를 맞대어 보는 것이라
+# 상대가 없으면 그 검사들은 "미관측" 으로 조용히 빠진다 — 없는 주소를 지어내면
+# 접속 실패가 어긋남처럼 보인다.
+#   echo "<ssh 주소>" > ~/.config/claude-infra-peer
+PEER_HOST = os.environ.get("HOME_INFRA_WATCH_PEER", _read_conf("claude-infra-peer"))
+# 사람이 읽을 이름. 기본은 기계 마커와 상대 주소이고, 검사는 환경변수로 고정한다 —
+# 안 그러면 문구 검사가 그 검사를 돌리는 기계의 마커에 따라 붙었다 떨어졌다 한다.
+LOCAL_LABEL = os.environ.get("HOME_INFRA_WATCH_LABEL",
+                             _read_conf("claude-machine-id") or "이 기계")
+PEER_LABEL = os.environ.get("HOME_INFRA_WATCH_PEER_LABEL", PEER_HOST or "상대 기계")
+
+
+def _ssh(remote_cmd):
+    """상대 기계에서 한 줄 돌리는 명령. 상대가 없으면 빈 문자열(= 미관측)."""
+    if not PEER_HOST:
+        return ""
+    return ("ssh -o BatchMode=yes -o ConnectTimeout=8 %s %s" % (PEER_HOST, remote_cmd))
+
+CODEX_WHICH_LOCAL = os.environ.get(
+    "HOME_INFRA_WATCH_WHICH_LOCAL", str(Path.home() / ".local/bin/codex-ask") + " --which")
+CODEX_WHICH_REMOTE = os.environ.get(
+    "HOME_INFRA_WATCH_WHICH_REMOTE", _ssh("~/.local/bin/codex-ask --which"))
+SYSTEMCTL = os.environ.get("HOME_INFRA_WATCH_SYSTEMCTL", "systemctl --user")
+# C) codex 한도 사용률. 한도는 계정 하나라 두 호스트가 같은 값을 본다 — 어느 쪽이든
+# 가장 최근 관측을 쓴다. 관측은 codex 가 돌 때만 새로 찍히므로, 오래된 값으로는
+# 알리지 않는다(조용한 것이 곧 여유는 아니다).
+CODEX_USAGE_ALERT_PCT = float(os.environ.get("HOME_INFRA_WATCH_USAGE_PCT", "80"))
+CODEX_USAGE_STALE_S = int(os.environ.get("HOME_INFRA_WATCH_USAGE_STALE_S", str(12 * 3600)))
+CODEX_USAGE_LOCAL = os.environ.get(
+    "HOME_INFRA_WATCH_USAGE_LOCAL", str(Path.home() / ".local/bin/codex-usage"))
+CODEX_USAGE_REMOTE = os.environ.get(
+    "HOME_INFRA_WATCH_USAGE_REMOTE", _ssh("~/.local/bin/codex-usage"))
+DRY_RUN = os.environ.get("HOME_INFRA_WATCH_DRY_RUN") == "1"
+# D) 공유 저장소 어긋남. 두 호스트가 같은 저장소를 각자 시점에 받아 쓰고, 배포는
+# 심링크라 안 받은 쪽은 옛 코드를 그대로 돈다. 짧은 어긋남은 정상이다 — 커밋하고
+# 올리기까지의 시간이라, 지속될 때만 본다.
+REPO_DIR = os.environ.get("HOME_INFRA_WATCH_REPO", str(Path.home() / "dotfiles"))
+REPO_BRANCH = os.environ.get("HOME_INFRA_WATCH_REPO_BRANCH", "master")
+REPO_REMOTE_HEAD = os.environ.get(
+    "HOME_INFRA_WATCH_REPO_REMOTE_HEAD", _ssh("git -C dotfiles rev-parse HEAD"))
+REPO_PERSIST_S = int(os.environ.get("HOME_INFRA_WATCH_REPO_PERSIST_S", str(6 * 3600)))
+# E) 코덱스 모델 설정이 두 호스트에서 갈림. ai-debate 의 최종 정리자는 codex 단독이고,
+# 그 모델과 강도는 저장소 밖 파일 하나가 단일 출처다. 코덱스 화면에서 바꾸면 한쪽만
+# 바뀌고, 갈린 채로 돌아도 토론 결과만 보고는 알 수 없다. 두 키만 읽는다 — 같은
+# 폴더에 자격증명 파일이 있으므로 파일을 통째로 가져오지 않는다.
+CODEX_CONFIG_LOCAL = os.environ.get(
+    "HOME_INFRA_WATCH_CODEX_CONFIG", str(Path.home() / ".codex/config.toml"))
+CODEX_CONFIG_REMOTE = os.environ.get(
+    "HOME_INFRA_WATCH_CODEX_CONFIG_REMOTE",
+    _ssh("'f=$HOME/.codex/config.toml; [ -f \"$f\" ] || { echo NOFILE; exit 0; }; "
+         "grep -E \"^[[:space:]]*(model|model_reasoning_effort)[[:space:]]*=\" \"$f\"'"))
+CODEX_CONFIG_PERSIST_S = int(
+    os.environ.get("HOME_INFRA_WATCH_CODEX_CONFIG_PERSIST_S", str(2 * 3600)))
+
+
+def now_epoch():
+    v = os.environ.get("HOME_INFRA_WATCH_NOW_EPOCH")
+    if v:
+        return int(v)
+    import time
+    return int(time.time())
+
+
+def uptime_s():
+    v = os.environ.get("HOME_INFRA_WATCH_UPTIME_S")
+    if v:
+        return float(v)
+    try:
+        return float(Path("/proc/uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def run(cmd, timeout=30):
+    """(rc, 합쳐진 출력). 실행 자체가 안 되면 rc=127.
+
+    빈 명령은 "상대 기계가 설정에 없다" 는 뜻이라 돌리지 않는다. 셸에 넘기면
+    rc=0 에 빈 출력이 나와서, 상대를 본 적도 없는데 "정상" 으로 읽힌다.
+    """
+    if not (cmd or "").strip():
+        return 127, "상대 기계가 설정에 없다 (~/.config/claude-infra-peer)"
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+    except OSError as e:
+        return 127, f"{type(e).__name__}: {e}"
+
+
+def machine_is_home():
+    """home 전용. 다른 머신에서 돌면 남의 상태를 홈 이름으로 보고하게 된다."""
+    f = Path.home() / ".config/claude-machine-id"
+    try:
+        mid = f.read_text().strip()
+    except OSError:
+        return True          # 마커가 없으면 fail-open — 감시가 조용히 죽는 쪽이 더 나쁘다
+    return mid in ("", "home")
+
+
+def load_state():
+    try:
+        return json.loads((STATE_DIR / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / "state.json").write_text(json.dumps(st, ensure_ascii=False, indent=1),
+                                          encoding="utf-8")
+
+
+def log_observation(line):
+    """관측을 남긴다(알림 아님). 500줄만 유지 — 매시 1줄이면 약 20일치다.
+
+    이상만 남기면 조용한 2주가 "정상"인지 "검사가 조용히 깨졌다"인지 구분이 안 된다.
+    그래서 정상 회차도 관측값과 함께 한 줄 남긴다.
+    """
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        p = STATE_DIR / "watch.log"
+        import time
+        stamp = time.strftime("%F %T", time.localtime(now_epoch()))
+        with p.open("a", encoding="utf-8") as f:
+            f.write(f"{stamp} {line}\n")
+        lines = p.read_text(encoding="utf-8").splitlines()[-500:]
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def notify(msg):
+    if DRY_RUN:
+        print(f"[notify] {msg}")
+        return
+    if not NOTIFY_SESSION:
+        log_observation(f"notify-skipped reason=no-session msg={msg}")
+        return
+    subprocess.run([NOTIFY_BIN, "--session", NOTIFY_SESSION, msg],
+                   capture_output=True, text=True, timeout=60)
+
+
+def parse_version(which_out):
+    """codex-ask --which 출력에서 (major,minor,patch). 못 읽으면 None."""
+    # 실제 형식은 `ver=codex-cli 0.147.0` 이다 — 이름과 숫자 사이에 공백이 있으므로
+    # `\S*?` 로 잡으면 영원히 None 이 되고, 그러면 감시가 "버전을 못 읽음" 으로만 운다.
+    m = re.search(r"ver=.*?(\d+)\.(\d+)\.(\d+)", which_out or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def vstr(v):
+    return ".".join(str(x) for x in v) if v else "?"
+
+
+def track(st, key, bad, alert_msg, resolved_msg, alerts, threshold=2):
+    """연속 관측 카운터. bad 가 threshold 회 연속이면 1건 알리고, 정상으로 돌아오면 해소."""
+    slot = st.setdefault(key, {"count": 0, "alerted": False})
+    if not bad:
+        if slot.get("alerted"):
+            alerts.append(resolved_msg)
+        st[key] = {"count": 0, "alerted": False}
+        return
+    slot["count"] = int(slot.get("count", 0)) + 1
+    if slot["count"] >= threshold and not slot.get("alerted"):
+        alerts.append(alert_msg)
+        slot["alerted"] = True
+
+
+def check_codex(st, alerts):
+    """반환값은 이번 회차 관측 요약이다(판정 아님) — 심박 로그에 그대로 실린다."""
+    rc_l, out_l = run(CODEX_WHICH_LOCAL, timeout=40)
+    local = parse_version(out_l) if rc_l == 0 else None
+    # 버전을 못 읽는 것도 이상이다 — 아비터가 죽어도 사용 시점까지 모른다.
+    track(st, "codex_local",
+          bad=(local is None or local < MIN_CODEX),
+          alert_msg=(f"[home infra] codex 버전 이상: {LOCAL_LABEL} {vstr(local)} "
+                     f"(하한 {vstr(MIN_CODEX)}, 2회 연속 관측). ai-debate 의 최종 판정은 codex 단독이라 "
+                     f"이게 낮으면 설정 모델이 거부돼도 쓸 때까지 모른다. 조치: {LOCAL_LABEL} 에서 codex 업데이트. "
+                     f"관측: {(out_l or '출력 없음')[:200]}"),
+          resolved_msg=f"[home infra] codex 버전 정상 복귀({LOCAL_LABEL} {vstr(local)}). 직전 경보는 해소됐다.",
+          alerts=alerts)
+
+    rc_r, out_r = run(CODEX_WHICH_REMOTE, timeout=40)
+    if rc_r != 0:
+        # ssh 가 안 되는 것은 버전 문제가 아니다. todo-rearm-trigger 의 ssh 데드맨이 본다.
+        st.pop("codex_drift", None)
+        return f"codex local={vstr(local)} remote=ssh실패(rc={rc_r})"
+    remote = parse_version(out_r)
+    if not local or not remote or local < MIN_CODEX or remote < MIN_CODEX or local == remote:
+        # 하한 미달은 위에서 이미 다룬다. 여기서는 "둘 다 정상인데 서로 다름" 만 본다.
+        if st.pop("codex_drift", None) and st.get("codex_drift_alerted"):
+            alerts.append("[home infra] codex 호스트간 버전차 해소됐다.")
+        st.pop("codex_drift_alerted", None)
+        return f"codex local={vstr(local)} remote={vstr(remote)}"
+    pair = f"{vstr(local)}/{vstr(remote)}"
+    d = st.get("codex_drift") or {}
+    if d.get("pair") != pair:
+        d = {"pair": pair, "since": now_epoch()}
+        st.pop("codex_drift_alerted", None)
+    st["codex_drift"] = d
+    if now_epoch() - int(d["since"]) >= DRIFT_PERSIST_S and not st.get("codex_drift_alerted"):
+        alerts.append(f"[home infra] codex 버전이 두 기계에서 24시간 넘게 다르다 — "
+                      f"{LOCAL_LABEL} {vstr(local)}, {PEER_LABEL} {vstr(remote)}. "
+                      f"배포 시차라면 이미 끝났어야 한다. 낮은 쪽을 올려라.")
+        st["codex_drift_alerted"] = True
+    return (f"codex local={vstr(local)} remote={vstr(remote)} "
+            f"drift={int((now_epoch() - int(d['since'])) / 60)}분")
+
+
+def usage_snapshot(cmd):
+    """codex-usage --json 한 번. (관측시각epoch, 사용률, 초기화epoch, 24시간합계) 또는 None."""
+    rc, out = run(f"{cmd} --json --hours 24", timeout=90)
+    if rc != 0 or not out:
+        return None
+    try:
+        d = json.loads(out)
+    except ValueError:
+        return None
+    rl = d.get("rate_limit")
+    if not isinstance(rl, dict):
+        return None
+    primary = rl.get("primary") or {}
+    if primary.get("used_percent") is None:
+        return None
+    observed = to_epoch((rl.get("observed_kst") or "").replace("T", " "))
+    total = sum(int(h.get("합계", 0)) for h in (d.get("hourly") or []))
+    return (observed, float(primary["used_percent"]), int(primary.get("resets_at") or 0), total)
+
+
+def check_codex_usage(st, alerts):
+    """계정 한도 사용률. 임계를 넘으면 그 창에 한 번만 알린다."""
+    snaps = [s for s in (usage_snapshot(CODEX_USAGE_LOCAL),
+                         usage_snapshot(CODEX_USAGE_REMOTE)) if s]
+    if not snaps:
+        st.pop("codex_usage", None)
+        return "codex_usage 관측없음"
+    observed, pct, resets, total24 = max(snaps, key=lambda s: s[0])
+    # 관측이 미래로 찍히면(시계 어긋남) 음수가 된다 — 신선한 쪽으로 본다.
+    age = max(0, now_epoch() - observed) if observed else CODEX_USAGE_STALE_S + 1
+    # 알림은 안 보낸다(운영자 지시). 심박 줄로만 남긴다 —
+    # 수치는 codex-usage 로 직접 본다.
+    st.pop("codex_usage", None)
+    return f"codex_usage {pct:.0f}% 관측{int(age / 60)}분전 24h={total24:,}"
+
+
+def to_epoch(ts):
+    """systemd 의 realtime 타임스탬프 문자열("Tue 2026-08-18 14:19:23 KST")을 epoch 로.
+
+    monotonic(*USecMonotonic) 속성을 쓰지 않는 이유: `systemctl show` 는 그 값을
+    "1month 3w 3d 11h 1min 970.055ms" 같은 사람 읽는 문자열로 찍는다. 숫자로 파싱하면
+    항상 0 이 되고, 그러면 감시가 "한 번도 발화하지 않았다"고 영원히 오탐한다
+    (2026-08-18 실기계 dry-run 에서 실제로 이렇게 나왔다).
+    """
+    ts = (ts or "").strip()
+    if not ts or ts.startswith("n/a"):
+        return 0
+    rc, out = run(f"date -d {json.dumps(ts)} +%s", timeout=10)
+    try:
+        return int(out.strip()) if rc == 0 else 0
+    except ValueError:
+        return 0
+
+
+def systemd_props(unit, props):
+    rc, out = run(f"{SYSTEMCTL} show {unit} " + " ".join(f"-p {p}" for p in props), timeout=20)
+    d = {}
+    for line in (out or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k] = v
+    return rc, d
+
+
+def check_todo_rearm(st, alerts):
+    up = uptime_s()
+    rc_e, en = run(f"{SYSTEMCTL} is-enabled todo-rearm.timer", timeout=20)
+    rc_a, act = run(f"{SYSTEMCTL} is-active todo-rearm.timer", timeout=20)
+    _, tp = systemd_props("todo-rearm.timer", ["LastTriggerUSec"])
+    _, sp = systemd_props("todo-rearm.service",
+                          ["Result", "ExecMainStatus", "ActiveState",
+                           "ExecMainStartTimestamp"])
+
+    now = now_epoch()
+    problem = None
+    if en.strip() not in ("enabled", "enabled-runtime", "static", "indirect"):
+        problem = f"타이머가 enabled 가 아니다({en.strip() or 'unknown'})"
+    elif act.strip() != "active":
+        problem = f"타이머가 active 가 아니다({act.strip() or 'unknown'})"
+    else:
+        last = to_epoch(tp.get("LastTriggerUSec"))
+        if last == 0:
+            # 부팅 후 아직 한 번도 안 돌았다. 유예 안이면 정상.
+            if up > BOOT_GRACE_S:
+                problem = f"부팅 {int(up / 60)}분이 지났는데 한 번도 발화하지 않았다"
+        else:
+            quiet = now - last
+            if quiet > TRIGGER_STALE_S:
+                problem = f"마지막 발화가 {int(quiet / 60)}분 전이다(주기 10분)"
+        if not problem:
+            state = (sp.get("ActiveState") or "").strip()
+            if state in ("activating", "active", "reloading"):
+                started = to_epoch(sp.get("ExecMainStartTimestamp"))
+                running = now - started if started else 0
+                if started and running > SERVICE_MAX_RUN_S:
+                    problem = f"서비스가 {int(running)}초째 안 끝난다(상한 120초)"
+            else:
+                res = (sp.get("Result") or "").strip()
+                code = (sp.get("ExecMainStatus") or "").strip()
+                if res and res != "success":
+                    problem = f"서비스 마지막 결과가 {res} 다"
+                elif code not in ("", "0"):
+                    problem = f"서비스가 exit {code} 로 끝났다"
+
+    if problem:
+        # 세기만 하고 아무 데도 안 남기면, 2회차에 알림이 왔을 때 1회차가 무엇이었는지
+        # 알 길이 없다. 알림 문구는 마지막 관측만 담는다.
+        log_observation(f"todo_rearm: {problem} | enabled={en.strip()} active={act.strip()} "
+                        f"last={tp.get('LastTriggerUSec')} svc={sp.get('ActiveState')}/"
+                        f"{sp.get('Result')}/{sp.get('ExecMainStatus')}")
+    track(st, "todo_rearm",
+          bad=problem is not None,
+          alert_msg=(f"[home infra] todo-rearm 복구 경로 이상: {problem} (2회 연속 관측). "
+                     f"{PEER_LABEL} 의 todo cron 이 만료돼도 아무도 되살리지 않는 상태다. "
+                     f"볼 것: {SYSTEMCTL} status todo-rearm.timer todo-rearm.service"),
+          resolved_msg="[home infra] todo-rearm 타이머 정상 복귀. 직전 경보는 해소됐다.",
+          alerts=alerts)
+    last = to_epoch(tp.get("LastTriggerUSec"))
+    when = f"발화={int((now - last) / 60)}분전" if last else "발화기록없음"
+    return f"todo_rearm {('문제=' + problem) if problem else '정상'} {when}"
+
+
+def _repo_git(args, timeout=30):
+    return run(f"git -C {shlex.quote(REPO_DIR)} {args}", timeout=timeout)
+
+
+def _rev_count(rng):
+    rc, out = _repo_git(f"rev-list --count {shlex.quote(rng)}")
+    try:
+        return int(out.strip()) if rc == 0 else 0
+    except ValueError:
+        return 0
+
+
+def commit_position(sha, tip):
+    """origin 끝점을 기준으로 한 커밋의 위치. (상태, 커밋 수).
+
+    홈이 fetch 한 뒤에도 그 커밋이 여기 없으면 그건 아무도 안 올린 커밋이다 —
+    개수는 셀 수 없으므로 0 으로 둔다. 조상이면 못 받은 것이고, 자손이면 안 올린
+    것이고, 둘 다 아니면 갈라진 것이라 사람이 봐야 한다.
+    """
+    if not sha:
+        return "모름", 0
+    if sha == tip:
+        return "동기", 0
+    if _repo_git(f"cat-file -e {shlex.quote(sha)}^{{commit}}")[0] != 0:
+        return "미푸시", 0
+    if _repo_git(f"merge-base --is-ancestor {shlex.quote(sha)} {shlex.quote(tip)}")[0] == 0:
+        return "미풀", _rev_count(f"{sha}..{tip}")
+    if _repo_git(f"merge-base --is-ancestor {shlex.quote(tip)} {shlex.quote(sha)}")[0] == 0:
+        return "미푸시", _rev_count(f"{tip}..{sha}")
+    return "갈라짐", 0
+
+
+def check_repo_sync(st, alerts):
+    """홈과 둘째 기계가 공유 저장소의 같은 지점에 있나.
+
+    왜: 2026-09-22 에 둘째 기계의 안 올린 커밋과 홈의 안 받은 커밋 넷이 동시에 있었는데
+    아무것도 그것을 알리지 않았다. 배포가 심링크라 안 받은 쪽은 고쳐진 줄 아는 코드를
+    옛날 것으로 돌린다. 기준점은 origin 의 끝이고, 그 판정에 필요한 객체를 얻기 위해
+    fetch 를 한 번 한다(원격 추적 참조만 건드린다 — 작업본과 인덱스는 안 건드린다).
+    """
+    if _repo_git(f"fetch --quiet origin {shlex.quote(REPO_BRANCH)}", timeout=90)[0] != 0:
+        st.pop("repo_sync", None)
+        return "repo_sync fetch실패"
+    rc, tip = _repo_git(f"rev-parse origin/{shlex.quote(REPO_BRANCH)}")
+    tip = (tip or "").strip()
+    if rc != 0 or not re.fullmatch(r"[0-9a-f]{7,40}", tip):
+        st.pop("repo_sync", None)
+        return "repo_sync 기준점모름"
+
+    rc, head = _repo_git("rev-parse HEAD")
+    home_sha = head.strip() if rc == 0 else ""
+    rc_r, out_r = run(REPO_REMOTE_HEAD, timeout=40)
+    m = re.search(r"\b([0-9a-f]{40})\b", out_r or "")
+    peer_sha = m.group(1) if (rc_r == 0 and m) else ""
+
+    hs, hn = commit_position(home_sha, tip)
+    rs, rn = commit_position(peer_sha, tip)
+    # ssh 가 안 되는 것은 어긋남이 아니다 — 그건 todo-rearm-trigger 의 데드맨 몫이다.
+    bad = hs != "동기" or rs not in ("동기", "모름")
+    sig = f"local:{hs}|peer:{rs}"
+
+    def side(name, state, n):
+        return f"{name} {state}" + (f" {n}커밋" if n else "")
+
+    if not bad:
+        if st.pop("repo_sync", None) and st.get("repo_sync_alerted"):
+            alerts.append("[home infra] 저장소 어긋남 해소됐다 — 두 기계가 같은 지점이다.")
+        st.pop("repo_sync_alerted", None)
+        return f"repo_sync 동기 tip={tip[:7]}"
+
+    d = st.get("repo_sync") or {}
+    if d.get("sig") != sig:
+        d = {"sig": sig, "since": now_epoch()}
+        st.pop("repo_sync_alerted", None)
+    st["repo_sync"] = d
+    age = now_epoch() - int(d["since"])
+    if age >= REPO_PERSIST_S and not st.get("repo_sync_alerted"):
+        alerts.append(
+            f"[home infra] 공유 저장소가 {int(age / 3600)}시간 넘게 어긋나 있다 — "
+            f"{side(LOCAL_LABEL, hs, hn)}, {side(PEER_LABEL, rs, rn)} (기준 origin/{REPO_BRANCH} {tip[:7]}). "
+            f"배포가 심링크라 안 받은 쪽은 옛 코드를 그대로 돈다. "
+            f"조치: 안 올린 쪽에서 git push, 못 받은 쪽에서 git pull --ff-only. "
+            f"갈라졌으면 사람이 본다.")
+        st["repo_sync_alerted"] = True
+    return f"repo_sync {sig} {int(age / 60)}분"
+
+
+CODEX_CONFIG_KEYS = ("model", "model_reasoning_effort")
+# 값의 글자를 좁게 잡는다. 이 검사는 알림에 값을 그대로 싣기 때문에, 모델 이름·강도로
+# 쓰일 수 있는 글자만 통과시켜 엉뚱한 내용이 밖으로 나가지 않게 한다.
+CODEX_CONFIG_LINE = re.compile(
+    r'^\s*(model|model_reasoning_effort)\s*=\s*"?([A-Za-z0-9._-]{1,64})"?\s*$')
+
+
+def parse_codex_config(text):
+    """두 키만 뽑는다. 둘 다 못 읽으면 빈 사전."""
+    got = {}
+    for line in (text or "").splitlines():
+        m = CODEX_CONFIG_LINE.match(line)
+        if m:
+            got[m.group(1)] = m.group(2)
+    return got if all(k in got for k in CODEX_CONFIG_KEYS) else {}
+
+
+def codex_config_side(rc, out):
+    """(상태, 값사전). 상태는 정상·설정없음·읽기실패·미관측 중 하나."""
+    if rc != 0:
+        return "미관측", {}
+    if "NOFILE" in (out or ""):
+        return "설정없음", {}
+    got = parse_codex_config(out)
+    return ("정상", got) if got else ("읽기실패", {})
+
+
+def check_codex_config(st, alerts):
+    """홈과 둘째 기계의 코덱스 모델·강도가 같은가.
+
+    왜: 이 값은 저장소 밖 파일 하나가 단일 출처라 한쪽만 바뀌어도 아무 기록에 안 남는다.
+    갈린 채로 돌면 두 호스트의 토론이 다른 모델로 닫히는데 결과만 보고는 못 가린다.
+    바로 알리지 않는 것은 사람이 양쪽을 고치는 사이가 정상 구간이기 때문이다.
+    원격 접속 실패는 어긋남이 아니라 미관측이다 — 그건 다른 감시의 몫이다.
+    """
+    try:
+        local_text = Path(CODEX_CONFIG_LOCAL).read_text(encoding="utf-8")
+        rc_l = 0
+    except OSError:
+        local_text, rc_l = "NOFILE", 0
+    home_state, home_vals = codex_config_side(rc_l, local_text)
+    rc_r, out_r = run(CODEX_CONFIG_REMOTE, timeout=40)
+    peer_state, peer_vals = codex_config_side(rc_r, out_r)
+
+    if peer_state == "미관측":
+        return "codex_config 상대미관측"
+
+    # 파일이 없거나 두 키를 못 읽는 것은 어긋남과 다른 고장이다. 어긋남 타이머를
+    # 건드리지 않고 연속 2회에서 따로 알린다.
+    broken = [n for n, s in ((LOCAL_LABEL, home_state), (PEER_LABEL, peer_state)) if s != "정상"]
+    track(st, "codex_config_read",
+          bad=bool(broken),
+          alert_msg=(f"[home infra] 코덱스 설정을 못 읽는다: {', '.join(broken)} "
+                     f"({LOCAL_LABEL} {home_state}, {PEER_LABEL} {peer_state}, 2회 연속). "
+                     f"ai-debate 의 최종 정리자가 어느 모델로 도는지 확인할 수 없다. "
+                     f"조치: 해당 호스트의 ~/.codex/config.toml 에 model 과 "
+                     f"model_reasoning_effort 가 있는지 본다."),
+          resolved_msg="[home infra] 코덱스 설정을 다시 읽는다. 직전 경보는 해소됐다.",
+          alerts=alerts)
+    if broken:
+        st.pop("codex_config", None)
+        st.pop("codex_config_alerted", None)
+        return f"codex_config 못읽음({LOCAL_LABEL} {home_state}, {PEER_LABEL} {peer_state})"
+
+    same = home_vals == peer_vals
+    sig = "|".join(f"{k}:{home_vals[k]}/{peer_vals[k]}" for k in CODEX_CONFIG_KEYS)
+    if same:
+        if st.pop("codex_config", None) and st.get("codex_config_alerted"):
+            alerts.append("[home infra] 코덱스 설정이 다시 같아졌다. 직전 경보는 해소됐다.")
+        st.pop("codex_config_alerted", None)
+        return f"codex_config 동일 {home_vals['model']}/{home_vals['model_reasoning_effort']}"
+
+    d = st.get("codex_config") or {}
+    if d.get("sig") != sig:
+        d = {"sig": sig, "since": now_epoch(), "seen": 0}
+        st.pop("codex_config_alerted", None)
+    d["seen"] = int(d.get("seen", 0)) + 1
+    st["codex_config"] = d
+    age = now_epoch() - int(d["since"])
+    # 지속시간만으로는 부족하다 — 원격을 한 번밖에 못 본 채 두 시간이 지날 수 있다.
+    if age >= CODEX_CONFIG_PERSIST_S and d["seen"] >= 2 and not st.get("codex_config_alerted"):
+        diff = ", ".join(f"{k}: {LOCAL_LABEL} {home_vals[k]} / {PEER_LABEL} {peer_vals[k]}"
+                         for k in CODEX_CONFIG_KEYS if home_vals[k] != peer_vals[k])
+        alerts.append(
+            f"[home infra] 코덱스 설정이 {int(age / 3600)}시간 넘게 두 기계에서 갈려 있다 — "
+            f"{diff}. ai-debate 의 최종 판정은 codex 단독이라 어느 호스트에서 돌렸는지에 따라 "
+            f"결론이 달라진다. 조치: 한쪽 ~/.codex/config.toml 을 맞춘다.")
+        st["codex_config_alerted"] = True
+    return f"codex_config 갈림 {sig} {int(age / 60)}분 관측{d['seen']}회"
+
+
+def main():
+    if not machine_is_home():
+        print("home-infra-watch: home 전용이라 실행하지 않는다.", file=sys.stderr)
+        return 0
+    st = load_state()
+    alerts = []
+    obs = [check_codex(st, alerts), check_todo_rearm(st, alerts),
+           check_codex_usage(st, alerts), check_repo_sync(st, alerts),
+           check_codex_config(st, alerts)]
+    save_state(st)
+    # 회차마다 한 줄. 이게 없으면 "2주 무경보"가 정상인지 검사 중단인지 못 가린다.
+    log_observation(("ALERT " if alerts else "ok ") + " | ".join(o for o in obs if o))
+    for a in alerts:
+        notify(a)
+        print(a)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,11 @@
+[Unit]
+Description=Claude Coord Report Timer (09~22시 정각)
+
+[Timer]
+OnCalendar=*-*-* 09..22:00:00
+# 기계가 꺼져 있던 회차를 깨어나자마자 몰아서 보내지 않는다 — 지난 정각은 지난 것이다.
+Persistent=false
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

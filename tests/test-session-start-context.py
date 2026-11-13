@@ -56,7 +56,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("정상일 때 active.md 가 주입된다", "현재 유효한 결정" in out, out[:400])
 
 with tempfile.TemporaryDirectory() as tmp:
-    # active.md 부재 — session-a 가 몇 달간 있던 상태. 지금까지 조용했다.
+    # active.md 부재 — alpha 가 몇 달간 있던 상태. 지금까지 조용했다.
     d = project(tmp, history="## [2026-01-01] #1 결정\n- 실험/실패: 재시도 시간낭비\n" * 300)
     out = run(d)
     check("active.md 부재 시 경고", ALERT in out and "history/active.md 가 없다" in out, out[-600:])
@@ -96,13 +96,13 @@ with tempfile.TemporaryDirectory() as tmp:
     check("따옴표·역슬래시가 있어도 주입 유지", "SENTINEL_QUOTE" in out, out[:300])
 
 with tempfile.TemporaryDirectory() as tmp:
-    # 줄 수만 초과(바이트는 상한 안) — session_c_work 592줄 계열
+    # 줄 수만 초과(바이트는 상한 안) — gamma_work 592줄 계열
     d = project(tmp, history="## [2026-01-01] #1\n" * 500, active="- 짧다\n" * 200)
     out = run(d)
     check("줄 수 초과를 잡는다", ALERT in out and "200줄이다" in out, out[-600:])
 
 with tempfile.TemporaryDirectory() as tmp:
-    # 요약본이 본체보다 큼 — proj-b 계열(363줄 vs 184줄)
+    # 요약본이 본체보다 큼 — raise 계열(363줄 vs 184줄)
     d = project(tmp, history="## 짧은 본체\n", active="- 요약이 더 길다\n" * 20)
     out = run(d)
     check("요약본 역전을 잡는다", ALERT in out and "요약본이 원본보다 크다" in out, out[-600:])

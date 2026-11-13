@@ -2,8 +2,8 @@
 # gemini-ask: Antigravity CLI (agy) wrapper — 라벨은 gemini 유지, 백엔드는 agy.
 #
 # 2026-05-21 마이그레이션: gemini-cli (EOL 2026-06-18) → antigravity CLI.
-# 외부 호출자 4개 (ai-morning-briefing, ai-briefing-review, ai-weekly-review,
-# kill-ai-zombies) 의 API 호환을 위해 wrapper 보존.
+# 외부 호출자 (ai-morning-briefing, ai-briefing-review, kill-ai-zombies) 의
+# API 호환을 위해 wrapper 보존.
 #
 # Usage:
 #   gemini-ask "프롬프트"                       - 새 호출 (이전엔 latest resume)
@@ -15,7 +15,7 @@
 
 set -uo pipefail
 
-AGY=$HOME/.local/bin/agy
+AGY="${AGY:-$HOME/.local/bin/agy}"
 
 _AI_TELEM_START=$(date +%s%3N)
 _AI_TELEM_KIND=""

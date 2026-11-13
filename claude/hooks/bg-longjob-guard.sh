@@ -87,13 +87,38 @@ def strip_heredocs(text):
 # 파이프라인/체인 세그먼트로 분리 후 각 세그먼트의 "실행위치 프로그램" 추출
 WRAPPERS = {"env", "timeout", "nice", "nohup", "stdbuf", "ionice", "time",
             "sudo", "command", "exec", "setsid"}
-segments = re.split(r"\|\||&&|[|;&\n]", strip_heredocs(cmd))
+# 다음 토큰이 다시 명령 시작 자리가 되는 것들. 기호는 글자 집합으로 본다 —
+# 어휘 분석기가 이어진 기호를 한 토큰으로 묶어 내놓기 때문이다(");" 같은 모양).
+SEP_WORDS = {"then", "do", "else", "elif", "{", "}", "!"}
+SEP_CHARS = set("|&;()")
 
-def tokens_of(seg):
+def is_sep(t):
+    return t in SEP_WORDS or (bool(t) and all(c in SEP_CHARS for c in t))
+
+def segments_of(text):
+    """연산자로 나눈 명령 조각들. 따옴표 안은 쪼개지 않는다.
+
+    글자로 먼저 가르면 따옴표 안의 세로줄이 조각 경계가 되어 둘 다 틀린다 —
+    인용문 속 이름이 실행으로 읽히고, 반대로 `ai-debate "a|b"` 는 따옴표가
+    갈려 어휘 분석이 실패해 그 조각이 통째로 판정에서 빠진다.
+    """
     try:
-        return shlex.split(seg, comments=False, posix=True)
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        toks = list(lex)
     except Exception:
         return []
+    out, cur = [], []
+    for t in toks:
+        if is_sep(t):
+            if cur:
+                out.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    if cur:
+        out.append(cur)
+    return out
 
 def exec_program(toks):
     # 래퍼/환경대입을 벗긴 "실행위치" 프로그램 basename (ai-debate 판정용, 엄격)
@@ -114,10 +139,7 @@ def exec_program(toks):
 hit_aidebate = False
 hit_wrapper = False
 hit_bench = None
-for seg in segments:
-    toks = tokens_of(seg)
-    if not toks:
-        continue
+for toks in segments_of(strip_heredocs(cmd)):
     # ai-debate: 실행위치만(흔한 단어라 grep/echo 인자 오탐 방지)
     prog = exec_program(toks)
     if prog == "ai-debate":

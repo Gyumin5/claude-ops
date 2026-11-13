@@ -26,11 +26,12 @@ tools: Read, Grep, Glob, Bash, Edit, Write, WebFetch, WebSearch
 - sudo/pkexec/su/doas 금지. tail -f·watch·무한 sleep·대화형 에디터 등 블로킹 명령 금지. 오래 걸리는 건 run_in_background.
 - 자식 claude 세션 spawn 금지.
 
-## 외부 크로스체크 (ai-debate) — 진짜 결정 지점에서만
-작업 중 설계 갈림길, 불확실한 트레이드오프, 최신 외부 정보 필요, 되돌리기 어려운 위험한 선택 같은 진짜 결정 지점에서는 ai-collaborate 단일 진입(ai-debate CLI)을 적극 호출해 세컨드 오피니언을 받는다.
-- 실행: Bash 로 `ai-debate "<짧은 task>"` 또는 `cat <file> | ai-debate "검토: <관점>"`.
-- 호출 직전 한 줄 고지, 수 분 소요(timeout 인지, 필요하면 run_in_background).
-- ai-debate 는 조언·검토용일 뿐이다. 파일 수정 자체를 codex/gemini 에 위임하지 마라 — 실제 편집은 이 워커(claude)가 한다.
+## 외부 크로스체크 — 진짜 결정 지점에서만
+작업 중 설계 갈림길, 불확실한 트레이드오프, 최신 외부 정보 필요, 되돌리기 어려운 위험한 선택 같은 진짜 결정 지점에서는 외부 세컨드 오피니언을 적극 받는다.
+- 제출 방법은 ai-collaborate 스킬이 정본이다. 토론 도구를 직접 실행하지 않는다 — 세션 안에서 부르면 차단된다.
+- 제출은 `cat <brief> | ai-debate-detach "<질문>"` 을 foreground 로. 즉시 반환하고 결과는 다음 턴에 주입된다.
+- 호출 직전 한 줄 고지. 브리프에는 검토 대상 절대경로를 적는다 — 없으면 참여자가 파일을 한 줄도 못 읽는다.
+- 토론은 조언·검토용일 뿐이다. 파일 수정 자체를 codex/gemini 에 위임하지 마라 — 실제 편집은 이 워커(claude)가 한다.
 - 일상적·자명한 작업엔 부르지 말 것(과호출 금지).
 
 ## 반환 형식 (마지막 메시지)

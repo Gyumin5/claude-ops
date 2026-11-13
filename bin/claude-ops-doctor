@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""설치가 끝났는지 스스로 검사한다.
+
+SETUP.md 를 따라 세운 뒤 "어디까지 된 건가" 를 한 번에 보는 자리다. 고치지는
+않는다 — 무엇이 빠졌는지와 어느 줄을 다시 보면 되는지만 적는다. 고치는 것까지
+하면 사람이 안 본 채로 설정이 바뀌고, 그 상태는 화면에 안 남는다.
+
+판정은 셋이다.
+  OK    — 이대로면 된다
+  경고  — 없어도 나머지는 돌지만, 그 기능은 안 돈다(텔레그램·통로 따위)
+  실패  — 이대로는 세션이 안 뜬다
+
+실패가 하나라도 있으면 종료코드 1 이다.
+"""
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+HOME = Path(os.environ.get("HOME", str(Path.home())))
+
+fails = 0
+warns = 0
+
+
+def say(level, name, detail=""):
+    global fails, warns
+    if level == "실패":
+        fails += 1
+    elif level == "경고":
+        warns += 1
+    print(f"{level:4}  {name}" + (f"\n      {detail}" if detail else ""))
+
+
+def have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def systemctl(*args):
+    """없는 기계에서는 None 을 준다 — 건너뛸 수 있어야 한다."""
+    if not have("systemctl"):
+        return None
+    try:
+        p = subprocess.run(["systemctl", "--user", *args],
+                           capture_output=True, text=True, timeout=20)
+        return p.stdout.strip()
+    except Exception:
+        return None
+
+
+def unit_property(unit, prop):
+    out = systemctl("show", "-p", prop, "--value", unit)
+    return out or ""
+
+
+def main():
+    print("== 바탕 ==")
+    say("OK", f"파이썬 {sys.version_info.major}.{sys.version_info.minor}")
+
+    if have("claude"):
+        say("OK", "Claude Code 명령이 PATH 에 있다")
+    else:
+        say("실패", "Claude Code 명령을 못 찾는다",
+            "세션 유닛이 이 명령으로 뜬다. SETUP.md 2절.")
+
+    if have("bun"):
+        say("OK", "bun 이 PATH 에 있다")
+    else:
+        say("경고", "bun 이 없다 — 텔레그램이 안 붙는다",
+            "세션 자체는 뜬다. SETUP.md 2절.")
+
+    if have("systemctl"):
+        say("OK", "systemctl 을 쓸 수 있다")
+    else:
+        say("실패", "systemctl 이 없다", "이 묶음은 systemd user 유닛으로 돈다.")
+
+    local_bin = HOME / ".local" / "bin"
+    path_parts = [Path(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    if local_bin in path_parts:
+        say("OK", f"{local_bin} 이 PATH 에 있다")
+    else:
+        say("실패", f"{local_bin} 이 PATH 에 없다",
+            "명령이 거기 심링크로 깔린다. 셸 설정에 더한다.")
+
+    print("\n== 심기 ==")
+    settings = HOME / ".claude" / "settings.json"
+    if not settings.exists():
+        say("실패", "~/.claude/settings.json 이 없다", "install.sh 를 아직 안 돌렸다.")
+    elif settings.is_symlink():
+        # 파이썬 3.8 에는 Path.is_relative_to 가 없다 — 문자열로 본다.
+        target = os.path.realpath(settings)
+        if target == str(REPO) or target.startswith(str(REPO) + os.sep):
+            say("OK", "설정이 이 저장소를 가리킨다")
+        else:
+            say("경고", "설정이 다른 저장소를 가리킨다", target)
+    else:
+        say("경고", "설정이 심링크가 아니다 — 저장소를 고쳐도 안 따라간다", str(settings))
+
+    print("\n== 기계 이름표 ==")
+    marker = HOME / ".config" / "claude-machine-id"
+    name = marker.read_text(encoding="utf-8").strip() if marker.exists() else ""
+    if not name:
+        say("실패", "기계 이름표가 없다",
+            "echo <이름> > ~/.config/claude-machine-id 로 정한다. SETUP.md 4절.")
+        return finish()
+    say("OK", f"기계 이름 {name}")
+
+    listing = REPO / "machines" / f"{name}.list"
+    if not listing.exists():
+        say("실패", f"켤 목록이 없다: machines/{name}.list",
+            "machines/home.list.example 를 베껴 세션 이름을 한 줄에 하나씩 적는다.")
+        return finish()
+
+    sessions = [ln.strip() for ln in listing.read_text(encoding="utf-8").splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")]
+    if not sessions:
+        say("경고", "켤 목록이 비어 있다", str(listing))
+    say("OK", f"켤 세션 {len(sessions)}개", ", ".join(sessions) if sessions else "")
+
+    print("\n== 세션 ==")
+    for s in sessions:
+        unit = f"claude-{s}.service"
+        installed = HOME / ".config" / "systemd" / "user" / unit
+        if not installed.exists():
+            say("실패", f"[{s}] 유닛이 안 깔렸다",
+                "저장소 systemd/user/ 에 만들고 ./install.sh 를 돌린다. SETUP.md 5절.")
+            continue
+
+        wd = ""
+        for line in installed.read_text(encoding="utf-8").splitlines():
+            if line.startswith("WorkingDirectory="):
+                wd = line.split("=", 1)[1].strip()
+        if wd.startswith("%h"):
+            wd = str(HOME) + wd[2:]
+        if not wd:
+            say("실패", f"[{s}] 유닛에 작업 폴더가 없다", str(installed))
+            continue
+        if not Path(wd).is_dir():
+            say("실패", f"[{s}] 작업 폴더가 없다", wd)
+            continue
+
+        env = Path(wd) / ".claude" / "telegram" / ".env"
+        if not env.exists():
+            say("경고", f"[{s}] 봇 토큰 파일이 없다 — 이 세션은 안 켜진다",
+                f"{env} 에 TELEGRAM_BOT_TOKEN 을 적는다. SETUP.md 3절.")
+        elif (env.stat().st_mode & 0o077) != 0:
+            say("경고", f"[{s}] 봇 토큰 파일을 남이 읽을 수 있다",
+                f"chmod 600 {env}")
+        else:
+            say("OK", f"[{s}] 봇 토큰 파일이 제자리에 있다")
+
+        state = systemctl("is-active", unit)
+        if state is None:
+            say("경고", f"[{s}] 도는지 못 쟀다 — systemctl 을 못 불렀다")
+        elif state == "active":
+            say("OK", f"[{s}] 돌고 있다")
+        else:
+            say("경고", f"[{s}] 안 돌고 있다 ({state or '모름'})",
+                f"systemctl --user start {unit}")
+
+    print("\n== 선택 ==")
+    control = HOME / ".claude" / "control-bot" / ".env"
+    say("OK" if control.exists() else "경고",
+        "통제 봇 설정" + ("이 있다" if control.exists() else "이 없다 — 세션이 멈추면 조작할 창구가 없다"),
+        "" if control.exists() else "SETUP.md 3-e 절.")
+
+    targets = HOME / ".claude" / "userbot" / "targets.json"
+    say("OK" if targets.exists() else "경고",
+        "세션끼리 넣는 통로" + ("가 설정돼 있다" if targets.exists() else "는 설정 안 됐다 — 안 써도 된다"),
+        "" if targets.exists() else "SETUP.md 6절.")
+
+    return finish()
+
+
+def finish():
+    print(f"\n실패 {fails} · 경고 {warns}")
+    if fails:
+        print("실패를 먼저 고친다. 경고는 그 기능을 쓸 때 고치면 된다.")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

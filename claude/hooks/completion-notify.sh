@@ -3,10 +3,12 @@
 # 크로스세션으로 --notify-done 주입된 작업이 끝나면, 받은 세션의 자기 봇으로
 # 운영자 챗에 "작업완료" 핑 1회. 마커 [[xnotify:from=...]] 가 현재 턴 프롬프트에
 # 있을 때만 발동. 일반 대화 턴은 영향 없음(스팸 방지).
-# 발송은 운영자 단일 챗(${TELEGRAM_CHAT_ID:-})으로만 — 세션 재주입 없음 → 무한핑퐁 0.
+# 발송은 운영자 단일 챗으로만 — 세션 재주입 없음 → 무한핑퐁 0.
 # 항상 exit 0 (종료 차단 안 함, 기존 telegram-reply-enforcer 와 공존).
 
 set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../lib/operator_chat.sh"   # 방 번호 단일 출처
+CHAT_ID="$(operator_chat_id)" || exit 0   # 방 번호가 없으면 알림만 건너뛴다
 
 # 자동 작업(claude -p 등)은 스킵.
 [ "${CLAUDE_AUTOMATED:-0}" = "1" ] && exit 0
@@ -149,7 +151,7 @@ MSG="✅ [${PROJ}@${MACHINE}] 크로스세션 작업 완료
 결과: ${TAIL}"
 
 curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+    --data-urlencode "chat_id=$CHAT_ID" \
     --data-urlencode "text=${MSG}" >/dev/null 2>&1 && touch "$FLAG"
 
 exit 0

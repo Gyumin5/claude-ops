@@ -1,0 +1,11 @@
+[Unit]
+Description=Claude Nudge Audit (넛지 장치 자신이 돌고 있는지 30분마다 확인)
+
+[Service]
+Type=oneshot
+Environment="PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=%h/dotfiles/bin/claude-nudge-audit
+# 점검이 매달려 있으면 그 회차는 없는 게 낫다 — 다음 회차가 30분 뒤에 다시 온다.
+TimeoutStartSec=180
+StandardOutput=append:%h/.claude/logs/nudge-audit.log
+StandardError=append:%h/.claude/logs/nudge-audit.log

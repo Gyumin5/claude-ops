@@ -11,7 +11,7 @@
 # 사용법:
 #   claude-soft-restart <name> [--dry-run] [--timeout SEC]
 #   claude-soft-restart --all   [--dry-run] [--timeout SEC] [--stagger SEC]
-# 주의: 로컬(같은 머신) 세션만. cross-host(peer) relay 는 P2b-2(미구현, graceful 스킵).
+# 주의: 로컬(같은 머신) 세션만. 다른 기계로 건너가는 relay 는 P2b-2(미구현, graceful 스킵).
 #
 # 구조적 한계 — 이 레일은 대상이 "턴 경계"에 있을 때만 동작한다. 텔레그램 메시지가 턴
 # 진행중에 도착하면 fresh prompt 가 아니라 현재 턴에 주입되고, 그러면 UserPromptSubmit
@@ -22,10 +22,11 @@
 # self-trigger 는 실패하지 않는다 — 단 트리거를 보낸 뒤 그 턴을 즉시 끝내야 한다.
 # 그래야 메시지가 도착할 때 자기가 유휴다. 같은 턴 안에서 결과를 기다리면 영원히 안 온다
 # (그래서 자기 세션이면 폴링을 생략하고 다음 턴에 훅이 소비하게 둔다).
-# 2026-06 큐 flush 자가 테스트가 이 함정에 걸렸던 것이고, 2026-08-03 스윕에서는 home·peer
+# 2026-06 큐 flush 자가 테스트가 이 함정에 걸렸던 것이고, 2026-08-03 스윕에서는 두 기계
 # 양쪽 dotfiles 가 자기 자신을 정상 재시작했다.
-# (session-g 는 대화중이라 3회 전부 enqueue→remove, dequeue 없음 — 유휴가 된 뒤 재시도로 붙었다.)
+# (한 세션은 대화중이라 3회 전부 enqueue→remove, dequeue 없음 — 유휴가 된 뒤 재시도로 붙었다.)
 set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/operator_chat.sh"   # 방 번호 단일 출처
 
 SECRET_FILE="$HOME/.claude/userbot/soft-restart.secret"
 JOB_DIR="$HOME/.claude/state/soft-restart"
@@ -92,7 +93,7 @@ try: print("@"+json.load(sys.stdin)["result"]["username"])
 except: sys.exit(1)' ) 2>/dev/null
 }
 
-# 트리거 발송: 로컬 유저봇(세션 있으면) 또는 relay(peer 등 유저봇 없는 PC → home 에 ssh 위임).
+# 트리거 발송: 로컬 유저봇(세션 있으면) 또는 relay(유저봇 없는 PC → home 에 ssh 위임).
 # rate-limit-recovery trigger_flush 와 동일 패턴. 서명은 이 머신에서 로컬로 끝났고 여기선 전달만
 # 하므로 relay 대상(home)은 secret 몰라도 됨(머신 간 secret 조율 불필요).
 send_via_userbot() {
@@ -207,8 +208,9 @@ soft_restart_one() {
         # shellcheck disable=SC1090
         . "$env_file" 2>/dev/null
         [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || exit 0
+        CHAT_ID="$(operator_chat_id)" || exit 0
         curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+            --data-urlencode "chat_id=$CHAT_ID" \
             --data-urlencode "text=⚠ 소프트재시작 미확인 — ${n}(${timeout}초, ack=${acked}). 대개 hang 이 아니라 대상이 턴 중이라 훅이 안 돈 것이다(턴 진행중 도착 메시지는 UserPromptSubmit 을 발동시키지 않는다). 유휴가 되면 재시도하면 붙는다. 그래도 안 되면: cs restart ${n} --hard" \
             >/dev/null 2>&1
     )

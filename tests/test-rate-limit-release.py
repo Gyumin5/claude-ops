@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """한도 차단·해제 경로 계약 검사 — 진짜 한도를 기다리지 않고 합성 HOME 으로 잰다.
 
-재현하는 사고(2026-08-28 옆 기계): 캐시가 6시간 전에 얼었고 그 안의 7일 창은 리셋이
+재현하는 사고(2026-08-28 둘째 기계): 캐시가 6시간 전에 얼었고 그 안의 7일 창은 리셋이
 아직 미래라 99% 가 그대로 살아 있었다. 옛 계산은 그걸 근거로 계속 차단했고, 막히니
 턴이 없고, 턴이 없으니 캐시가 안 갱신되는 순환에 6시간 갇혔다.
 
 지키는 것:
   1. 도구 차단 훅은 낡은 캐시로 차단하지 않는다(순환의 입구를 막는다).
-  2. 복구 스크립트는 낡은 캐시를 해제 근거로도 쓰지 않는다 — 큐가 있으면 실측한다.
-  3. 실측이 성공해야 해제다. 실패하면 큐를 그대로 두고 백오프한다.
-  4. 큐가 없으면 실측하지 않는다(공짜가 아니다).
-  5. 신선한 관측이 임계를 넘으면 그대로 차단이다.
+  2. 복구 스크립트는 큐가 있을 때 5시간 창의 리셋 시각으로 깨울지를 가른다. 사용률은
+     얼어붙어도 리셋 시각은 절대 시각이라 낡은 캐시에서도 유효하다.
+  3. 얼어붙은 7일 수치는 보류 근거가 아니다 — 그걸 근거로 삼으면 사고 그대로 최대
+     7일을 갇힌다. 7일이 진짜로 찼으면 깨어난 세션이 다시 막히고 차단기가 멈춘다.
+  4. 큐가 없으면 창 판정까지 가지 않는다.
+  5. 신선한 관측이 임계를 넘으면 그 앞에서 끝난다.
 
-가짜 claude 를 $HOME/.local/bin 에 놓아 실측 성공·실패를 주입한다. 네트워크·실제
-계정을 쓰지 않는다.
+네트워크·실제 계정을 쓰지 않는다. 합성 HOME 의 캐시만으로 잰다.
 """
 import json
 import os
@@ -22,10 +23,6 @@ import subprocess
 import sys
 import tempfile
 import time
-
-# 저장소 뿌리를 이 파일 위치에서 찾는다. 예전엔 홈 아래 고정 경로였는데,
-# 그러면 다른 자리에 받은 사람은 그대로 못 돌린다.
-REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 # 도는 스크립트를 제자리에서 고치지 않으려고 새 파일로 먼저 검사할 수 있게 열어둔다.
@@ -45,9 +42,9 @@ def check(name, got, want, detail=""):
 
 
 class Home:
-    """합성 HOME. 캐시·큐·가짜 claude 를 원하는 상태로 놓는다."""
+    """합성 HOME. 캐시와 큐를 원하는 상태로 놓는다."""
 
-    def __init__(self, cache_age, fh, sd, queue=False, probe_rc=None):
+    def __init__(self, cache_age, fh, sd, queue=False):
         self.dir = tempfile.mkdtemp(prefix="ratelimit-test-")
         now = time.time()
         state = os.path.join(self.dir, ".claude", "state")
@@ -60,15 +57,6 @@ class Home:
         if queue:
             with open(os.path.join(qdir, "testproj.jsonl"), "w") as f:
                 f.write('{"id": "m1", "text": "밀린 메시지"}\n')
-        if probe_rc is not None:
-            bindir = os.path.join(self.dir, ".local", "bin")
-            os.makedirs(bindir)
-            fake = os.path.join(bindir, "claude")
-            with open(fake, "w") as f:
-                f.write("#!/bin/bash\n"
-                        + ("echo pong\nexit 0\n" if probe_rc == 0
-                           else "echo 'rate limit' >&2\nexit %d\n" % probe_rc))
-            os.chmod(fake, 0o755)
 
     def env(self):
         e = dict(os.environ)
@@ -82,6 +70,9 @@ class Home:
         # 자체를 판정하지 않으므로 의도는 그대로다. 보조 조치로 부모가 들고
         # 있을 수 있는 토큰도 뺀다.
         e["CLAUDE_SESSION_NAME"] = "ratelimit-test"
+        # 깨우기를 흩는 무작위 대기는 끈다 — 이 검사가 보는 것은 보낸 결과지
+        # 몇 초 뒤에 나가나가 아니다. 흩는 동작은 tests/test-flush-jitter.py.
+        e["CLAUDE_FLUSH_JITTER_MAX"] = "0"
         e.pop("TELEGRAM_BOT_TOKEN", None)
         e.pop("TELEGRAM_CHAT_ID", None)
         return e
@@ -165,6 +156,14 @@ def frozen(**kw):
                 {"used_percentage": 99, "resets_at": now + 2 * 86400}, **kw)
 
 
+def blocked_5h_frozen(**kw):
+    """6시간 전에 언 캐시인데 5시간 창 리셋은 아직 미래다 = 그 창 기준으로 아직 막힘."""
+    now = time.time()
+    return Home(6 * 3600,
+                {"used_percentage": 95, "resets_at": now + 1800},
+                {"used_percentage": 40, "resets_at": now + 2 * 86400}, **kw)
+
+
 def fresh(pct5, pct7=2, **kw):
     now = time.time()
     return Home(60,
@@ -196,7 +195,7 @@ def main():
         h.close()
 
     print("차단 시 재개 검토 신호 (깨울 근거를 큐에 한 칸 남기는가)")
-    # 재현하는 사고(2026-09-20 session-b): 첫 차단 도구가 Bash 라 마커가 안 남았고,
+    # 재현하는 사고(2026-09-20 beta): 첫 차단 도구가 Bash 라 마커가 안 남았고,
     # 복구 타이머는 큐가 빈 세션을 건너뛰므로 한도가 풀려도 아무도 깨우지 않았다.
     h = fresh(95)
     try:
@@ -263,48 +262,44 @@ def main():
         h.close()
 
     print("복구 — 모름 + 큐 있음")
-    h = frozen(queue=True, probe_rc=0)
+    # 얼어붙은 캐시의 5시간 창은 리셋이 이미 지났다(frozen). 그 창 기준으로는 풀렸으니
+    # 깨우기로 넘어간다 — 7일 창이 99퍼센트로 얼어 있어도 그걸 근거로 보류하지 않는다.
+    # 그렇게 하면 사고 그대로 최대 7일을 갇힌다.
+    h = frozen(queue=True)
     try:
         h.run_recovery()
-        check("실측한다", "probe" in h.log(), True, h.log()[:120])
-        check("성공하면 해제로 본다", "probe 성공" in h.log(), True, h.log()[:120])
-        check("성공 뒤 백오프 상태가 남지 않는다", h.has("rate-limit-probe-next"), False)
+        check("5시간 창 리셋이 지났으면 보류하지 않는다", "깨우기 보류" in h.log(), False,
+              h.log()[:160])
+        check("얼어붙은 7일 수치를 보류 근거로 쓰지 않는다", "7d" in h.log(), False,
+              h.log()[:160])
     finally:
         h.close()
 
-    h = frozen(queue=True, probe_rc=1)
+    # 5시간 창이 임계를 넘겼고 리셋이 아직 미래다 = 지금 깨워도 되튕긴다.
+    h = blocked_5h_frozen(queue=True)
     try:
         h.run_recovery()
-        check("실패하면 실패로 기록", "probe 실패" in h.log(), True, h.log()[:120])
-        check("백오프 상태를 남긴다", h.has("rate-limit-probe-next"), True)
+        check("5시간 창이 리셋 전이면 보류한다", "깨우기 보류" in h.log(), True, h.log()[:160])
         qpath = os.path.join(h.dir, ".claude", "state", "rate-limit-queue", "testproj.jsonl")
-        check("큐를 건드리지 않는다", os.path.getsize(qpath) > 0, True)
-        # 두 번째 tick 은 백오프 중이라 실측하지 않는다.
-        before = h.log().count("probe")
-        h.run_recovery()
-        check("백오프 중에는 다시 찌르지 않는다", h.log().count("probe"), before)
+        check("보류해도 큐를 건드리지 않는다", os.path.getsize(qpath) > 0, True)
+        check("모름 구간 표시는 남긴다", h.has("rate-limit-unknown-since"), True)
     finally:
         h.close()
 
-    print("복구 — 실측하지 않아야 하는 경우")
-    h = frozen(queue=False, probe_rc=0)
+    print("복구 — 창을 보지 않아야 하는 경우")
+    h = frozen(queue=False)
     try:
         h.run_recovery()
-        check("큐가 없으면 실측 안 함", "probe" in h.log(), False, h.log()[:120])
+        check("큐가 없으면 창 판정까지 안 간다", "깨우기 보류" in h.log(), False, h.log()[:120])
+        check("큐가 없으면 모름 표시도 안 남긴다", h.has("rate-limit-unknown-since"), False)
     finally:
         h.close()
 
-    h = fresh(10, queue=True, probe_rc=0)
+    h = fresh(95, queue=True)
     try:
         h.run_recovery()
-        check("신선하면 실측 안 함", "probe" in h.log(), False, h.log()[:120])
-    finally:
-        h.close()
-
-    h = fresh(95, queue=True, probe_rc=0)
-    try:
-        h.run_recovery()
-        check("신선한 차단이면 실측 안 함", "probe" in h.log(), False, h.log()[:120])
+        check("신선한 차단은 창 판정 앞에서 끝난다", "깨우기 보류" in h.log(), False,
+              h.log()[:120])
         check("차단 플래그를 세운다", h.has("rate-limit-blocked.flag"), True)
     finally:
         h.close()

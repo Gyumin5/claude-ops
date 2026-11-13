@@ -320,7 +320,6 @@ claude-sessions rotate <이름>    # 기록을 보관하고 새 세션으로 시
 claude-sessions health          # 멈췄거나 한도에 걸린 세션 감지
 
 cl                              # 지금 폴더의 세션을 터미널로 가져온다(유닛은 잠시 멈춘다)
-cl-all                          # 모든 세션을 탭으로 한 번에 연다
 
 ai-debate-detach "물음"          # 외부 모델 셋을 붙여 토론시킨다(세션 밖에서 돈다)
 claude-quota-observe            # 지금 한도 상태

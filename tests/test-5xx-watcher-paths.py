@@ -14,11 +14,8 @@ from contextlib import redirect_stderr
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-# 저장소 뿌리를 이 파일 위치에서 찾는다. 예전엔 홈 아래 고정 경로였는데,
-# 그러면 다른 자리에 받은 사람은 그대로 못 돌린다.
-REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-
-w = SourceFileLoader("w", os.path.join(REPO, "bin/claude-api-5xx-watcher")).load_module()
+ROOT = Path(__file__).resolve().parent.parent
+w = SourceFileLoader("w", str(ROOT / "bin" / "claude-api-5xx-watcher")).load_module()
 real_projects = w.PROJECTS_DIR
 fails = []
 skipped = []   # 안 돈 검사는 PASS 안에 숨기지 않는다

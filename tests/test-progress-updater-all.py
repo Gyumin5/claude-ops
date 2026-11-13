@@ -2,7 +2,7 @@
 """claude-progress-updater-all 대상 선정 테스트.
 
 왜 있나: 2026-08-11 까지 이 스크립트는 세션이름→디렉토리 매핑을 손으로 들고 있었고,
-목록에 없는 이름은 조용히 continue 했다. peer·session-a·session-* 4개·session_c
+목록에 없는 이름은 조용히 continue 했다. peer·alpha·raise-* 4개·gamma
 일곱 세션이 도입 이후 내내 갱신 대상이 아니었는데 로그조차 안 남아 아무도 몰랐다.
 progress.md 가 19~92시간 낡아 있었다(history #57).
 
@@ -38,13 +38,13 @@ def sh(path, body):
 UNITS = [
     ("claude-dotfiles.service", True, False, "dotfiles"),
     ("claude-peer.service", True, False, "peer"),
-    ("claude-session-a.service", True, False, "session-a"),
-    ("claude-session-b.service", True, False, "proj-b"),
-    ("claude-session_c.service", True, False, "session_c_work"),
+    ("claude-alpha.service", True, False, "alpha"),
+    ("claude-beta.service", True, False, "raise"),
+    ("claude-gamma.service", True, False, "gamma_work"),
     ("claude-watchdog.service", False, False, "etc"),          # 세션 아님
     ("claude-control-bot.service", False, False, "etc"),       # 세션 아님
     ("claude-job-sweep-1786.service", True, True, "jobdir"),   # 일회성 잡
-    ("claude-session-nudge@session-d.service", True, False, "x"),  # 템플릿 인스턴스
+    ("claude-session-nudge@delta.service", True, False, "x"),  # 템플릿 인스턴스
     ("claude-noprog.service", True, False, "noprog"),          # progress.md 없음
 ]
 
@@ -108,7 +108,7 @@ def main():
 
         print("대상 선정")
         check("rc=0", r.returncode == 0, r.stderr[-200:])
-        for sub in ("dotfiles", "peer", "session-a", "proj-b", "session_c_work"):
+        for sub in ("dotfiles", "peer", "alpha", "raise", "gamma_work"):
             check("%s 세션이 대상이다" % sub, sub in hit, hit)
 
         print("제외")
@@ -122,7 +122,7 @@ def main():
         print("손목록 부재")
         src = open(os.path.realpath(SCRIPT)).read()
         check("세션이름→경로 하드코딩이 없다",
-              "project_cwd" not in src and "/home/user/session-e" not in src)
+              "project_cwd" not in src and "/home/" not in src, src[:200])
         check("대상을 WorkingDirectory 에서 읽는다", "WorkingDirectory=" in src)
 
         print("빈 목록")

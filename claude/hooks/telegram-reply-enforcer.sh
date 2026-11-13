@@ -76,11 +76,12 @@ if last_user_idx < 0:
 current_turn = [d for d in parsed[last_user_idx:] if d]
 
 def is_nudge(txt):
-    """자동 넛지는 전역 규칙(텔레그램 IRON LAW 의 유일한 예외)상 답장 대상이 아니다.
-    구별 표식은 claude-userbot-send 가 본문 첫 줄에 붙이는 발신자 태그다 —
-    `[[xsrc:from=<호스트>/session-nudge@<세션>]]`. 사람은 이 태그를 못 붙이므로
-    사람 메시지에는 강제가 그대로 걸린다. 문구("이건 자동 넛지다")로는 판정하지 않는다 —
-    운영자가 그 문구를 인용하면 진짜 메시지가 조용히 강제에서 빠진다."""
+    """자동 넛지는 답장 대상이 아니다(2026-10-16 운영자 지시 —
+    10분마다 항상 보내되 답장은 안 해도 된다). 구별 표식은 claude-userbot-send 가
+    본문 첫 줄에 붙이는 발신자 태그다 — `[[xsrc:from=<호스트>/session-nudge@<세션>]]`.
+    사람은 이 태그를 못 붙이므로 사람 메시지에는 강제가 그대로 걸린다. 문구("이건 자동
+    넛지다")로는 판정하지 않는다 — 운영자가 그 문구를 인용하면 진짜 메시지가 조용히
+    강제에서 빠진다."""
     return "[[xsrc:from=" in txt and "session-nudge@" in txt
 
 
@@ -114,9 +115,10 @@ for d in current_turn:
             for it in c:
                 if isinstance(it, dict) and it.get("type") == "tool_use":
                     name = it.get("name", "")
-                    if name in ("mcp__plugin_telegram_telegram__reply",
-                                "mcp__plugin_telegram_telegram__edit_message",
-                                "mcp__plugin_telegram_telegram__react"):
+                    # 답장으로 치는 것은 reply 하나다. edit_message 는 이미 보낸
+                    # 메시지를 고치는 것이고 react 는 이모지라, 둘 다 운영자 기기에
+                    # 알림을 안 울린다 — 화면에서는 세션이 침묵한 것과 같아 보인다.
+                    if name == "mcp__plugin_telegram_telegram__reply":
                         has_reply = True
 
 # 5xx (예: 529 Overloaded) 으로 끝난 턴은 BLOCK 금지 — retry dead loop 방지.

@@ -12,6 +12,7 @@
 #    - userbot이 보내는 깨우기 신호용. (userbot 미도입 상태에서는 사용자가 아무 메시지나 보내면 큐 flush됨.)
 
 set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../lib/operator_chat.sh"   # 방 번호 단일 출처
 
 THRESHOLD_5H=90
 THRESHOLD_7D=99
@@ -100,23 +101,20 @@ elif [ ! -f "$CACHE" ]; then
     exit 0
 else
     # 판정 규칙은 lib 한 벌(claude-quota-observe)에 있다. 여기서 캐시를 다시 파싱하던
-    # 사본은 cached_at 을 안 봐서 얼어붙은 수치로 계속 차단했다(2026-08-28 옆 기계 6시간).
+    # 사본은 cached_at 을 안 봐서 얼어붙은 수치로 계속 차단했다(2026-08-28 둘째 기계 6시간).
     OBSERVE="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/../../bin/claude-quota-observe"
     [ -x "$OBSERVE" ] || OBSERVE="$HOME/.local/bin/claude-quota-observe"
     eval "$("$OBSERVE" --sh 2>/dev/null)"
     [ "${QUOTA_BLOCKED:-}" = "true" ] && BLOCKED=true
 fi
 
-# 3. 차단 상태: 큐에 저장하고 prompt 차단
-if [ "$BLOCKED" = true ]; then
-    # trigger 메시지면 그냥 묵살 (큐 처리는 차단 풀린 다음 분기에서)
-    if [ "$IS_TRIGGER" = true ]; then
-        echo "rate-limit-guard: trigger 무시 (아직 차단 중)" >&2
-        exit 2
-    fi
+# 큐 적재와 알림은 두 자리에서 쓴다 — 한도 차단(3번)과 재로그인 직후(3.5번).
+# 한 벌로 둬야 한쪽만 고쳐져 적재 형식이나 알림이 갈리는 일이 안 생긴다.
 
-    # 큐에 append (jsonl: id, ts, ts_unix, project, cause, state, retry_count, prompt)
-    # flush(consume)와 동시 실행 시 레이스 방지 위해 같은 lock 사용.
+# enqueue_prompt <cause>
+# 큐에 append (jsonl: id, ts, ts_unix, project, cause, state, retry_count, prompt)
+# flush(consume)와 동시 실행 시 레이스 방지 위해 같은 lock 사용.
+enqueue_prompt() {
     (
         flock -x 200
         python3 -c '
@@ -133,30 +131,71 @@ rec = {"id": qid, "ts": ts_iso, "ts_unix": ts_unix, "project": proj,
        "cause": cause, "state": "pending", "retry_count": 0, "prompt": prompt}
 with open(sys.argv[4], "a") as f:
     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-' "$USER_PROMPT" "$PROJ" "5h_or_7d" "$QUEUE_FILE" 2>/dev/null
+' "$USER_PROMPT" "$PROJ" "$1" "$QUEUE_FILE" 2>/dev/null
     ) 200>"$LOCK_FILE"
-
-    # 큐 길이 계산
     QUEUE_LEN=$(wc -l < "$QUEUE_FILE" 2>/dev/null || echo 0)
+}
 
-    # 텔레그램 알림 — 큐잉될 때마다 매번 (cooldown 제거). 사용자가 어떤 메시지가 어디로 큐잉됐는지 추적 가능하도록 prompt 미리보기 포함.
+# notify_queued <앞머리 한 줄>
+# 큐잉될 때마다 매번 알린다(cooldown 없음). 어떤 메시지가 어디로 갔는지 사람이
+# 추적할 수 있게 prompt 미리보기를 붙인다. 프로젝트별 봇으로 직접 보낸다.
+notify_queued() {
     ALERT_FLAG="${ALERT_FLAG_PREFIX}-${PROJ}.flag"
-    # 프로젝트별 봇으로 직접 알림.
-    if [ -f "$TELEGRAM_ENV" ]; then
-        . "$TELEGRAM_ENV"
-        if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-            preview=$(printf '%s' "$USER_PROMPT" | head -c 200)
-            msg="[${PROJ}] rate-limit 차단 중 — 메시지 큐잉됨 (큐 ${QUEUE_LEN}개). 풀리면 자동 처리.
+    [ -f "$TELEGRAM_ENV" ] || return 0
+    . "$TELEGRAM_ENV"
+    [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || return 0
+    preview=$(printf '%s' "$USER_PROMPT" | head -c 200)
+    msg="[${PROJ}] $1 (큐 ${QUEUE_LEN}개). 풀리면 자동 처리.
 
 > ${preview}"
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
-                --data-urlencode "text=${msg}" >/dev/null 2>&1
-            touch "$ALERT_FLAG"
-        fi
+    local cid
+    cid="$(operator_chat_id)" || return 0
+    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=$cid" \
+        --data-urlencode "text=${msg}" >/dev/null 2>&1
+    touch "$ALERT_FLAG"
+}
+
+# 3. 차단 상태: 큐에 저장하고 prompt 차단
+if [ "$BLOCKED" = true ]; then
+    # trigger 메시지면 그냥 묵살 (큐 처리는 차단 풀린 다음 분기에서)
+    if [ "$IS_TRIGGER" = true ]; then
+        echo "rate-limit-guard: trigger 무시 (아직 차단 중)" >&2
+        exit 2
     fi
 
+    enqueue_prompt "5h_or_7d"
+    notify_queued "rate-limit 차단 중 — 메시지 큐잉됨"
+
     echo "rate-limit-guard: 차단 중. 메시지 큐잉됨 (queue=${QUEUE_LEN}). 풀리면 처리됨." >&2
+    exit 2
+fi
+
+# 3.5. 재로그인 직후에는 큐를 안 푼다.
+# 막는 쪽과 푸는 쪽의 기준이 다르다. 모르면 열어두는 것은 막는 쪽만이다 — 실제로 막혀
+# 있으면 그 턴이 429 로 실패하고 끝이라 비용이 유계다. 푸는 쪽은 그렇지 않다. 한도가
+# 그대로인데 큐를 비우면 밀려 있던 메시지가 답을 못 받은 채 소비되고 대화 순서가 꼬인다.
+# 재로그인은 자격증명이 다시 적용됐다는 증거지 한도가 회복됐다는 증거가 아니므로
+# 그것만으로는 안 푼다. 사람이 켠 bypass 는 여기 해당 없다 — 그때는 관측을 아예 안
+# 부른다(위 2번).
+#
+# 안 푼다고 새 입력을 그냥 통과시키면 안 된다. 그러면 밀려 있던 큐보다 방금 온 말이
+# 먼저 답을 받아 대화 순서가 뒤집힌다 — 큐를 지킨다면서 순서를 깨는 것이라 안 푸는
+# 이유 자체를 무너뜨린다. 그래서 큐가 있을 때는 새 입력도 큐 뒤에 넣고 평소 차단
+# 경로로 돌려보낸다. 깨우기 신호는 큐 뒤에 넣을 것도 아니고 사람이 쓴 말도 아니라
+# 조용히 버린다 — 통과시키면 그 신호 글자가 운영자 화면에 그대로 뜬다.
+#
+# 막히지 않는다: 복구 장치가 로그인을 보면 캐시에서 수치를 들어내므로 그때부터
+# relogin 이 아니고(수치가 없으면 안 붙는다) 큐가 정상 경로로 풀린다. 복구 장치가
+# 죽어 있어도 cached_at 이 15분을 넘기면 stale 이 되어 같은 자리에서 풀린다.
+if [ "${QUOTA_STATUS:-}" = "relogin" ] && [ -s "$QUEUE_FILE" ]; then
+    if [ "$IS_TRIGGER" = true ]; then
+        echo "rate-limit-prompt-guard: 재로그인 직후 — 깨우기 신호 무시(새 수치 전)" >&2
+        exit 2
+    fi
+    enqueue_prompt "relogin_hold"
+    notify_queued "재로그인 직후 — 큐 순서 지키려고 뒤에 넣었다"
+    echo "rate-limit-prompt-guard: 재로그인 직후 — 큐 유지, 새 입력도 큐 뒤로 (queue=${QUEUE_LEN})" >&2
     exit 2
 fi
 
@@ -268,7 +307,7 @@ ${STALE_CONTENT}"
     # trigger 메시지면 noise 없이 큐만 처리 — 사용자에게 trigger 자체는 안 보이게
     if [ "$IS_TRIGGER" = true ]; then
         cat <<EOF
-[rate-limit 해제 — fresh ${QUEUE_LEN}개 flush, stale ${STALE_LEN}개, 잔여 ${REMAINDER_LEN}개]
+[큐 비우기 — fresh ${QUEUE_LEN}개, stale ${STALE_LEN}개, 잔여 ${REMAINDER_LEN}개. 한도가 풀렸다는 뜻은 아니다 — 도구가 막히면 아직 차단 중이다]
 
 다음 메시지들이 차단 중에 큐잉됐었음.
 [처리 규칙 — 반드시 지켜라]
@@ -284,7 +323,7 @@ ${QUEUE_CONTENT}${STALE_BLOCK}${REMAINDER_BLOCK}
 EOF
     else
         cat <<EOF
-[rate-limit 해제 — fresh ${QUEUE_LEN}개 flush, stale ${STALE_LEN}개, 잔여 ${REMAINDER_LEN}개]
+[큐 비우기 — fresh ${QUEUE_LEN}개, stale ${STALE_LEN}개, 잔여 ${REMAINDER_LEN}개. 한도가 풀렸다는 뜻은 아니다 — 도구가 막히면 아직 차단 중이다]
 
 다음 메시지들이 차단 중에 큐잉됐었음.
 [처리 규칙 — 반드시 지켜라]

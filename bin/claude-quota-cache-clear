@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""공유 한도 캐시의 수치 칸을 비운다. 사용량 초기화권을 쓴 뒤 쓰는 복구 명령이다.
+
+왜 손으로 비워야 하나. 한도 수치는 한 호스트의 전 세션이 파일 하나
+(~/.claude/statusline_cache.json)를 같이 쓰고, 합치기에는 래칫이 걸려 있다 — 같은 창
+안에서는 낮은 값이 높은 값을 못 덮는다. 오래 쉰 세션이 깨어나면 몇십 분 전 값을 방금
+잰 값처럼 쓰기 때문이고, 그걸 그냥 받으면 한도 가드가 안 막는다.
+
+사용량 초기화권은 그 전제를 깬다. 주간 창 끝 시각을 그대로 두고 수치만 내리므로
+래칫이 내려온 값을 매번 버린다. 2026-10-22 에 실제 7일 9퍼센트가 99퍼센트로 눌러앉았고,
+주간 차단 임계가 정확히 99라서 두 호스트 전 세션이 한도에 걸린 것으로 읽혔다.
+
+자동으로 가려내지 않는 이유는 가려낼 신호가 없어서다. 다섯시간 창이 새로 열리는 것을
+신호로 삼아 봤지만 둘 다 실측으로 깨졌다 — 그 창의 끝 시각이 후퇴하고(기록 27,984건 중
+750건), 다섯시간 칸이 빠진 쓰기가 있어서(170건) 캐시의 두 칸이 서로 다른 시점에서 온다.
+그래서 사람이 초기화를 알려 줄 때만 이 명령으로 기준을 버린다.
+
+쓰는 법:  claude-quota-cache-clear [캐시경로]
+비운 뒤 다음 상태줄 렌더가 실제 수치를 새로 넣는다. 같은 계정을 쓰는 호스트마다 돌린다.
+오래 쉰 세션이 초기화 이전 값을 다시 심을 수 있다 — 값이 되돌아오면 다시 돌린다.
+"""
+import datetime
+import json
+import os
+import sys
+
+DEFAULT = os.path.expanduser("~/.claude/statusline_cache.json")
+
+
+def _fmt(ts):
+    if not isinstance(ts, (int, float)):
+        return "끝 시각 없음"
+    return datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M KST")
+
+
+def describe(rate_limits):
+    if not isinstance(rate_limits, dict) or not rate_limits:
+        return ["한도 칸 없음"]
+    out = []
+    for key, label in (("five_hour", "다섯시간"), ("seven_day", "주간")):
+        win = rate_limits.get(key)
+        if not isinstance(win, dict):
+            continue
+        out.append("{} {}퍼센트 ({}까지)".format(
+            label, win.get("used_percentage"), _fmt(win.get("resets_at"))))
+    return out or ["한도 칸 없음"]
+
+
+def main(argv):
+    path = argv[1] if len(argv) > 1 else DEFAULT
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        print("캐시 파일이 없다: {} — 비울 것이 없다".format(path))
+        return 0
+    except Exception as exc:  # 깨진 파일을 조용히 덮어쓰지 않는다
+        print("캐시를 읽지 못했다: {}: {}".format(type(exc).__name__, exc))
+        return 1
+    if not isinstance(data, dict):
+        print("캐시 형식이 사전이 아니다 — 손대지 않는다")
+        return 1
+
+    before = data.get("rate_limits")
+    print("계정 표시: {}".format(data.get("_account") or "없음"))
+    for line in describe(before):
+        print("비우기 전: {}".format(line))
+    if not isinstance(before, dict) or not before:
+        print("이미 비어 있다")
+        return 0
+
+    data.pop("rate_limits", None)
+    tmp = "{}.tmp-{}".format(path, os.getpid())
+    with open(tmp, "w") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, path)
+    print("비웠다. 다음 상태줄 렌더가 실제 수치를 새로 넣는다.")
+    print("같은 계정을 쓰는 다른 호스트에서도 돌린다. 값이 되돌아오면 다시 돌린다.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

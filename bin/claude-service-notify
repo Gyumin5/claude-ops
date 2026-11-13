@@ -5,10 +5,12 @@
 exit 0
 
 set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/operator_chat.sh"   # 방 번호 단일 출처
 
 EVENT="${1:-start}"
 SVC="${2:-claude}"
-CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID:-}}"
+CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+[ -n "$CHAT_ID" ] || CHAT_ID="$(operator_chat_id)" || exit 1
 
 STATE_DIR="${TELEGRAM_STATE_DIR:-}"
 [ -z "$STATE_DIR" ] && exit 0

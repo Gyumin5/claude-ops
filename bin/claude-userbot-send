@@ -32,12 +32,52 @@ TARGETS_PATH = os.path.join(USERBOT_DIR, "targets.json")
 LOCK_PATH = os.path.join(USERBOT_DIR, "userbot.lock")
 RELAY_CONF = os.path.join(USERBOT_DIR, "relay.conf")
 RELAY_ALIAS_PATH = os.path.join(USERBOT_DIR, "relay-alias.json")
+AMBIGUOUS_PATH = os.path.join(USERBOT_DIR, "ambiguous.json")
+# 독립 유닛으로 인계되면 워커 출력이 journal 로 간다. 대체 경로(Popen)에는 journal 이
+# 없으므로 그때만 이 파일로 받는다 — 오류를 버리지 않는다.
+DELETE_LOG_PATH = os.path.expanduser("~/.claude/logs/userbot-delayed-delete.log")
+
+
+def reject_if_ambiguous(target):
+    """두 기계에 같은 이름의 세션이 있는 경우 그 짧은 이름을 거절한다(rc=1).
+
+    사고(2026-10-18): 둘째 기계의 세 세션이 첫째 기계 세션의 질문에 답하면서 출처 마커의
+    기계 이름을 떼고 짧은 이름으로 보냈고, 전부 둘째 기계 자신의 같은 이름 세션으로
+    갔다. 짧은 이름은 각 호스트에서 '이 기계의 그 세션' 으로 조용히 풀리므로 보내는
+    쪽도 받는 쪽도 오배송을 모른다 — 사람이 눈으로 알아채 넘겨줘서 복구됐다.
+    목적지가 하나로 안 정해지는 이름은 조용히 고르지 말고 거절한다.
+
+    목록은 호스트마다 다르므로(어느 이름이 겹치는지는 그 호스트의 등록 상태다)
+    저장소가 아니라 ~/.claude/userbot/ambiguous.json 에 둔다. 파일이 없으면 거절도
+    없다 — 새 코드가 먼저 배포돼도 등록 전까지는 동작이 그대로다.
+
+    쓸 수 있는 완전 주소는 대상 표에서 뽑아 보여 준다. 기계 이름을 문구에 박아
+    두면 그 이름이 없는 기계에서는 쓸 수 없는 주소를 안내하게 되고, 안내대로 보낸
+    쪽이 다시 거절당한다."""
+    try:
+        names = json.load(open(AMBIGUOUS_PATH))
+    except Exception:
+        return
+    if not isinstance(names, list) or target not in names:
+        return
+    try:
+        full = sorted(k for k in json.load(open(TARGETS_PATH))
+                      if k.endswith("/" + target))
+    except Exception:
+        full = []
+    options = ("대상 표에 있는 것: " + ", ".join(full)) if full else (
+        "대상 표에서 '<기계>/" + target + "' 모양의 키를 찾아 쓴다")
+    sys.exit(f"[send] 거절: '{target}' 은 두 기계에 같은 이름의 세션이 있어 목적지가 "
+             f"하나로 안 정해진다. <기계>/<세션> 완전 주소로 보낼 것.\n"
+             f"       {options}\n"
+             f"       받은 메시지의 출처 마커 [[xsrc:from=<기계>/<세션>]] 를 그대로 쓰면 된다.\n"
+             f"       겹치는 이름 목록: {AMBIGUOUS_PATH}")
 
 
 def compute_origin():
     """출처 마커 = <machine>/<session>. 받는 쪽·운영자가 '어느 PC 의 어느 세션'인지 식별.
 
-    machine = ~/.config/claude-machine-id (home/peer). session = CLAUDE_SESSION_NAME,
+    machine = ~/.config/claude-machine-id (기계 이름, 예: home). session = CLAUDE_SESSION_NAME,
     없으면 /proc/self/cgroup 의 claude-<name>.service 로 추적, 그래도 없으면 '?'.
     완료-핑 정규식(completion-notify)이 ':' 를 구분자로 쓰므로 origin 에 ':' 금지 → '/' 사용.
     --origin 으로 호출자가 명시 지정 가능(ssh 릴레이처럼 env/cgroup 추적 불가한 경로용)."""
@@ -92,11 +132,11 @@ def _relay_host():
 
 
 def maybe_relay(args, message):
-    """로컬에 userbot 이 없는 머신(peer 등)에서 USERBOT_HOST 로 ssh 릴레이.
+    """로컬에 userbot 이 없는 머신(둘째 기계 등)에서 USERBOT_HOST 로 ssh 릴레이.
 
-    배경: peer 은 로컬 telethon userbot 이 없어 targets.json 자체가 없다. 그래서
+    배경: 둘째 기계는 로컬 telethon userbot 이 없어 targets.json 자체가 없다. 그래서
     claude-userbot-send 를 그냥 부르면 "targets.json 없음" 으로 죽었고, 세션이 이
-    사실과 우회로(ssh 로 home 것을 부르기)를 스스로 알아야만 크로스세션 전송이
+    사실과 우회로(ssh 로 userbot 이 있는 기계의 것을 부르기)를 스스로 알아야만 크로스세션 전송이
     됐다 — 실제로 몰라서 못 보내는 사고가 반복됐다(2026-07-22 사용자 보고).
     우회로는 CLAUDE.md 에 적혀는 있었으나 장시간작업 detach 설명 안에 파묻혀 있어
     발견되지 않았다. 문서가 아니라 도구가 알아서 하도록 여기로 내린다
@@ -142,6 +182,8 @@ def maybe_relay(args, message):
     remote = ["--session", alias, "--no-relay"]
     if args.delete_after:
         remote += ["--delete-after", str(args.delete_after)]
+    if args.silent:
+        remote += ["--silent"]
     if args.notify_done:
         remote += ["--notify-done"]
     if args.no_origin:
@@ -192,11 +234,118 @@ def coerce_entity(target):
     return target if target.startswith("@") else "@" + target
 
 
+def _user_bus_env():
+    """systemd-run --user 가 쓸 환경. 호출 환경이 자동으로 맞을 거라고 보지 않는다.
+
+    비대화형 ssh 로 들어온 호출에는 XDG_RUNTIME_DIR·DBUS_SESSION_BUS_ADDRESS 가 없을 수
+    있다. 없을 때만 /run/user/<uid> 를 보되, 실제 uid 소유인지 확인한 뒤에 쓴다 — 확인
+    없이 끼워 넣으면 남의 버스를 가리킬 수 있다. 환경 전체나 자격증명은 기록하지 않는다."""
+    env = dict(os.environ)
+    uid = os.getuid()
+    xdg = env.get("XDG_RUNTIME_DIR", "")
+    if not xdg or not os.path.isdir(xdg):
+        cand = f"/run/user/{uid}"
+        try:
+            if os.path.isdir(cand) and os.stat(cand).st_uid == uid:
+                env["XDG_RUNTIME_DIR"] = cand
+                xdg = cand
+        except OSError:
+            pass
+    if xdg and not env.get("DBUS_SESSION_BUS_ADDRESS"):
+        sock = os.path.join(xdg, "bus")
+        if os.path.exists(sock):
+            env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + sock
+    return env
+
+
+def _unit_exists(unit, env, timeout=3.0, _query=None):
+    """그 사용자 유닛이 systemd 에 올라갔나. 인계 여부가 불명일 때만 쓴다."""
+    run = _query or subprocess.run
+    try:
+        p = run(["systemctl", "--user", "show", "-p", "LoadState", "--value", unit],
+                capture_output=True, text=True, timeout=timeout, env=env)
+    except Exception:
+        return False
+    return p.returncode == 0 and p.stdout.strip() not in ("", "not-found")
+
+
+def spawn_supervised(argv, unit_hint="claude-userbot-del", timeout=5.0,
+                     stderr_log=None, _runner=None, _popen=None, _query=None):
+    """argv 를 호출자 cgroup 밖 독립 사용자 유닛으로 인계한다.
+
+    돌려주는 값은 (방식, 보장) 짝이다. 방식은 "systemd-run"·"popen"·"실패" 중 하나이고,
+    보장은 호출자가 끝나도 그 자식이 살아남는다고 볼 수 있는지다.
+
+    왜 떼어낸 자식만으로는 모자란가: start_new_session 은 프로세스 세션만 떼어낼 뿐
+    cgroup 은 그대로다. Type=oneshot 유닛(claude-rate-limit-recovery 등)이 끝나면 systemd
+    가 기본값 KillMode=control-group 으로 그 cgroup 에 남은 프로세스를 전부 죽인다.
+    2026-11-01 통제 실험: 유닛 안 setsid 자식은 2초를 못 살고 죽고, 평범한 셸과
+    systemd-run 자식은 산다. 그래서 큐 깨우기 메시지가 7월 9일 이후 한 건도 안 지워졌다.
+
+    systemd-run 이 없거나 실패하면 옛 Popen 으로 떨어지되 보장을 False 로 돌린다 —
+    조용한 대체를 정상 복구로 치지 않는다(ai-debate run-20261101T091530Z).
+    """
+    import time as _time
+    env = _user_bus_env()
+    unit = f"{unit_hint}-{os.getpid()}-{int(_time.time() * 1000)}"
+    run = _runner or subprocess.run
+    cmd = ["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}",
+           f"--setenv=HOME={os.path.expanduser('~')}", "--"] + list(argv)
+    # --wait·--pipe·--scope 는 쓰지 않는다. 셋 다 호출자가 자식을 기다리거나 자식을
+    # 호출자 cgroup 안에 두어서, 지금 고치는 바로 그 결함이 되돌아온다.
+    try:
+        p = run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=timeout, env=env)
+        if p.returncode == 0:
+            return ("systemd-run", True)
+        detail = (p.stderr or "").strip()[:200]
+    except FileNotFoundError:
+        detail = "systemd-run 없음"
+    except subprocess.TimeoutExpired:
+        # 시간 초과는 실패가 아니라 인계 여부 불명이다. 유닛이 올라갔으면 대체 실행하지
+        # 않는다 — 두 번 띄우면 같은 메시지를 두 번 지우러 간다.
+        if _unit_exists(unit, env, _query=_query):
+            return ("systemd-run", True)
+        detail = "systemd-run 응답 없음(인계 불명)"
+    except Exception as e:  # noqa: BLE001 — 어떤 실패든 발송 자체를 되돌리면 안 된다
+        detail = str(e)[:200]
+    print(f"[send] 독립 유닛 인계 실패({detail}) — 떼어낸 자식으로 대체한다. "
+          f"호출자가 먼저 끝나면 이 자식은 안 산다.", file=sys.stderr)
+    popen = _popen or subprocess.Popen
+    err = subprocess.DEVNULL
+    opened = None
+    if stderr_log:
+        try:
+            opened = open(stderr_log, "a")
+            err = opened
+        except OSError:
+            err = subprocess.DEVNULL
+    try:
+        popen(list(argv), start_new_session=True, close_fds=True,
+              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err)
+        return ("popen", False)
+    except Exception as e:  # noqa: BLE001
+        print(f"[send] 지연삭제 예약 실패 (무해): {e}", file=sys.stderr)
+        return ("실패", False)
+    finally:
+        if opened is not None:
+            opened.close()
+
+
+def schedule_delayed_delete(delay, target, message_id, **kw):
+    """발송이 끝난 뒤 지연삭제를 예약한다. flock 과 TelegramClient 를 모두 놓은 뒤에 부른다.
+
+    예약이 실패해도 발송은 이미 성공한 것이다 — 호출자는 이 결과로 재발송하지 않는다."""
+    argv = [sys.executable, os.path.abspath(__file__), "--_delayed-delete",
+            str(delay), str(target), str(message_id)]
+    return spawn_supervised(argv, stderr_log=DELETE_LOG_PATH, **kw)
+
+
 def _delayed_delete_worker(delay, target_s, message_id):
-    """--_delayed-delete 내부 워커. detached 자식 프로세스로 실행돼 sleep 하는 동안
+    """--_delayed-delete 내부 워커. 호출자와 분리된 자리에서 돌며 sleep 하는 동안
     machine-wide lock 을 잡지 않는다 — 잡으면 그 sleep 시간만큼 다른 모든 발송이
-    막힌다(peer 실측 발견: delete-after 600 도입 후 rate-limit-recovery tick 이
-    10분씩 직렬화되던 회귀, 2026-07-09)."""
+    막힌다(둘째 기계 실측 발견: delete-after 600 도입 후 rate-limit-recovery tick 이
+    10분씩 직렬화되던 회귀, 2026-07-09). 순서는 수면 → 잠금 → 삭제 그대로다."""
     import time as _time
     _time.sleep(delay)
     lock_fd = open(LOCK_PATH, "w")
@@ -209,6 +358,8 @@ def _delayed_delete_worker(delay, target_s, message_id):
         entity = coerce_entity(target_s)
         with TelegramClient(SESSION_PATH, api_id, api_hash) as client:
             try:
+                # 같은 아이디를 두 번 지우러 와도 안전하다 — 텔레그램은 모르는 아이디를
+                # 조용히 무시한다. 인계가 불명일 때 대체 실행이 겹칠 수 있어 그렇게 둔다.
                 client.delete_messages(entity, [message_id], revoke=True)
             except Exception as e:
                 print(f"[send] 지연삭제 실패 (무해): {e}", file=sys.stderr)
@@ -227,6 +378,9 @@ def main():
     ap.add_argument("--session", action="store_true", help="target 을 targets.json 세션이름으로 해석")
     ap.add_argument("--delete-after", type=float, default=0, metavar="SEC",
                     help="발송 N초 뒤 메시지 삭제 (대상 세션 getUpdates 가 받은 뒤 채팅 정리용). trigger 노이즈 제거.")
+    ap.add_argument("--silent", action="store_true",
+                    help="알림음 없이 발송(telethon silent). 메시지는 그대로 가고 푸시 알림만 안 울린다. "
+                         "주기 주입처럼 운영자가 매번 알 필요가 없는 발송에만 쓴다 — 기본은 소리 나게.")
     ap.add_argument("--notify-done", action="store_true",
                     help="크로스세션 작업 완료 핑 요청. 마커에 :notify 추가. "
                          "받은 세션 Stop 훅(completion-notify)이 완료 시 자기 봇으로 운영자 챗에 1회 알림.")
@@ -239,6 +393,10 @@ def main():
     args = ap.parse_args()
 
     text = " ".join(args.message)
+    # 겹치는 짧은 이름 거절은 직접 발송·릴레이 두 경로 앞에서 한 번에 한다. 릴레이 뒤로
+    # 미루면 릴레이 경로가 그 이름을 원격 targets.json 으로 넘겨 거기서 조용히 풀린다.
+    if args.session:
+        reject_if_ambiguous(args.target)
     # 로컬 userbot 이 없는 머신은 여기서 ssh 릴레이하고 종료. 마커 prepend 전에 해야
     # 원격에서 --origin 으로 받은 진짜 출처로 마커를 붙인다(이중 prepend 방지).
     if maybe_relay(args, text):
@@ -270,9 +428,10 @@ def main():
     from telethon.sync import TelegramClient
 
     # userbot.session 은 sqlite 파일이라 동시에 여러 프로세스(로컬 직접호출 +
-    # peer 등의 ssh relay 호출)가 열면 파일락 충돌로 발송 실패함
-    # (2026-07-06 전세션 소프트재시작 배치 중 peer 2건 발송실패로 재현·확인).
+    # 둘째 기계 등의 ssh relay 호출)가 열면 파일락 충돌로 발송 실패함
+    # (2026-07-06 전세션 소프트재시작 배치 중 둘째 기계 2건 발송실패로 재현·확인).
     # 같은 홈 머신에서 실행되는 모든 호출(직접+relay)이 이 lockfile 하나로 직렬화됨.
+    sent_id = None
     lock_fd = open(LOCK_PATH, "w")
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)  # blocking — 앞선 발송 끝날 때까지 대기
@@ -285,32 +444,35 @@ def main():
                 # 기본값 () 를 "안 넘김" sentinel 로 보고 클라이언트 기본 파스모드
                 # (markdown) 로 떨어지고, 그 파서가 백틱을 MessageEntityCode 로 바꾸면서
                 # 본문에서 지운다 — 감싼 내용은 남아서 받는 쪽엔 멀쩡한 문장으로 보인다.
-                # 조용한 변조라 지문 없이는 못 잡는다(2026-08-15 옆 기계 SPEC 사본 2자리).
+                # 조용한 변조라 지문 없이는 못 잡는다(2026-08-15 둘째 기계 SPEC 사본 2자리).
                 # None 은 () 와 다른 값이다: sanitize_parse_mode 를 타고 falsy 가 되어
                 # 파싱 자체를 건너뛴다.
-                sent = client.send_message(entity, text, parse_mode=None)
+                # silent=True 는 메시지를 그대로 보내되 받는 쪽 푸시 알림만 안 울린다.
+                # 지워지는 주기 주입(넛지)에 필요한 것이 이것이다 — 메시지는 60초 뒤
+                # 사라져도 한 번 울린 알림은 안 사라져서, 운영자 화면에는 10분마다
+                # 알림이 하나씩 쌓인다(2026-10-24 운영자 지시).
+                sent = client.send_message(entity, text, parse_mode=None,
+                                           silent=args.silent)
             except Exception as e:
                 print(f"[send] 발송 실패 ({entity}): {e}", file=sys.stderr)
                 sys.exit(3)
-            deleted = False
-            if args.delete_after and args.delete_after > 0:
-                # 대상 세션 getUpdates 가 메시지를 받은 뒤 삭제 → wake 는 유지, 채팅엔 안 남음.
-                # 여기서 그대로 sleep 하면 이 lock(위 flock, machine-wide) 을 delete_after
-                # 만큼 붙잡아 다른 모든 발송을 막는다 — detached 자식으로 분리해 즉시 리턴.
-                try:
-                    subprocess.Popen(
-                        [sys.executable, os.path.abspath(__file__), "--_delayed-delete",
-                         str(args.delete_after), str(target), str(sent.id)],
-                        start_new_session=True,
-                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    )
-                    deleted = True  # 예약됨(비동기) — 즉시 확인된 삭제 아님
-                except Exception as e:
-                    print(f"[send] 지연삭제 예약 실패 (무해): {e}", file=sys.stderr)
+            sent_id = sent.id
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
-    suffix = f", delete scheduled in {args.delete_after}s" if deleted else ""
+
+    # 예약은 여기서 한다 — TelegramClient 를 닫고 flock 을 놓은 뒤다. 잠금 안에서 띄우면
+    # 그 기술자가 자식에 상속되고, 자식이 수면하는 동안 다른 발송이 못 들어온다.
+    # 대상 세션 getUpdates 가 메시지를 받은 뒤 삭제 → 깨우기는 유지, 채팅엔 안 남는다.
+    suffix = ""
+    if args.delete_after and args.delete_after > 0:
+        how, guaranteed = schedule_delayed_delete(args.delete_after, target, sent_id)
+        if how == "실패":
+            suffix = ", 삭제 예약 실패(발송은 성공)"
+        elif guaranteed:
+            suffix = f", delete scheduled in {args.delete_after}s"
+        else:
+            suffix = f", delete scheduled in {args.delete_after}s (삭제 보장 안 됨)"
     print(f"[send] OK → {entity} ({len(text)} chars{suffix})")
 
 

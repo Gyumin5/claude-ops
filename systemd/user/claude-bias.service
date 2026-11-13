@@ -1,0 +1,25 @@
+[Unit]
+Description=Claude Code session for bias (telegram remote-control)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/av-ros/test/bias/.claude/telegram/.env
+
+[Service]
+Type=simple
+WorkingDirectory=%h/av-ros/test/bias
+Environment="CLAUDE_SESSION_NAME=bias"
+Environment="PATH=%h/.bun/bin:%h/.nvm/versions/node/v22.17.0/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="TELEGRAM_STATE_DIR=%h/av-ros/test/bias/.claude/telegram"
+Environment="TERM=xterm-256color"
+ExecStart=%h/.local/bin/claude-service-exec
+ExecStartPost=%h/.local/bin/claude-service-notify start claude-bias
+ExecStopPost=%h/.local/bin/claude-service-notify stop claude-bias
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/.claude/logs/claude-bias.log
+StandardError=append:%h/.claude/logs/claude-bias.log
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

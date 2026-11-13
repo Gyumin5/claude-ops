@@ -1,41 +1,102 @@
 #!/bin/bash
-# progress-md-path-guard.sh: PreToolUse 경고형 훅 — progress.md를 세션 WD 루트가
-# 아닌 다른 경로(예: 하위 서브레포)에 쓰려는 Write/Edit/MultiEdit을 감지해 경고만
-# 한다(차단 안 함). exit 0 항상 — 정당한 하위 progress.md 편집(사용자가 명시
-# 요청한 별개 파일 등)까지 막으면 오탐 비용이 크다는 게 토론 결론.
+# progress-md-path-guard.sh: PreToolUse 경고형 훅 — progress.md 를 세션 루트가 아닌
+# 곳에 쓰려는 Write/Edit/MultiEdit 을 감지해 경고만 한다(차단 안 함). 항상 exit 0.
 #
-# 배경: 2026-07-08 peer 로컬 dotfiles세션이 실측 발견 — peer R&D 세션이
-# progress.md를 WD 루트($HOME/peer)가 아니라 하위 서브레포
-# (sub-repo/)에 쓰고 있었음. SessionStart 컨텍스트 주입은
-# WD 루트만 읽으므로 재시작 시 20일 묵은 stale 파일을 물려받고 실제 인계
-# 실패가 발생함. CLAUDE.md에 이미 "WD 루트에만 쓴다" 규칙이 있었는데도
-# enforcement가 없어 위반됨 — ai-debate run-20260708T071716Z 결론(차단형은
-# 정당한 하위 progress.md와 세션상태 파일을 구분 못해 오탐 위험 크므로 보류,
-# 경고형+관측 먼저 → 2~4주 후 위반/오탐 로그로 차단 승격 여부 재검토).
+# 왜 있나: 2026-07-08 에 어떤 세션이 progress.md 를 세션 루트가 아니라 그 아래 하위
+# 저장소에 썼다. 세션 시작 때 주입되는 것은 루트 파일뿐이라(session-start-context.sh),
+# 재시작 때 20일 묵은 파일을 물려받고 인계가 실패했다.
+#
+# 세션 루트는 CLAUDE_PROJECT_DIR 로 판정한다. 현재 작업디렉토리(cwd)와 비교하지
+# 않는다 — 하네스가 작업 도중 작업디렉토리를 옮기기 때문이다. 2026-09-23~10-12 로그
+# 27건이 전부 그 때문에 난 오탐이었다(대상이 실제로는 루트인데 cwd 가 그 아래로
+# 내려가 있었다). 2026-10-12 실측: 훅 환경에는 CLAUDE_PROJECT_DIR 가 들어오고
+# (도구 셸 환경에는 안 들어온다) cwd 를 하위로 옮겨도 루트 값 그대로 유지된다.
+#
+# 변수가 없는 환경에서는 근사 판정으로 내려간다 — 대상이 cwd 자신이거나 그 상위면
+# 경고하지 않는다. 이건 정확한 루트 판정이 아니라서, 그 회차 기록에 root=미확인 으로
+# 남긴다. 변수가 없다고 cwd 를 루트로 대입하지 않는다.
+#
+# 차단형(deny)으로 올리지 않는다 — 2026-10-12 토론 run-20261012T121643Z 결론이고,
+# 정당한 하위 progress.md 까지 막는 오탐 비용이 크다는 도입 당시 판단 그대로다.
 set -uo pipefail
 
-read -r TOOL FILE_PATH CWD <<<"$(python3 -c "
-import json, sys
+# 파이썬 본문은 heredoc 으로 변수에 담아 -c 로 넘긴다. `python3 - <<'PYEOF'` 로 쓰면
+# 그 heredoc 이 stdin 을 차지해서 훅이 받은 JSON 을 읽을 수 없다 — 입력이 비면 조용히
+# 종료하므로 모든 회차가 무경고로 보인다(2026-10-12 테스트에서 잡았다).
+PYSRC=$(cat <<'PYEOF'
+import json, os, sys
+
 try:
     d = json.load(sys.stdin)
 except Exception:
-    print('', '', '')
     sys.exit(0)
-tool = d.get('tool_name', '') or ''
-ti = d.get('tool_input') or {}
-fp = ti.get('file_path', '') or ''
-cwd = d.get('cwd', '') or ''
-print(tool, fp, cwd)
-" 2>/dev/null)"
+if not isinstance(d, dict):
+    sys.exit(0)
 
-case "$TOOL" in Write|Edit|MultiEdit) ;; *) exit 0 ;; esac
-[ -n "$FILE_PATH" ] && [ "$(basename "$FILE_PATH")" = "progress.md" ] || exit 0
-[ -n "$CWD" ] || exit 0
+tool = d.get("tool_name") or ""
+if tool not in ("Write", "Edit", "MultiEdit"):
+    sys.exit(0)
+ti = d.get("tool_input") or {}
+fp = (ti.get("file_path") or "") if isinstance(ti, dict) else ""
+if not fp or os.path.basename(fp) != "progress.md":
+    sys.exit(0)
 
-FILE_DIR=$(dirname "$(realpath -m "$FILE_PATH" 2>/dev/null || echo "$FILE_PATH")")
-CWD_REAL=$(realpath -m "$CWD" 2>/dev/null || echo "$CWD")
+target = os.path.dirname(os.path.realpath(fp))
+root = (os.environ.get("PROJECT_ROOT") or "").strip()
+cwd = (d.get("cwd") or "").strip()
 
-if [ "$FILE_DIR" != "$CWD_REAL" ]; then
-    echo "[progress-md-path-guard] 경고: progress.md를 세션 루트(${CWD_REAL})가 아닌 ${FILE_DIR}에 쓰려 합니다. SessionStart 컨텍스트 주입은 세션 루트만 읽으므로, 재시작 시 이 내용이 무시되고 stale 파일을 물려받을 수 있습니다. 의도한 하위 파일이면 무시해도 되지만, 세션 진행상황 파일이면 루트로 옮기세요." >&2
-fi
+if root:
+    root = os.path.realpath(root)
+    warn = target != root
+    approx = False
+else:
+    # 근사 판정. 루트를 모르므로 "대상이 cwd 자신이거나 그 상위" 를 침묵 조건으로 쓴다.
+    if not cwd:
+        sys.exit(0)
+    cwd_real = os.path.realpath(cwd)
+    warn = not (target == cwd_real or cwd_real.startswith(target + os.sep))
+    approx = True
+
+if not warn:
+    sys.exit(0)
+
+if approx:
+    msg = ("[progress-md-path-guard] 경고: progress.md 를 %s 에 쓰려 합니다. 세션 루트를 "
+           "확인하지 못해(CLAUDE_PROJECT_DIR 없음) 현재 작업디렉토리 %s 기준으로 근사 "
+           "판정했습니다 — 정확한 루트 판정이 아닙니다. 세션 시작 때 주입되는 것은 세션 "
+           "루트의 progress.md 뿐이라, 다른 곳에 쓴 파일은 다음 세션이 못 읽습니다. "
+           "의도한 별개 파일이면 그대로 두고, 세션 진행상황 파일이면 R05 기준에 맞는지 "
+           "확인하세요." % (target, cwd_real))
+else:
+    msg = ("[progress-md-path-guard] 경고: progress.md 를 세션 루트 %s 가 아니라 %s 에 "
+           "쓰려 합니다. 세션 시작 때 주입되는 것은 세션 루트의 progress.md 뿐이라, 이 "
+           "파일은 다음 세션이 못 읽습니다. 의도한 별개 파일이면 그대로 두고, 세션 "
+           "진행상황 파일이면 R05 기준에 맞는지 확인하세요." % (root, target))
+print(msg, file=sys.stderr)
+
+# 경고는 그 세션 화면에만 뜨고 사라진다. 나중에 "위반이 몇 건이고 그중 오탐이 몇
+# 건인가" 를 물으면 답할 자료가 있어야 하므로 경고한 회차만 한 줄 남긴다.
+log = os.environ.get("GUARD_LOG") or ""
+try:
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    from datetime import datetime
+    line = "%s tool=%s cwd=%s target=%s root=%s\n" % (
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"), tool,
+        cwd or "-", target, "미확인" if approx else root)
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(line)
+    with open(log, encoding="utf-8") as f:
+        lines = f.readlines()
+    if len(lines) > 200:
+        with open(log, "w", encoding="utf-8") as f:
+            f.writelines(lines[-200:])
+except Exception:
+    pass
+sys.exit(0)
+PYEOF
+)
+
+GUARD_LOG="${PROGRESS_MD_PATH_GUARD_LOG:-$HOME/.claude/state/progress-md-path-guard.log}" \
+PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-}" \
+python3 -c "$PYSRC"
 exit 0

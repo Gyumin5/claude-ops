@@ -8,6 +8,7 @@
 # 재노출: 쿨다운 7일 + 성장률 기반 조건부 재노출
 
 set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/operator_chat.sh"   # 방 번호 단일 출처
 
 # === PATH 설정 (cron 환경 대응) ===
 export NVM_DIR="$HOME/.nvm"
@@ -18,8 +19,8 @@ set -u
 export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 
 # === 설정 ===
-TELEGRAM_ENV="$HOME/dotfiles/.claude/telegram/.env"
-CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+TELEGRAM_ENV="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")/.claude/telegram/.env"
+CHAT_ID="$(operator_chat_id)" || exit 1
 DATA_DIR="$HOME/.local/share/ai-briefing"
 TODAY=$(date +%Y-%m-%d)
 YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)

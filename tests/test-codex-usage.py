@@ -4,7 +4,7 @@
 고정하는 것: 오래 열려 있는 대화가 최근 구간 집계에서 빠지면 안 된다.
 codex 는 대화를 시작한 날짜 폴더에 기록을 계속 덧붙인다. 옛 판은 창 시작 하루
 전부터 오늘까지의 날짜 폴더만 훑어서, 13일째 살아 있는 대화 하나가 통째로
-빠졌다(2026-09-15 옆 기계 실측: 7일치 1억 2,513만 vs 실제 3억 6,522만).
+빠졌다(2026-09-15 둘째 기계 실측: 7일치 1억 2,513만 vs 실제 3억 6,522만).
 
   1. 후보는 날짜 폴더가 아니라 최종수정 시각으로 고른다 — 옛 폴더의 살아 있는 대화도 든다.
   2. 최종수정이 창 밖인 파일은 안 든다.
@@ -87,7 +87,7 @@ with tempfile.TemporaryDirectory() as tmp:
     # 13일 전에 시작해 지금도 살아 있는 대화 — 폴더는 옛 날짜, 기록은 최근
     old_start = now - timedelta(days=13)
     live = sess / f"{old_start:%Y/%m/%d}" / "rollout-live.jsonl"
-    rollout(live, "/home/user/session-b",
+    rollout(live, "/home/u/beta",
             [(now - timedelta(days=12), "tokens", 111),          # 창 밖 기록
              (now - timedelta(hours=3), "tokens", 900_000),      # 창 안
              (now - timedelta(hours=2), "limit", 91.5)],
@@ -95,7 +95,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # 오늘 폴더의 평범한 대화
     today = sess / f"{now:%Y/%m/%d}" / "rollout-today.jsonl"
-    rollout(today, "/home/user/dotfiles",
+    rollout(today, "/home/u/dotfiles",
             [(now - timedelta(hours=1), "tokens", 100_000),
              (now - timedelta(hours=1), "limit", 92.0)],
             mtime=(now - timedelta(hours=1)).timestamp())
@@ -103,7 +103,7 @@ with tempfile.TemporaryDirectory() as tmp:
     # 오래 전에 끝난 대화 — 창 밖
     dead_day = now - timedelta(days=30)
     dead = sess / f"{dead_day:%Y/%m/%d}" / "rollout-dead.jsonl"
-    rollout(dead, "/home/user/session-a",
+    rollout(dead, "/home/u/alpha",
             [(dead_day, "tokens", 777_000)], mtime=dead_day.timestamp())
 
     mod = load("codex_usage_mod", REPO / "bin" / "codex-usage", home)
@@ -122,22 +122,22 @@ with tempfile.TemporaryDirectory() as tmp:
 
     rows = mod.by_session(turns)
     check("작업 디렉토리로 세션을 가른다",
-          set(rows) == {"/home/user/session-b", "/home/user/dotfiles"}, str(set(rows)))
+          set(rows) == {"/home/u/beta", "/home/u/dotfiles"}, str(set(rows)))
     check("세션별 합계가 전체 합계와 같다",
           sum(v["합계"] for v in rows.values()) == 1_000_000,
           str({k: v["합계"] for k, v in rows.items()}))
     check("가장 많이 쓴 세션을 집어낼 수 있다",
-          max(rows.items(), key=lambda kv: kv[1]["합계"])[0] == "/home/user/session-b",
+          max(rows.items(), key=lambda kv: kv[1]["합계"])[0] == "/home/u/beta",
           str(rows))
 
-    # 작업 이름: 잎 폴더로 고르면 한 작업이 여러 줄로 흩어진다(옆 기계 관측).
+    # 작업 이름: 잎 폴더로 고르면 한 작업이 여러 줄로 흩어진다(둘째 기계 관측).
     os.environ["HOME"] = str(home)
     debate = f"{home}/claude-work/ai-debate/run-20260915T010203Z/snapshot"
     for path, want in [
-        (f"{home}/work/test/session-d", "work/test/session-d"),
+        (f"{home}/av-ros/test/delta", "av-ros/test/delta"),
         (f"{debate}/arbiter", "claude-work/ai-debate"),
         (f"{debate}/r2.debater.codex", "claude-work/ai-debate"),
-        (f"{home}/session_c_work", "session_c_work"),
+        (f"{home}/gamma_work", "gamma_work"),
         (str(home), "홈 디렉토리"),
         ("/srv/other/thing", "/srv/other/thing"),
     ]:
@@ -157,7 +157,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("살아 있는 대화의 토큰이 합계에 든다", "1,000,000" in r.stdout,
           r.stdout[-400:])
     check("세션별 표에 그 작업 이름이 나온다",
-          "session-b" in r.stdout and "세션별" in r.stdout, r.stdout[-400:])
+          "beta" in r.stdout and "세션별" in r.stdout, r.stdout[-400:])
 
     rj = subprocess.run([sys.executable, str(REPO / "bin" / "codex-usage"),
                          "--hours", "24", "--json"],
@@ -174,7 +174,7 @@ with tempfile.TemporaryDirectory() as tmp:
           isinstance(d.get("rate_limit"), dict) and "primary" in d["rate_limit"],
           str(d.get("rate_limit"))[:200])
     check("기계용 출력에도 세션별 칸이 있다",
-          d.get("by_session") and d["by_session"][0]["cwd"] == "/home/user/session-b",
+          d.get("by_session") and d["by_session"][0]["cwd"] == "/home/u/beta",
           str(d.get("by_session"))[:200])
 
 print(f"\n{sum(results)}/{len(results)} passed")

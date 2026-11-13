@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""계정별 사용량을 웹 페이지 하나로 보여 준다 — 누르면 그 자리에서 다시 잰다.
+
+수치를 만드는 것은 그 계정으로 도는 대화형 세션의 상태줄뿐이라(2026-11-05 실측),
+claude-account-probe 가 계정마다 세션을 짧게 띄워 받아 둔다. 이 서버는 그 결과를
+claude-accounts-usage 가 읽는 형태 그대로 내보내고, 누르면 다시 재게 한다.
+
+  claude-usage-web                          # 127.0.0.1:8787, 이 기계에서만
+  claude-usage-web --host 0.0.0.0 --port 8787 --token <열쇠글>
+  claude-usage-web --names <계정> <계정>       # 안 적으면 설정의 공용 계정 전부
+
+안쪽에만 여는 것이 기본이고, 다른 사람은 그 기계에 접속해서 읽는다. 접속 권한이 곧
+열쇠라 암호를 따로 두지 않아도 되고 포트를 열 일도 없다.
+
+  ssh <서버> "curl -s localhost:8787/usage.txt"        # 저장된 값 보기
+  ssh <서버> "curl -s -X POST localhost:8787/measure"  # 다시 재기 (오초쯤)
+
+바깥 주소로 직접 내보낼 때는 열쇠글을 반드시 건다 — "지금 재기" 는 그 계정 한도를 쓰는
+동작이라, 열어 두면 주소를 아는 누구나 우리 한도를 태울 수 있다. 그래서 열쇠글 없이
+바깥 주소(0.0.0.0)로 뜨라고 하면 시작을 거절한다.
+
+올리는 것은 --names 에 적은 계정뿐이고, 열쇠글을 건 자리에는 설정(night-accounts)의
+candidate 줄에 적힌 공용 계정만 올린다. 운영자의 회사·개인 계정 수치는 이 서버를 안
+거치고 컨트롤봇에서만 본다.
+
+보는 쪽은 언제나 다시 재고 그 결과를 받는다. 다만 연달아 누를 때만 짧게 막는다(기본
+30초) — 열 사람이 같은 순간에 누를 때 같은 측정을 열 번 하지 않게 하려는 것이고, 재는 데
+오초쯤 걸리므로 그 안의 값은 이미 방금 잰 값이다.
+"""
+import argparse
+import html
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+HERE = Path(__file__).resolve().parent
+USAGE = HERE / "claude-accounts-usage"
+PROBE = HERE / "claude-account-probe"
+NIGHT_SWITCH = HERE / "claude-account-night-switch"
+WEEKDAY = "월화수목금토일"
+
+
+def fmt_when(epoch, now):
+    """풀리는 시각. 오늘이면 시:분, 아니면 월-일(요일) 시:분."""
+    if not isinstance(epoch, (int, float)):
+        return "?"
+    when = datetime.fromtimestamp(epoch)
+    if when.date() == datetime.fromtimestamp(now).date():
+        return when.strftime("오늘 %H:%M")
+    return when.strftime("%m-%d") + f"({WEEKDAY[when.weekday()]}) " + when.strftime("%H:%M")
+
+
+def cell(win, now):
+    """창 하나를 표의 칸 하나로. 안 온 창은 수치 자리를 비우고 까닭을 적는다."""
+    if not isinstance(win, dict) or not win:
+        return '<td><b class="dimcell">—</b><span class="w">칸 없음</span></td>'
+    pct = win.get("used_percentage")
+    pct_s = f"{pct}%" if isinstance(pct, (int, float)) else "?%"
+    return (f'<td><b>{html.escape(pct_s)}</b>'
+            f'<span class="w">{html.escape(fmt_when(win.get("resets_at"), now))} 풀림</span></td>')
+
+
+class Store:
+    """지금 값과 마지막으로 잰 시각을 들고 있는다. 재는 것은 한 번에 하나만."""
+
+    def __init__(self, root, names, min_gap, timeout):
+        self.root = root
+        self.names = names
+        self.min_gap = min_gap
+        self.timeout = timeout
+        self.lock = threading.Lock()
+        self.measured_at = 0.0
+        self.last_error = ""
+
+    def read(self):
+        """저장된 수치를 읽는다 — 재지 않는다. 내보내는 것은 self.names 에 적힌 계정뿐이다.
+        뿌리 아래를 통째로 읽으면 그 뿌리에 운영자 계정 홈이 생기는 순간 열쇠글을 가진
+        누구에게나 그 수치가 같이 나간다."""
+        cmd = [sys.executable, str(USAGE), "--root", self.root, "--json", "--no-current",
+               "--names"] + self.names
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if out.returncode != 0:
+            return {"rows": [], "error": out.stderr.strip()[:200]}
+        try:
+            return json.loads(out.stdout)
+        except ValueError:
+            return {"rows": [], "error": "읽은 값이 깨졌다"}
+
+    def measure(self, force=False):
+        """계정마다 세션을 띄워 다시 잰다. 바닥 안이면 재지 않고 그렇게 말한다."""
+        with self.lock:
+            waited = time.time() - self.measured_at
+            if not force and waited < self.min_gap:
+                return False, int(self.min_gap - waited)
+            cmd = [sys.executable, str(PROBE), "--root", self.root,
+                   "--timeout", str(self.timeout)] + self.names
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True,
+                                     timeout=self.timeout * len(self.names) + 60)
+                self.last_error = "" if out.returncode == 0 else out.stdout.strip()[:300]
+            except subprocess.TimeoutExpired:
+                self.last_error = "재는 데 너무 오래 걸려서 접었다"
+            # 한도를 다 쓴 계정이 있으면 rc 가 0 이 아니다 — 그것도 정상 결과라 시각은 올린다.
+            self.measured_at = time.time()
+            return True, 0
+
+
+def as_text(store):
+    """터미널에서 읽는 모양. 모아 보기가 내는 줄을 그대로 쓴다 — 두 곳에서 다르게
+    적으면 같은 수치가 두 말이 된다."""
+    data = store.read()
+    now = data.get("now") or time.time()
+    cmd = [sys.executable, str(USAGE), "--root", store.root, "--no-current",
+           "--names"] + store.names
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    body = out.stdout.rstrip() if out.returncode == 0 else "수치를 읽지 못했다"
+    if store.measured_at:
+        mins = int((now - store.measured_at) // 60)
+        body += "\n" + ("방금 쟀다" if mins < 1 else f"{mins}분 전에 쟀다")
+    return body + "\n"
+
+
+def page(store):
+    """지금 값을 담은 쪽. 폰에서 먼저 읽히게 짠다."""
+    data = store.read()
+    now = data.get("now") or time.time()
+    head = datetime.fromtimestamp(now)
+    rows = []
+    for r in data.get("rows", []):
+        name = html.escape(str(r.get("label", "?")))
+        if r.get("state") == "ok":
+            # 칸이 안 온 창은 수치 자리를 비운다. 풀릴 시각이 지난 창도 여기 안 온다 —
+            # 모아 보기가 읽는 자리에서 먼저 뺀다(그 창은 이미 0 으로 초기화됐고 우리가
+            # 든 값은 초기화 전 값이라, 적으면 지금 그만큼 쓴 계정으로 읽힌다).
+            rows.append(f"""<tr><td class="n">{name}</td>
+{cell(r.get("five_hour"), now)}{cell(r.get("seven_day"), now)}</tr>""")
+        elif r.get("state") == "spent":
+            if r.get("until"):
+                what = html.escape(str(r.get("kind", "한도"))) + "를 다 썼다"
+                why = html.escape(fmt_when(r["until"], now)) + " 풀림"
+            else:
+                what = "한도를 다 썼다 — 지금 답하지 않는다"
+                why = html.escape(str(r.get("detail", "")))
+            rows.append(f"""<tr class="spent"><td class="n">{name}</td>
+<td colspan="2">{what}<span class="w">{why}</span></td></tr>""")
+        else:
+            # 풀릴 시각이 지난 한도 쪽지는 "지금 다 썼다" 로 안 적는다(claude-accounts-usage
+            # 가 그 판정을 한다). 대신 언제 풀렸는지는 남긴다 — 그냥 "못 받았다" 로만
+            # 적으면 로그인이 풀린 것처럼 읽힌다.
+            if r.get("spent_until"):
+                why = (html.escape(str(r.get("kind", "한도"))) + "가 "
+                       + html.escape(fmt_when(r["spent_until"], now))
+                       + " 에 풀렸고 그 뒤로 안 쟀다")
+            else:
+                why = "그 계정에서 아직 못 받았다"
+            rows.append(f"""<tr class="none"><td class="n">{name}</td>
+<td colspan="2">수치 없음<span class="w">{why}</span></td></tr>""")
+    if not rows:
+        rows.append('<tr class="none"><td colspan="3">아직 아무 계정도 없다</td></tr>')
+
+    age = ""
+    if store.measured_at:
+        mins = int((time.time() - store.measured_at) // 60)
+        age = "방금 쟀다" if mins < 1 else f"{mins}분 전에 쟀다"
+    return f"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>계정 사용량</title>
+<style>
+:root {{ color-scheme: light dark; --bg:#fff; --fg:#1b1b1b; --line:#e3e3e3; --dim:#6b6b6b; --hot:#b3261e; }}
+@media (prefers-color-scheme: dark) {{
+  :root {{ --bg:#17181a; --fg:#ececec; --line:#303236; --dim:#9aa0a6; --hot:#f2b8b5; }}
+}}
+body {{ margin:0; padding:16px; background:var(--bg); color:var(--fg);
+  font-family:'Noto Sans CJK KR',system-ui,sans-serif; font-size:17px; line-height:1.5; }}
+.wrap {{ max-width:720px; margin:0 auto; }}
+h1 {{ font-size:21px; margin:4px 0 2px; }}
+.sub {{ color:var(--dim); font-size:15px; margin-bottom:14px; }}
+table {{ width:100%; border-collapse:collapse; }}
+th, td {{ text-align:left; padding:12px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
+th {{ font-size:14px; color:var(--dim); font-weight:600; }}
+td.n {{ font-weight:700; white-space:nowrap; }}
+b {{ font-size:19px; }}
+.w {{ display:block; color:var(--dim); font-size:14px; }}
+b.dimcell {{ color:var(--dim); font-weight:400; }}
+tr.spent td {{ color:var(--hot); }}
+tr.none td {{ color:var(--dim); }}
+button {{ margin-top:18px; width:100%; min-height:48px; font-size:17px; font-family:inherit;
+  border:1px solid var(--line); border-radius:10px; background:transparent; color:var(--fg); }}
+button:disabled {{ color:var(--dim); }}
+.msg {{ margin-top:10px; color:var(--dim); font-size:15px; min-height:1.5em; }}
+</style></head><body><div class="wrap">
+<h1>계정 사용량</h1>
+<div class="sub">{head.strftime('%Y-%m-%d')}({WEEKDAY[head.weekday()]}) {head.strftime('%H:%M')} 기준 · {age}</div>
+<table><thead><tr><th>계정</th><th>다섯 시간</th><th>7일</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table>
+<button id="go">지금 다시 재기</button>
+<div class="msg" id="msg">누르면 계정마다 세션을 잠깐 띄워 받아 온다. 사십 초쯤 걸린다.</div>
+</div><script>
+const go = document.getElementById('go'), msg = document.getElementById('msg');
+const token = new URLSearchParams(location.search).get('t') || '';
+go.onclick = async () => {{
+  go.disabled = true; msg.textContent = '재는 중… 사십 초쯤 걸린다';
+  try {{
+    const r = await fetch('measure' + (token ? '?t=' + encodeURIComponent(token) : ''),
+                          {{ method: 'POST' }});
+    const d = await r.json();
+    if (d.ok) {{ location.reload(); return; }}
+    msg.textContent = d.message || '다시 재지 못했다';
+  }} catch (e) {{ msg.textContent = '서버에 닿지 못했다'; }}
+  go.disabled = false;
+}};
+</script></body></html>
+"""
+
+
+def make_handler(store, token):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "claude-usage-web"
+
+        def log_message(self, fmt, *args):   # 주소만 남긴다 — 열쇠글은 로그에 안 적는다.
+            sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
+
+        def ok(self, body, ctype):
+            raw = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", f"{ctype}; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def deny(self):
+            self.send_response(403)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("열쇠글이 필요하다".encode("utf-8"))
+
+        def allowed(self, query):
+            if not token:
+                return True
+            given = (query.get("t") or [""])[0]
+            # 글자마다 비교 시간이 달라지지 않게 길이까지 같이 본다.
+            return len(given) == len(token) and \
+                sum(a != b for a, b in zip(given, token)) == 0
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            if not self.allowed(q):
+                return self.deny()
+            if u.path in ("/", "/index.html"):
+                return self.ok(page(store), "text/html")
+            if u.path == "/usage.json":
+                return self.ok(json.dumps(store.read(), ensure_ascii=False), "application/json")
+            if u.path == "/usage.txt":
+                # 터미널에서 ssh 로 바로 읽는 통로. 꾸밈 없이 글자만 준다.
+                return self.ok(as_text(store), "text/plain")
+            self.send_error(404)
+
+        def do_POST(self):
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            if not self.allowed(q):
+                return self.deny()
+            if u.path not in ("/measure", "measure"):
+                return self.send_error(404)
+            ran, wait = store.measure()
+            body = {"ok": ran}
+            if not ran:
+                body["message"] = f"방금 쟀다 — {wait}초 뒤에 다시 눌러 달라"
+            elif store.last_error:
+                body["note"] = store.last_error
+            self.ok(json.dumps(body, ensure_ascii=False), "application/json")
+
+    return Handler
+
+
+def shared_accounts(conf=None):
+    """공용 계정 이름을 설정에서 읽는다 — 이 파일에는 이름을 적지 않는다.
+
+    정본은 ~/.config/claude-usage/night-accounts 의 candidate 줄이고, 그 파일을 읽는
+    코드는 claude-account-night-switch 하나다. 여기서 같은 파서를 다시 쓰면 두 벌이
+    되어 한쪽이 낡고, 낡은 쪽이 "이 이름은 공용이 아니다" 를 조용히 말한다.
+    """
+    from importlib.machinery import SourceFileLoader
+    mod = SourceFileLoader("night_switch", str(NIGHT_SWITCH)).load_module()
+    cands, _day, _peer, _yield, _fallbacks = mod.read_conf(conf)
+    return list(cands)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="기본은 이 기계에서만. 바깥에 내보낼 때만 0.0.0.0")
+    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--root", default=os.path.expanduser("~/claude-accounts"))
+    ap.add_argument("--names", nargs="*", default=None,
+                    help="안 적으면 설정의 공용 계정(candidate 줄) 전부")
+    ap.add_argument("--token", default="", help="주소 뒤 t= 에 붙일 열쇠글")
+    ap.add_argument("--min-gap", dest="min_gap", type=float, default=30.0,
+                    help="연달아 누를 때만 막는 간격(초). 기본 30")
+    ap.add_argument("--timeout", type=float, default=30.0,
+                    help="계정 하나를 기다리는 시간(초). 기본 30")
+    args = ap.parse_args()
+
+    # 바깥에 내놓으면서 열쇠글이 없으면 거절한다. "지금 재기" 는 한도를 쓰는 동작이라,
+    # 주소를 아는 누구나 우리 한도를 태울 수 있게 된다.
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
+        print("바깥으로 열려면 --token 을 같이 적는다 — 열쇠글 없이는 시작하지 않는다.",
+              file=sys.stderr)
+        return 2
+
+    # 무엇이 공용 계정인가는 이름의 생김새가 아니라 설정이 정한다. 이름 앞가지로
+    # 가르면 설정에 적힌 이름을 바꾸는 날 이 판정이 조용히 틀려진다 — 공용인데
+    # 아니라고 하면 서버가 안 뜨고, 아닌데 공용이라고 하면 개인 수치가 새어 나간다.
+    shared = shared_accounts()
+    if args.names is None:
+        args.names = shared
+    if not args.names:
+        print("올릴 계정이 없다. --names 로 적거나 설정(night-accounts)의 "
+              "candidate 줄에 공용 계정을 적는다.", file=sys.stderr)
+        return 2
+
+    # 열쇠글을 건 자리는 여럿이 보는 자리다. 거기 올리는 것은 회사 공용 계정뿐이고,
+    # 운영자의 회사·개인 계정은 컨트롤봇에서만 본다(운영자 지시). 권한을 열쇠별로
+    # 나누는 안은 그때 기각했으니, 가르는 자리를 여기 하나로 둔다 — 공용이 아닌 이름이
+    # 섞이면 시작을 거절한다. 내보낼 때 걸러 내는 것만으로는 부족하다. 거르는 쪽을 누가
+    # 고치면 조용히 새고, 그 샘은 아무 신호도 안 낸다.
+    outside = [n for n in args.names if n not in shared]
+    if args.token and outside:
+        print("열쇠글을 건 자리에는 설정에 적힌 공용 계정만 올린다. "
+              "뺄 것: " + ", ".join(outside), file=sys.stderr)
+        return 2
+
+    store = Store(args.root, list(args.names), args.min_gap, args.timeout)
+    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(store, args.token))
+    where = f"http://{args.host}:{args.port}/"
+    print(f"{where} 에서 듣는다" + ("  (열쇠글 필요)" if args.token else ""))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

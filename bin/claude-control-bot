@@ -9,9 +9,11 @@ env 파일: ~/.claude/control-bot/.env
 
 systemd user service로 상시 실행.
 """
+import html
 import http.client
 import json
 import os
+import queue
 import random
 import re
 import subprocess
@@ -25,10 +27,6 @@ from pathlib import Path
 # login_relay 는 같은 bin/ 디렉토리에 있음 (symlink 실행 대비 realpath 로 해석).
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import login_relay
-
-# 저장소 뿌리를 이 파일 위치에서 찾는다. 예전엔 홈 아래 고정 경로였는데,
-# 그러면 다른 자리에 받은 사람은 그대로 못 돌린다.
-REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 ENV_PATH = Path.home() / ".claude" / "control-bot" / ".env"
 
@@ -49,6 +47,17 @@ ALLOWED_USER = int(env.get("ALLOWED_USER_ID", "0"))
 if not TOKEN or not ALLOWED_USER:
     raise SystemExit("CONTROL_BOT_TOKEN / ALLOWED_USER_ID missing in .env")
 
+def log(msg):
+    """로그 한 줄에 시각을 붙인다.
+
+    시각이 없으면 "언제 실패했나" 를 못 가린다 — 결과가 안 온 누름과 로그의 실패를
+    맞댈 방법이 그 시각뿐이다. 2026-11-11 에 운영자가 "반응이 없거나 엄청 늦다" 를
+    물었을 때, 7,965줄짜리 로그로 아무 시각도 못 댄 자리가 계기다. 시스템 표기(KST)를
+    쓴다 — 운영자가 보는 다른 기록과 같은 시계여야 맞댈 수 있다.
+    """
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+
+
 API = f"https://api.telegram.org/bot{TOKEN}"
 _API_HOST = "api.telegram.org"
 _API_PREFIX = f"/bot{TOKEN}"
@@ -56,11 +65,22 @@ _API_PREFIX = f"/bot{TOKEN}"
 _API_TIMEOUT = 60
 # 재시도 대상 예외: DNS 실패(gaierror는 OSError 하위, EAI_AGAIN 포함)/커넥션 리셋/타임아웃/HTTP 프로토콜 오류.
 _RETRIABLE_EXC = (http.client.HTTPException, OSError)
-# 읽기 전용/멱등 호출만 재시도한다. sendMessage/editMessageText/answerCallbackQuery 등
-# 쓰기성(비멱등) 호출은 재시도하지 않는다 — 요청이 텔레그램에 이미 도달·처리됐는데
-# 응답 수신만 실패한 경우 재시도하면 메시지 중복 발송·콜백 중복 응답이 생길 수 있다
+# 읽기 전용/멱등 호출만 재시도한다. sendMessage 처럼 두 번 가면 운영자 화면에 글이
+# 두 개 뜨는 호출은 재시도하지 않는다 — 요청이 텔레그램에 이미 도달·처리됐는데 응답
+# 수신만 실패한 경우를 사후 예외 이름으로는 가를 수 없다
 # (ai-debate 세컨드오피니언 지적, 2026-07-03. run-20260703T114659Z).
 _IDEMPOTENT_READ_METHODS = {"getUpdates", "getWebhookInfo", "getMe"}
+# 쓰기지만 두 번 가도 운영자 화면에 흔적이 안 남는 호출. 같은 message_id·callback_query_id
+# 에 거는 것이라 둘째 요청은 400(message is not modified / query is too old / 이미 답함)
+# 으로 조용히 끝난다. 그래서 중복 우려가 적용되지 않는다 — 2026-11-11 토론
+# run-20261111T035103Z 의 라운드 1 에서 참가자 넷이 같은 자리를 짚었다.
+_IDEMPOTENT_WRITE_METHODS = {"editMessageText", "deleteMessage", "answerCallbackQuery",
+                             "setMyCommands"}
+# 이만큼 놀던 커넥션은 쓰지 않고 버린다. 작업 스레드는 버튼을 누를 때만 깨어나므로 그
+# 사이 서버가 keep-alive 를 닫아 둔다 — 그 커넥션에 요청을 쓰면 보내는 데는 성공하고
+# 응답을 못 받아(RemoteDisconnected) 결과가 조용히 사라진다. 보내기 전에 버리면 그
+# 자리를 아예 안 만들고, 중복 발송 위험이 0 이다(요청을 한 번도 안 보냈으므로).
+_KEEPALIVE_IDLE_TTL = 25.0
 # 읽기 계열 최대 시도 2회(최초+재시도 1회)로 제한 — getUpdates 소켓타임아웃(60s)과 곱해지는
 # 최악 블로킹 시간을 낮춘다(4회면 최대 ~4분, 2회면 최대 ~2분).
 _MAX_READ_ATTEMPTS = 2
@@ -75,6 +95,10 @@ _tls = threading.local()
 
 def _api_conn():
     c = getattr(_tls, "conn", None)
+    if c is not None and time.time() - getattr(_tls, "conn_used_at", 0.0) > _KEEPALIVE_IDLE_TTL:
+        # 오래 놀았으면 살아 있는지 묻지 말고 버린다 — 묻는 방법이 요청을 보내 보는 것뿐이다.
+        _api_drop_conn()
+        c = None
     if c is None:
         c = http.client.HTTPSConnection(_API_HOST, timeout=_API_TIMEOUT)
         _tls.conn = c
@@ -109,43 +133,57 @@ def api(method, **params):
     ).encode()
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     path = f"{_API_PREFIX}/{method}"
-    max_attempts = _MAX_READ_ATTEMPTS if method in _IDEMPOTENT_READ_METHODS else 1
+    idempotent = method in _IDEMPOTENT_READ_METHODS or method in _IDEMPOTENT_WRITE_METHODS
+    max_attempts = _MAX_READ_ATTEMPTS if idempotent else 1
     delay = 1.0
-    for attempt in range(max_attempts):
+    attempt = 0
+    connect_retried = False
+    while True:
+        sent = False
         try:
             conn = _api_conn()
+            if conn.sock is None:
+                # 연결 단계를 따로 세운다. 여기서 죽으면 요청이 한 바이트도 안 나간 것이
+                # 확실해서, 메서드를 안 가리고 다시 걸어도 중복이 생길 수 없다.
+                conn.connect()
+            sent = True
             conn.request("POST", path, body=body, headers=headers)
             resp = conn.getresponse()
             raw = resp.read()  # keep-alive 재사용 위해 반드시 본문 소진
+            _tls.conn_used_at = time.time()
             status = resp.status
             if status >= 500 and max_attempts > 1:
                 # 서버측 일시 장애(502/503 등) → 읽기 계열만 재시도 대상.
                 raise OSError(f"HTTP {status}")
             if status >= 400:
                 # 4xx(예: 만료된 콜백 400) 또는 재시도 대상 아닌 5xx는 즉시 실패 반환.
-                print(f"[api {method}] HTTP {status}", flush=True)
+                log(f"[api {method}] HTTP {status}")
                 return _parse_api_body(raw, status)
             return _parse_api_body(raw, status)
         except _RETRIABLE_EXC as e:
             # 커넥션이 깨졌을 수 있으니 버리고 다음 시도에서 새로 연결(=새 DNS 조회).
             _api_drop_conn()
-            if attempt < max_attempts - 1:
-                # 첫 실패는 stale keep-alive 커넥션일 가능성이 높으니 즉시 1회 재연결(지연 없음).
-                # 그 다음 실패부터만 백오프(1s, 2s, ...)를 붙인다.
-                if attempt == 0:
-                    print(f"[api {method}] {e} (즉시 재연결)", flush=True)
-                else:
-                    sleep_s = delay + random.uniform(0, 0.3 * delay)  # 약간의 지터
-                    print(f"[api {method}] {e} (retry {attempt + 1}/{max_attempts - 1} in {sleep_s:.1f}s)", flush=True)
-                    time.sleep(sleep_s)
-                    delay *= 2
+            if not sent and not connect_retried:
+                # 요청 미전송이 확실한 실패(이름 풀기·접속 거부·암호화 악수). 쓰기 호출도
+                # 한 번은 다시 건다. 이름 풀기 실패에 지연 없이 바로 다시 걸면 장애 구간의
+                # 조회와 로그가 정확히 두 배가 되므로 짧게 쉬었다 간다.
+                connect_retried = True
+                log(f"[api {method}] {e} (연결 단계 실패 — 요청 미전송, 1회 재시도)")
+                time.sleep(0.5 + random.uniform(0, 0.3))
                 continue
-            print(f"[api {method}] {e}", flush=True)
+            if attempt < max_attempts - 1:
+                attempt += 1
+                sleep_s = delay + random.uniform(0, 0.3 * delay)  # 약간의 지터
+                log(f"[api {method}] {e} (retry {attempt}/{max_attempts - 1} in {sleep_s:.1f}s)")
+                time.sleep(sleep_s)
+                delay *= 2
+                continue
+            log(f"[api {method}] {e}")
             return {"ok": False, "description": str(e)}
         except Exception as e:
             # 비네트워크 예외(예: json 파싱)는 재시도 안 함.
             _api_drop_conn()
-            print(f"[api {method}] {e}", flush=True)
+            log(f"[api {method}] {e}")
             return {"ok": False, "description": str(e)}
 
 
@@ -163,10 +201,10 @@ def list_sessions():
                 continue
             if unit in ("claude-watchdog.service", "claude-control-bot.service",
                         "claude-progress-updater.service", "claude-progress-updater-all.service",
-                        "claude-rate-limit-recovery.service", "claude-daily-research.service"):
+                        "claude-rate-limit-recovery.service"):
                 continue
             # claude-*.service 중 Claude Code 세션이 아닌 보조 서비스 제외
-            if unit.startswith("claude-progress") or unit.startswith("claude-rate-limit") or unit.startswith("claude-daily"):
+            if unit.startswith("claude-progress") or unit.startswith("claude-rate-limit"):
                 continue
             # 템플릿 인스턴스 유닛(claude-xxx@yyy.service)은 세션이 아님.
             # 예: claude-session-nudge@<세션> — 넛지 발송 데몬이 세션 목록에 섞여 보이던 버그(2026-07-25).
@@ -177,7 +215,7 @@ def list_sessions():
             names.append(name)
         return sorted(names)
     except Exception as e:
-        print(f"[list_sessions] {e}", flush=True)
+        log(f"[list_sessions] {e}")
         return []
 
 
@@ -185,7 +223,7 @@ def run_cs(*args, timeout=30):
     """cs (claude-sessions) 실행. stdout 반환."""
     try:
         out = subprocess.check_output(
-            [os.path.expanduser("~/.local/bin/claude-sessions"), *args],
+            [str(Path(__file__).resolve().parent / "claude-sessions"), *args],
             text=True, stderr=subprocess.STDOUT, timeout=timeout,
         )
         return out.strip()[:3500]  # Telegram 4096 제한 여유
@@ -204,7 +242,7 @@ def is_intentionally_stopped(name):
     """컨트롤봇 끄기 버튼으로 의도적으로 정지된 세션인지. watchdog은 이미
     inactive를 안 건드리지만(is-active != active 시 skip), 컨트롤봇 자신의
     restart/forcerotate 버튼은 그런 구분 없이 systemctl restart/cs restart 를
-    그대로 실행해 정지된 세션을 되살려버린다(2026-07-09 session-k 실사고:
+    그대로 실행해 정지된 세션을 되살려버린다(2026-07-09 velocity 실사고:
     끄기→재시작 눌렀더니 살아남). 이 마커로 restart/forcerotate 를 막는다."""
     return (STOPPED_MARKER_DIR / name).exists()
 
@@ -252,7 +290,14 @@ def restart_all_active_only(timeout=60):
     return "\n".join(lines) if lines else "재시작할 세션 없음"
 
 
-ACCOUNT_SWITCH_BIN = os.path.expanduser("~/.local/bin/claude-account-switch")
+# 자기 옆에 있는 것을 쓴다. 봇은 저장소에 심링크로 깔리므로 이 경로는 같은 판본의
+# 교체 명령을 가리킨다 — 홈 경로를 글자로 박아 두면 그 기계에서만 돌고, 검사도 그
+# 기계의 실제 홈을 건드려야 한다.
+ACCOUNTS_BIN = str(Path(__file__).resolve().parent / "claude-accounts")
+# 자동 고르기는 밤 전환이 쓰는 그 코드를 그대로 부른다. 고르는 규칙(저쪽 기계가 쓰는
+# 계정 빼기, 한도 여유 많은 것 먼저, 겹치면 비키기)을 여기 다시 쓰면 두 벌이 갈리고
+# 갈린 쪽을 사람이 사실로 읽는다.
+NIGHT_SWITCH_BIN = str(Path(__file__).resolve().parent / "claude-account-night-switch")
 
 # 로그인 릴레이 싱글톤 (단일 진행). 계정 구분 없이 재로그인 → fresh creds 적용.
 _RELAY = login_relay.LoginRelay()
@@ -266,32 +311,127 @@ def start_relay(chat_id):
 
     def on_done(_tgt, success, cred_path, detail):
         if success and cred_path:
-            out = run_account_switch("--apply-login", cred_path)
+            out = run_accounts("--apply-login", cred_path)
             if out.startswith(("[error", "[timeout", "[exception")):
                 api("sendMessage", chat_id=chat_id,
-                    text=f"⚠️ 재로그인은 됐는데 적용 실패:\n{out}",
+                    text=with_account(f"⚠️ 재로그인은 됐는데 적용 실패:\n{out}"),
                     reply_markup=main_menu_markup())
             else:
                 api("sendMessage", chat_id=chat_id,
-                    text=f"✅ 재로그인·적용 완료.\n{out}",
+                    text=with_account(f"✅ 재로그인·적용 완료.\n{out}"),
                     reply_markup=main_menu_markup())
         elif success:
             api("sendMessage", chat_id=chat_id,
-                text="⚠️ 로그인 성공 신호인데 creds 파일을 못 찾음. 수동 확인 필요.",
+                text=with_account("⚠️ 로그인 성공 신호인데 creds 파일을 못 찾음. 수동 확인 필요."),
                 reply_markup=main_menu_markup())
         else:
             api("sendMessage", chat_id=chat_id,
-                text=f"❌ 재로그인 실패/취소: {detail}",
+                text=with_account(f"❌ 재로그인 실패/취소: {detail}"),
                 reply_markup=main_menu_markup())
 
     ok, msg = _RELAY.start("login", send, on_done)
     api("sendMessage", chat_id=chat_id, text=msg)
 
 
-def run_account_switch(*args, timeout=90):
+# ── 계정 고르기 ──────────────────────────────────────────────────────────────
+# 이 기계의 세션들이 어느 계정으로 도는지를 버튼으로 고른다. 계정마다 홈이 하나씩
+# 있고(각자 따로 로그인해 둔 것), 고른 홈의 자격을 live 로 올리면 떠 있는 세션이
+# 다음 요청부터 그 계정으로 간다 — 재시작도 재로그인도 없다(11-06 실측, fdfdc1e).
+# 상태 정본은 claude-accounts 가 쓰는 이름표 하나이고 봇은 읽기만 한다.
+ACCOUNTS_ROOT = Path.home() / "claude-accounts"
+
+
+def account_names():
+    try:
+        return sorted(p.name for p in ACCOUNTS_ROOT.iterdir() if p.is_dir())
+    except OSError:
+        return []
+
+
+def account_plan(name):
+    """그 계정 홈의 요금제. 토큰 값은 꺼내 쓰지 않는다 — 있는지와 등급만 본다."""
+    path = ACCOUNTS_ROOT / name / ".claude" / ".credentials.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    oauth = data.get("claudeAiOauth") or data
+    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+        return None
+    return oauth.get("subscriptionType") or "등급 모름"
+
+
+def account_current(timeout=20):
+    """지금 live 가 어느 계정인가. 모르면 None.
+
+    자격 파일끼리 비교해서는 못 가린다 — 쓰는 동안 토큰이 저절로 갱신돼서 홈에 있는
+    사본과 글자가 달라진다. 그래서 갈아 끼운 쪽이 이름을 적어 두고 그것만 읽는다.
+    """
+    out = run_accounts("--which", timeout=timeout)
+    name = out.strip().splitlines()[0].strip() if out.strip() else ""
+    if not name or name == "모름" or name.startswith("["):
+        return None
+    return name
+
+
+def account_line():
+    """지금 어느 계정으로 도는지 한 줄.
+
+    메인 자판을 다는 모든 글에 붙인다(운영자 지시). 계정 메뉴에 들어가야만 보이면
+    버튼을 누르기 전에 그 값을 모르고, 어느 계정 한도를 깎는지 모른 채 세션을 만진다.
+    짧게 잡는 것은 이 줄이 화면마다 붙기 때문이다 — 못 읽으면 그 글 전체가 늦어진다.
+    """
+    cur = account_current(timeout=10)
+    return "👤 계정: " + (cur or "모름")
+
+
+def with_account(text):
+    """메인 자판과 같이 보내는 글 끝에 계정 줄을 붙인다. 이미 있으면 그대로 둔다."""
+    line = account_line()
+    return text if line in text else (text.rstrip() + "\n\n" + line)
+
+
+def account_menu_text(cur, note=""):
+    lines = ["👤 계정 — 이 기계의 세션이 어느 계정으로 도는가", ""]
+    lines.append("지금: " + (cur or "모름 — 한 번 골라 두면 그때부터 여기 적힌다"))
+    lines.append("")
+    for name in account_names():
+        plan = account_plan(name)
+        lines.append(("● " if name == cur else "○ ") + name + "  "
+                     + (plan or "로그인 안 함"))
+    lines.append("")
+    lines.append("누르면 한 번 더 묻고 갈아 끼운다. 세션 재시작은 없다 — "
+                 "떠 있는 세션이 다음 요청부터 그 계정 한도를 쓴다.")
+    if note:
+        lines.append("")
+        lines.append(note)
+    return "\n".join(lines)
+
+
+def account_menu_markup(cur):
+    # 이름이 짧고(계정 이름 넷 글자 안팎) 누르면 확인을 한 번 더 받으므로 둘씩 둔다.
+    rows, row = [], []
+    for name in account_names():
+        row.append({"text": ("● " if name == cur else "") + name,
+                    "callback_data": f"acct:pick:{name}"})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    # 확인을 거쳐 실제로 계정을 바꾸는 버튼이라 한 줄에 하나로 둔다(자판 원칙 ⑵).
+    rows.append([{"text": "🎲 자동 — 여유 있는 공용 계정",
+                  "callback_data": "acct:auto"}])
+    rows.append([{"text": "🔑 새로 로그인", "callback_data": "relogin-confirm"}])
+    rows.append([{"text": "⬅ Back", "callback_data": "menu:main"}])
+    return {"inline_keyboard": rows}
+
+
+def run_night_switch(*args, timeout=300):
+    """밤 전환 코드를 부른다. 재는 데만 최대 240초라 넉넉히 잡는다."""
     try:
         out = subprocess.check_output(
-            [ACCOUNT_SWITCH_BIN, *args],
+            [NIGHT_SWITCH_BIN, *args],
             text=True, stderr=subprocess.STDOUT, timeout=timeout,
         )
         return out.strip()[:3500]
@@ -303,16 +443,49 @@ def run_account_switch(*args, timeout=90):
         return f"[exception] {e}"
 
 
+def run_accounts(*args, timeout=90):
+    try:
+        out = subprocess.check_output(
+            [ACCOUNTS_BIN, *args],
+            text=True, stderr=subprocess.STDOUT, timeout=timeout,
+        )
+        return out.strip()[:3500]
+    except subprocess.TimeoutExpired:
+        return "[timeout]"
+    except subprocess.CalledProcessError as e:
+        return f"[error exit {e.returncode}]\n{e.output[:3000]}"
+    except Exception as e:
+        return f"[exception] {e}"
+
+
+# 자판 짜는 원칙 (2026-11-06 운영자 지시 — 줄마다 개수가 들쭉날쭉한 것을 고쳤다).
+#  ⑴ 한 줄에 둘이 기본이다. 줄마다 개수가 달라지면 누르는 자리가 매번 옮겨 다닌다.
+#  ⑵ 확인을 거치지 않고 바로 도는 위험한 것은 한 줄에 하나로 둔다 — 옆 버튼 오누름 방지.
+#     세션별 동작(재시작·rotate·끄기·켜기)이 그래서 한 줄씩이다.
+#  ⑶ 이름이 들어가는 목록은 글자 길이로 정한다. 넛지는 "이름 3.0h" 라 둘씩, Bypass 는
+#     "이름 (프로젝트)" 라 하나씩 — 둘로 붙이면 글자가 잘린다.
+#  ⑷ 뒤로 가는 줄은 언제나 맨 마지막에 혼자 둔다.
 def main_menu_markup():
+    # 전부 조회이거나 하위 메뉴 열기라 ⑴ 그대로 둘씩. 왼쪽 두 줄이 보는 것,
+    # 오른쪽 아래 두 줄이 손대는 것이다.
     # 계정 구분 폐지 (2026-06-24) — 순수 재로그인 버튼 하나만. 모든 머신 공통.
+    # 모델 선택은 컨트롤봇에서 뺐다 (2026-09-23 운영자 지시). 세션 모델·effort 는
+    # ~/.config/claude-models.json 을 직접 고치고 그 세션을 Restart 해서 적용한다.
     rows = [
+        # 지금 상태
         [{"text": "📊 Status", "callback_data": "status"},
          {"text": "💻 Resources", "callback_data": "resources"}],
-        [{"text": "🚧 Bypass…", "callback_data": "menu:bypass"},
+        # 수치와 기록 — 계정 사용량은 누를 때마다 저쪽에서 새로 잰다(오초쯤).
+        [{"text": "🧮 계정 사용량", "callback_data": "usage"},
          {"text": "📜 Recent…", "callback_data": "menu:recent"}],
-        [{"text": "🔄 Restart…", "callback_data": "menu:restart"}],
-        [{"text": "⏰ 넛지…", "callback_data": "nudge:menu"}],
-        [{"text": "🔑 재로그인", "callback_data": "relogin-confirm"}],
+        # 세션 손대기
+        [{"text": "🔄 Restart…", "callback_data": "menu:restart"},
+         {"text": "🚧 Bypass…", "callback_data": "menu:bypass"}],
+        # 계정과 깨우기. 재로그인은 계정 메뉴 안으로 들어갔다 — 계정 홈이 여섯이라
+        # 평소에 고르는 것은 "어느 계정으로 도나" 이고, 새로 로그인하는 것은 그 안의
+        # 한 갈래다. 메인 줄마다 둘이라는 규칙도 그대로 지킨다.
+        [{"text": "⏰ 넛지…", "callback_data": "nudge:menu"},
+         {"text": "👤 계정…", "callback_data": "acct:menu"}],
     ]
     return {"inline_keyboard": rows}
 
@@ -323,7 +496,7 @@ def main_menu_markup():
 # 반드시 CLI 를 통한다 — 상태파일을 봇이 직접 쓰면 유닛과 갈린다.
 NUDGE_DIR = Path.home() / ".claude" / "state" / "session-nudge"
 # 유닛(claude-session-nudge@.service)이 부르는 경로와 같은 것을 쓴다.
-NUDGE_BIN = os.path.join(REPO, "bin/claude-session-nudge")
+NUDGE_BIN = str(Path(__file__).resolve().parent / "claude-session-nudge")
 NUDGE_HOURS = [("6h", 6), ("12h", 12), ("24h", 24), ("3d", 72), ("7d", 168)]
 
 
@@ -337,7 +510,7 @@ def _nudge_active_units():
             text=True, timeout=5,
         )
     except Exception as e:
-        print(f"[nudge units] {e}", flush=True)
+        log(f"[nudge units] {e}")
         return set()
     names = set()
     for line in out.splitlines():
@@ -436,6 +609,135 @@ def _pct_emoji(pct, warn, danger):
     return "✅"
 
 
+# 계정 넷의 한도 사용량을 재는 기계는 이 기계가 아니다. 거기까지 가는 명령 한 줄은
+# 저장소 밖 설정 파일에 둔다 — 그 줄에 서버 주소가 들어가고, 호스트마다 가는 길이
+# 다르기 때문이다(홈은 둘째 기계를 거쳐 가고 둘째 기계는 바로 간다).
+USAGE_REMOTE = Path.home() / ".config" / "claude-usage" / "remote"
+
+# 운영자의 회사·개인 계정은 저 기계에 안 올린다(운영자 지시) — 그 수치는 이 기계
+# 안에서 바로 읽는다. 어느 홈을 그렇게 읽을지는 저장소 밖 설정에 한 줄씩 적는다. 그 이름이
+# 곧 "운영자 계정" 이라는 사실을 담으므로 코드에 박지 않는다(R76).
+USAGE_LOCAL_NAMES = Path.home() / ".config" / "claude-usage" / "local-names"
+USAGE_BIN = str(Path(__file__).resolve().parent / "claude-accounts-usage")
+PROBE_BIN = str(Path(__file__).resolve().parent / "claude-account-probe")
+# 텔레그램으로 가는 글은 위아래 둘 다 이 하나로 그린다. 저 기계(공용 계정 넷)에서는
+# 손대지 않은 글줄을 받아 와 여기서 그린다 — 양쪽이 각자 그리면 서식이 갈린다(8754).
+GAUGE_BIN = str(Path(__file__).resolve().parent / "claude-usage-gauge")
+# 수치는 세션을 한 번 띄워야 생긴다. 볼 때마다 띄우면 그 계정 한도를 보기만 해도 깎으므로,
+# 이 간격보다 새 값이면 있는 것을 그대로 쓴다.
+USAGE_LOCAL_MIN_GAP = 900
+
+
+def gauge(text):
+    """계정 줄을 텔레그램 서식으로 그린다. 못 그리면 받은 글을 그대로 돌려준다.
+
+    실패해도 글을 버리지 않는 것이 이 자리의 규칙이다 — 보여 주는 단계에서 터져서
+    수치를 통째로 못 보는 것이 서식이 어긋난 것보다 나쁘다.
+    """
+    if not text.strip():
+        return text
+    try:
+        p = subprocess.run([GAUGE_BIN, "--no-bar"], input=text,
+                           capture_output=True, text=True, timeout=20)
+    except (subprocess.SubprocessError, OSError):
+        return text
+    out = (p.stdout or "").strip()
+    return out if p.returncode == 0 and out else text
+
+
+def local_names():
+    """이 기계 안에서 바로 읽을 계정 홈 이름들. 설정이 없으면 빈 목록."""
+    try:
+        raw = USAGE_LOCAL_NAMES.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    out = []
+    for line in raw.splitlines():
+        name = line.strip()
+        if not name or name.startswith("#") or "/" in name or name.startswith("."):
+            continue
+        out.append(name)
+    return out
+
+
+def read_usage_local(timeout=120):
+    """이 기계의 계정 홈을 바로 읽는다. 낡은 것만 다시 띄워 재고 글줄로 돌려준다."""
+    names = local_names()
+    if not names:
+        return ""
+    try:
+        p = subprocess.run([USAGE_BIN, "--json", "--no-current", "--names", *names],
+                           capture_output=True, text=True, timeout=30)
+        data = json.loads(p.stdout) if p.returncode == 0 else {}
+    except (subprocess.SubprocessError, OSError, ValueError):
+        data = {}
+    now = data.get("now") or time.time()
+    stale = [r["label"] for r in data.get("rows", [])
+             if now - (r.get("cached_at") or 0) > USAGE_LOCAL_MIN_GAP]
+    if stale:
+        try:
+            # 기본 30초는 짧다 — 한도를 다 쓴 계정은 그 사실을 알리는 데에도 시간이
+            # 걸려서, 짧게 끊으면 "시간초과" 가 되고 다 쓴 것과 말이 없는 것이 섞인다.
+            subprocess.run([PROBE_BIN, "--timeout", "60", *stale],
+                           capture_output=True, text=True, timeout=timeout)
+        except (subprocess.SubprocessError, OSError):
+            pass          # 못 쟀으면 있는 값을 그대로 보여 준다 — 비는 것보다 낫다
+    try:
+        p = subprocess.run([USAGE_BIN, "--no-current", "--names", *names],
+                           capture_output=True, text=True, timeout=30)
+    except (subprocess.SubprocessError, OSError) as e:
+        return f"이 기계 계정: 읽지 못했다 — {e}"
+    if p.returncode != 0:
+        return f"이 기계 계정: 실패 (rc={p.returncode})"
+    body = gauge("\n".join(line for line in (p.stdout or "").splitlines()
+                           if line.strip() and not line.startswith("계정별 사용량")))
+    return ("이 기계 계정 (여럿이 보는 자리에는 안 올린다)\n\n" + body) if body else ""
+
+
+def read_usage_remote(timeout=90):
+    """저쪽 기계(공용 계정이 사는 자리)의 수치를 접속 한 줄로 가져온다."""
+    if not USAGE_REMOTE.exists():
+        return ("계정 사용량을 가져올 길이 없다.\n"
+                f"{USAGE_REMOTE} 에 접속 명령 한 줄을 적는다.")
+    cmd = USAGE_REMOTE.read_text(encoding="utf-8").strip()
+    if not cmd or cmd.startswith("#"):
+        return f"계정 사용량: {USAGE_REMOTE} 가 비어 있다 — 접속 명령 한 줄을 적는다."
+    try:
+        p = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return f"계정 사용량: {timeout}초 안에 답이 없다. 저쪽 기계가 떠 있는지 본다."
+    except Exception as e:
+        return f"계정 사용량: 부르지 못했다 — {e}"
+    out = (p.stdout or "").strip()
+    if p.returncode != 0:
+        err = (p.stderr or "").strip() or out
+        return f"계정 사용량: 실패 (rc={p.returncode})\n{err[:1200]}"
+    return gauge(out) if out else "계정 사용량: 빈 응답이 왔다."
+
+
+def read_usage(timeout=90):
+    """두 자리의 사용량을 같이 긁어 한 글로 돌려준다.
+
+    차례로 부르면 이쪽 재기(낡은 계정을 다시 띄우느라 길면 2분)가 끝나야 저쪽 접속이
+    시작한다 — 두 자리는 서로 기대는 데가 없으므로 같이 띄우면 걸리는 시간이 느린
+    쪽 하나로 줄어든다(운영자 지시). 한쪽이 터져도 다른 쪽은 그대로 보여 준다.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_remote = ex.submit(read_usage_remote, timeout)
+        f_local = ex.submit(read_usage_local)
+        try:
+            remote = f_remote.result()
+        except Exception as e:
+            remote = f"계정 사용량: 부르지 못했다 — {e}"
+        try:
+            local = f_local.result()
+        except Exception as e:
+            local = f"이 기계 계정: 읽지 못했다 — {e}"
+    return (remote + "\n\n" + local) if local else remote
+
+
 def read_resources():
     """단일 화면(≤20줄) 리소스 요약. 사고 조기 신호 우선.
     포함: uptime, load, CPU%, MEM, swap, disk(/, /mnt/Data), 9세션 active/RSS,
@@ -496,11 +798,7 @@ def read_resources():
             else: failed += 1
             if ok and not bun: bun_missing += 1
             # RSS (cgroup memory.current 우선)
-            # cgroup 경로에 들어가는 번호는 이 기계의 사용자 번호다. 1000 으로 박아
-            # 두면 다른 사용자 번호를 쓰는 기계에서 조용히 빈 값이 된다.
-            _uid = os.getuid()
-            for cp in (f"/sys/fs/cgroup/user.slice/user-{_uid}.slice/"
-                       f"user@{_uid}.service/claude-{n}.service/memory.current",):
+            for cp in (f"/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/claude-{n}.service/memory.current",):
                 try:
                     rss_list.append((n, int(open(cp).read().strip())))
                     break
@@ -586,6 +884,7 @@ def bypass_menu_text():
 
 
 def bypass_menu_markup():
+    # 한 줄에 하나다 — 위 원칙 ⑶. 이름 뒤에 프로젝트까지 붙어 둘로 나누면 글자가 잘린다.
     BYPASS_DIR.mkdir(parents=True, exist_ok=True)
     rows = []
     g_on = BYPASS_GLOBAL.exists()
@@ -622,90 +921,6 @@ def service_workdir(name):
 def project_key(workdir):
     """cwd → ~/.claude/projects/<key> 변환 (/와 _ 를 -로). Claude Code 명명 규칙과 일치."""
     return workdir.replace("/", "-").replace("_", "-")
-
-
-# --- 세션별 모델/effort 설정 (~/.config/claude-models.json) ---
-# claude-service-exec 가 launch 시 읽어 --model/--effort 플래그로 적용.
-# 저장만 하고 자동 restart 안 함 (적용=해당 세션 Restart).
-MODELS_JSON = Path.home() / ".config" / "claude-models.json"
-MODEL_CHOICES = [("Opus 4.8", "claude-opus-4-8"), ("Sonnet 4.6", "claude-sonnet-4-6"),
-                 ("Haiku 4.5", "claude-haiku-4-5-20251001"), ("Fable 5", "claude-fable-5")]
-EFFORT_CHOICES = ["low", "mid", "high", "xhigh", "max"]  # mid 는 저장 시 medium 으로 매핑 (CLI 지원: low/medium/high/xhigh/max)
-
-
-def load_models():
-    try:
-        d = json.loads(MODELS_JSON.read_text())
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_models(cfg):
-    MODELS_JSON.parent.mkdir(parents=True, exist_ok=True)
-    tmp = MODELS_JSON.with_name(MODELS_JSON.name + ".tmp")
-    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
-    tmp.replace(MODELS_JSON)
-
-
-def session_proj_key(name):
-    wd = service_workdir(name)
-    return project_key(wd) if wd else None
-
-
-def actual_model(name):
-    """실행 중 프로세스의 --model 플래그 우선(실시간), 없으면 jsonl tail (재시작 직후 stale 가능)."""
-    try:
-        pid = subprocess.check_output(
-            ["systemctl", "--user", "show", f"claude-{name}.service", "-p", "MainPID", "--value"],
-            text=True, timeout=3,
-        ).strip()
-        if pid and pid != "0":
-            cmd = open(f"/proc/{pid}/cmdline", "rb").read().decode(errors="ignore").replace("\0", " ")
-            m = re.search(r"--model\s+(\S+)", cmd)
-            if m:
-                return m.group(1)
-    except Exception:
-        pass
-    try:
-        wd = service_workdir(name)
-        if not wd:
-            return "?"
-        proj = Path.home() / ".claude" / "projects" / project_key(wd)
-        jsonls = sorted(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not jsonls:
-            return "-"
-        size = jsonls[0].stat().st_size
-        with open(jsonls[0], "rb") as f:
-            f.seek(max(0, size - 65536))
-            tail = f.read().decode(errors="ignore")
-        ms = [m for m in re.findall(r'"model":"([^"]+)"', tail) if m != "<synthetic>"]
-        return ms[-1] if ms else "-"
-    except Exception:
-        return "?"
-
-
-def model_menu_text():
-    cfg = load_models()
-    lines = ["🧠 세션별 모델/effort", ""]
-    for name in list_sessions():
-        key = session_proj_key(name)
-        e = cfg.get(key, {}) if key else {}
-        setting = f"{e.get('model', '-')}/{e.get('effort', '-')}" if e else "(미설정)"
-        lines.append(f"{name}\n  실제: {actual_model(name)} | 설정: {setting}")
-    lines.append("")
-    lines.append("저장만 됨 — 적용하려면 해당 세션 Restart 필요.")
-    return "\n".join(lines)
-
-
-def model_menu_markup():
-    sessions = list_sessions()
-    rows = []
-    for i in range(0, len(sessions), 2):
-        rows.append([{"text": n, "callback_data": f"model_s:{n}"} for n in sessions[i:i + 2]])
-    rows.append([{"text": "🌐 전체 동시 설정", "callback_data": "model_s:*"}])
-    rows.append([{"text": "⬅ Back", "callback_data": "menu:main"}])
-    return {"inline_keyboard": rows}
 
 
 def read_recent(name, max_turns=6, max_chars=3000):
@@ -934,7 +1149,10 @@ def session_menu_markup(action):
 
 def session_action_markup(name):
     """세션별 재구동/전원. 재시작·rotate·끄기는 확인다이얼로그 거침(소프트 경로는 2026-07-07 폐기).
-    켜기는 되돌리기 쉬워서(그냥 다시 뜨는 것) 확인 없이 즉시 실행."""
+    켜기는 되돌리기 쉬워서(그냥 다시 뜨는 것) 확인 없이 즉시 실행.
+
+    여기만 한 줄에 하나다 — 위 원칙 ⑵. 끄기 옆에 켜기가 붙어 있으면 손가락이 한 칸
+    미끄러진 것만으로 돌던 세션이 꺼진다."""
     return {"inline_keyboard": [
         [{"text": "⚡ 하드 재시작(확인)", "callback_data": f"confirm:restart:{name}"}],
         [{"text": "⚠️ 강제 rotate(확인)", "callback_data": f"confirm:forcerotate:{name}"}],
@@ -953,22 +1171,170 @@ def confirm_markup(action_data, label):
 
 
 def show_main(chat_id, message_id=None):
-    text = "Claude Session Control\n\n선택해주세요."
+    text = with_account("Claude Session Control\n\n선택해주세요.")
     if message_id:
         api("editMessageText", chat_id=chat_id, message_id=message_id, text=text, reply_markup=main_menu_markup())
     else:
         api("sendMessage", chat_id=chat_id, text=text, reply_markup=main_menu_markup())
 
 
-def send_result_and_menu(chat_id, text):
-    """실행 결과 텍스트 + 메인 메뉴 한꺼번에 전송"""
-    api("sendMessage", chat_id=chat_id, text=text[:3500], reply_markup=main_menu_markup())
+def send_result_and_menu(chat_id, text, mono=False):
+    """실행 결과 텍스트 + 메인 메뉴 한꺼번에 전송.
+
+    mono 를 켜면 고정폭 블록으로 감싼다. 텔레그램은 평문을 비례 폰트로 그려서 글자마다
+    폭이 다르다 — 막대나 표처럼 칸을 맞춰 쓴 글은 줄마다 끝이 어긋나 못 읽는다.
+    백틱 세 개만 적는 것으로는 안 된다. parse_mode 를 같이 넘겨야 텔레그램이 그걸
+    블록으로 읽고, 안 넘기면 백틱이 그대로 글자로 보인다.
+    """
+    body = text[:3500]
+    extra = {}
+    # 계정 줄은 고정폭 블록 밖에 둔다 — 안에 넣으면 막대·표와 같은 칸에 묶여서
+    # 줄바꿈이 어긋나고, 블록이 길면 그 줄이 잘려 나간다.
+    tail = "\n\n" + html.escape(account_line()) if mono else ""
+    if mono:
+        body = "<pre>{}</pre>".format(html.escape(body)) + tail
+        extra["parse_mode"] = "HTML"
+    else:
+        body = with_account(body)
+    api("sendMessage", chat_id=chat_id, text=body,
+        reply_markup=main_menu_markup(), **extra)
+
+
+# 버튼마다의 짧은 이름. 누른 즉시 띄우는 알림과 "하는 중" 한 줄에 같이 쓴다.
+# 긴 앞가지부터 보도록 쓸 때 정렬한다 — "acct:auto" 가 "acct:autogo" 를 먼저
+# 집어삼키면 자동 고르기가 엉뚱한 이름으로 뜬다.
+_ACTION_LABELS = tuple(sorted((
+    ("list", "세션 목록"),
+    ("status", "한도 보기"),
+    ("resources", "자원 보기"),
+    ("usage", "계정 사용량"),
+    ("restart-all", "모든 세션 재시작"),
+    ("confirm:restart-all", "모든 세션 재시작 확인"),
+    ("confirm:restart:", "재시작 확인"),
+    ("confirm:forcerotate:", "강제 rotate 확인"),
+    ("confirm:stop:", "세션 끄기 확인"),
+    ("restart:", "세션 재시작"),
+    ("forcerotate:", "강제 rotate"),
+    ("stop:", "세션 끄기"),
+    ("start:", "세션 켜기"),
+    ("sess:", "세션 메뉴"),
+    ("recent:", "최근 대화"),
+    ("menu:main", "메인 메뉴"),
+    ("menu:restart", "재시작할 세션 목록"),
+    ("menu:recent", "최근 대화 볼 세션 목록"),
+    ("menu:bypass", "한도 우회 메뉴"),
+    ("bypass-toggle:", "한도 우회 바꾸기"),
+    ("acct:menu", "계정 메뉴"),
+    ("acct:pick:", "계정 고르기"),
+    ("acct:go:", "계정 갈아끼우기"),
+    ("acct:autogo", "계정 자동 고르기"),
+    ("acct:auto", "계정 자동 고르기"),
+    ("nudge:menu", "넛지 메뉴"),
+    ("nudge:s:", "넛지 세션"),
+    ("nudge:on:", "넛지 켜기"),
+    ("nudge:offc:", "넛지 끄기 확인"),
+    ("nudge:off:", "넛지 끄기"),
+    ("relogin-confirm", "재로그인 확인"),
+    ("relogin", "재로그인"),
+), key=lambda kv: -len(kv[0])))
+
+
+def action_label(data):
+    for prefix, label in _ACTION_LABELS:
+        if data.startswith(prefix):
+            return label
+    return "요청"
+
+
+class Progress:
+    """느린 버튼에만 "하는 중" 한 줄을 띄우고, 끝나면 그 줄을 지운다.
+
+    누른 즉시 뜨는 알림은 몇 초 뒤 사라져서 "눌렸고 지금 기다리는 중" 을 화면에
+    남기지 못한다. 그렇다고 버튼마다 한 줄을 띄우면 바로 끝나는 버튼에서 글이
+    번쩍이기만 한다. 그래서 시계를 두고 DELAY 초를 넘긴 동작에만 띄운다.
+    """
+
+    DELAY = 1.5
+
+    def __init__(self, chat_id, label):
+        self.chat_id = chat_id
+        self.label = label
+        self.lock = threading.Lock()
+        self.done = False
+        self.message_id = None
+        self.timer = None
+
+    def start(self):
+        if not self.chat_id:
+            return
+        self.timer = threading.Timer(self.DELAY, self._fire)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def _send(self):
+        r = api("sendMessage", chat_id=self.chat_id,
+                text=f"⏳ {self.label} — 하는 중…")
+        res = r.get("result") if isinstance(r, dict) else None
+        return res.get("message_id") if isinstance(res, dict) else None
+
+    def _delete(self, mid):
+        api("deleteMessage", chat_id=self.chat_id, message_id=mid)
+
+    def _fire(self):
+        with self.lock:
+            if self.done:
+                return
+        mid = self._send()
+        stale = False
+        with self.lock:
+            if self.done:
+                stale = True
+            else:
+                self.message_id = mid
+        # 보내는 사이에 동작이 끝났으면 그 줄을 그대로 두지 않는다.
+        if stale and mid:
+            self._delete(mid)
+
+    def stop(self):
+        with self.lock:
+            self.done = True
+            mid = self.message_id
+            self.message_id = None
+        if self.timer is not None:
+            self.timer.cancel()
+        if mid:
+            self._delete(mid)
+
+
+def ack_press(cb, waiting):
+    """버튼이 눌린 것을 그 자리에서 알린다. 누를 자격이 있으면 True.
+
+    getUpdates 루프에서 부른다 — 실제 동작은 일꾼 스레드가 하므로, 몇 분 걸리는
+    동작이 도는 중에 누른 것도 바로 답이 간다. 전에는 한 스레드가 받기와 처리를
+    같이 해서, 긴 동작 중에 누르면 그 동작이 끝날 때까지 아무 답도 못 갔다 —
+    운영자가 "눌린 건지 안 눌린 건지 모르겠다" 고 한 자리가 이것이다.
+    """
+    user_id = cb.get("from", {}).get("id", 0)
+    if user_id != ALLOWED_USER:
+        api("answerCallbackQuery", callback_query_id=cb["id"], text="unauthorized")
+        return False
+    # 누른 사실 자체를 남긴다. 2026-11-11 13:26·13:31 에 계정이 두 번 갈렸는데 그게
+    # 사람이 누른 것인지 저절로 된 것인지 가릴 자리가 없었다 — 이 로그는 오류만 적고
+    # 누름은 한 줄도 안 적고 있어서, 누름이 없는 것을 "사람이 아무것도 안 했다" 로
+    # 잘못 읽었다. 받은 자리에서 적으므로 일꾼이 끝내 못 돌아도 남는다.
+    log(f"[누름] {cb.get('data', '')}")
+    label = action_label(cb.get("data", ""))
+    if waiting > 0:
+        text = f"⏳ 받았다 — 앞의 {waiting}건이 끝나면 {label}"
+    else:
+        text = f"⏳ 받았다 — {label}"
+    api("answerCallbackQuery", callback_query_id=cb["id"], text=text)
+    return True
 
 
 def handle_callback(cb):
     user_id = cb.get("from", {}).get("id", 0)
     if user_id != ALLOWED_USER:
-        api("answerCallbackQuery", callback_query_id=cb["id"], text="unauthorized")
         return
 
     data = cb.get("data", "")
@@ -976,17 +1342,22 @@ def handle_callback(cb):
     chat_id = msg.get("chat", {}).get("id")
     message_id = msg.get("message_id")
 
-    api("answerCallbackQuery", callback_query_id=cb["id"])
-
     if data == "list":
         out = run_cs("list")
-        send_result_and_menu(chat_id, f"```\n{out}\n```")
+        send_result_and_menu(chat_id, out, mono=True)
     elif data == "status":
         out = read_statusline()
         send_result_and_menu(chat_id, out)
     elif data == "resources":
         out = read_resources()
         send_result_and_menu(chat_id, out)
+    elif data == "usage":
+        # 기다리는 줄 알게 하는 한 줄은 Progress 가 띄우고 끝나면 지운다 —
+        # 여기서 따로 보내면 같은 말이 두 줄로 남는다.
+        # 고정폭으로 감싸지 않는다. 저쪽이 막대 없는 글을 보내므로 맞출 칸이
+        # 없고, 텔레그램 고정폭 글꼴은 한글 폭이 라틴의 정확히 두 배가 아니라
+        # 감쌀수록 줄이 어긋나 보인다(운영자 지시).
+        send_result_and_menu(chat_id, read_usage())
     elif data == "restart-all":
         out = restart_all_active_only()
         send_result_and_menu(chat_id, f"restart-all:\n{out}")
@@ -1009,17 +1380,73 @@ def handle_callback(cb):
         show_main(chat_id, message_id)
     elif data == "menu:restart":
         api("editMessageText", chat_id=chat_id, message_id=message_id,
-            text="Restart할 세션 선택:", reply_markup=session_menu_markup("restart"))
+            text=with_account("Restart할 세션 선택:"),
+            reply_markup=session_menu_markup("restart"))
     elif data == "menu:recent":
         api("editMessageText", chat_id=chat_id, message_id=message_id,
-            text="최신 대화 볼 세션 선택:", reply_markup=session_menu_markup("recent"))
-    elif data == "menu:model" or data.startswith(("model_s:", "model_m:", "model_e:")):
-        # 모델 선택 기능 비활성화 (2026-07-03, 사용자 요청). 세션 모델은 관리자가 claude-models.json
-        # 으로 직접 관리(현재 전 세션 claude-sonnet-5 고정). 스테일 버튼이 설정 덮어쓰지 못하도록
-        # write 경로(model_m/model_e) 포함 전부 무력화.
+            text=with_account("최신 대화 볼 세션 선택:"),
+            reply_markup=session_menu_markup("recent"))
+    elif data == "acct:menu":
+        cur = account_current()
         api("editMessageText", chat_id=chat_id, message_id=message_id,
-            text="🧠 모델 선택 기능은 꺼져 있어요.\n세션 모델은 관리자가 직접 설정합니다 (현재 전 세션 claude-sonnet-5).",
-            reply_markup=main_menu_markup())
+            text=account_menu_text(cur), reply_markup=account_menu_markup(cur))
+    elif data.startswith("acct:pick:"):
+        name = data[len("acct:pick:"):]
+        cur = account_current()
+        if name == cur:
+            api("editMessageText", chat_id=chat_id, message_id=message_id,
+                text=account_menu_text(cur, note=f"{name} 은 이미 쓰고 있다."),
+                reply_markup=account_menu_markup(cur))
+        elif account_plan(name) is None:
+            api("editMessageText", chat_id=chat_id, message_id=message_id,
+                text=account_menu_text(cur, note=f"{name} 은 그 홈에 로그인이 안 돼 있다. "
+                                                 "새로 로그인을 먼저 한다."),
+                reply_markup=account_menu_markup(cur))
+        else:
+            # 지금 쓰는 이름을 모르면 떠나는 자격을 돌려놓을 데가 없다. 그 계정의
+            # 갱신분이 어느 홈에도 안 남으므로, 그 계정으로 다시 가려면 새로 로그인해야
+            # 할 수 있다. 누르기 전에 그 값을 적어 둔다.
+            warn = ("" if cur else
+                    "\n지금 쓰는 계정 이름을 모른다 — 그 자격은 어느 홈에도 안 돌려놓는다.")
+            api("editMessageText", chat_id=chat_id, message_id=message_id,
+                text=f"👤 {name} ({account_plan(name)}) 로 갈아 끼운다.\n"
+                     f"지금: {cur or '모름'}\n"
+                     "이 기계의 세션 전부가 다음 요청부터 그 계정 한도를 쓴다."
+                     f"{warn}\n\n확실합니까?",
+                reply_markup=confirm_markup(f"acct:go:{name}", f"{name} 로"))
+    elif data.startswith("acct:go:"):
+        name = data[len("acct:go:"):]
+        out = run_accounts("--use", name)
+        if out.startswith(("[error", "[timeout", "[exception")):
+            send_result_and_menu(chat_id, f"⚠️ {name} 로 갈아 끼우지 못했다.\n{out}")
+        else:
+            now = account_current()
+            send_result_and_menu(
+                chat_id,
+                f"✅ 계정을 {name} 로 바꿨다 (지금: {now or '모름'}).\n"
+                "세션은 재시작하지 않았다 — 떠 있는 세션이 다음 요청부터 그 계정으로 간다.\n"
+                "상태줄 수치는 그 계정이 한 번 답해야 새로 찍힌다.")
+    elif data == "acct:auto":
+        cur = account_current()
+        api("editMessageText", chat_id=chat_id, message_id=message_id,
+            text="🎲 공용 계정 중에서 여유 있는 것을 스스로 골라 갈아 끼운다.\n"
+                 f"지금: {cur or '모름'}\n"
+                 "고르는 규칙은 밤 전환과 같다 — 저쪽 기계가 쓰는 계정은 빼고, "
+                 "한도 여유가 많은 것부터. 겹치면 비키는 쪽이 비킨다. 공용이 다 "
+                 "막혔으면 개인 계정 중 여유 있는 것으로 간다.\n"
+                 "후보마다 한도를 재느라 몇 분 걸릴 수 있다.\n\n확실합니까?",
+            reply_markup=confirm_markup("acct:autogo", "자동으로"))
+    elif data == "acct:autogo":
+        # 사람에게 가는 알림은 끈다 — 이 버튼을 누른 사람이 바로 아래에서 결과를 본다.
+        out = run_night_switch("--apply", "--no-alert")
+        if out.startswith(("[error", "[timeout", "[exception")):
+            send_result_and_menu(chat_id, f"⚠️ 자동으로 고르지 못했다.\n{out}")
+        else:
+            now = account_current()
+            send_result_and_menu(
+                chat_id,
+                f"✅ 자동으로 골랐다 (지금: {now or '모름'}).\n\n{out}\n\n"
+                "세션은 재시작하지 않았다 — 떠 있는 세션이 다음 요청부터 그 계정으로 간다.")
     elif data == "relogin-confirm":
         if _RELAY.is_active():
             send_result_and_menu(chat_id, "이미 진행 중인 로그인이 있어요. 끝난 뒤 다시.")
@@ -1035,7 +1462,7 @@ def handle_callback(cb):
             start_relay(chat_id)
     elif data == "menu:bypass":
         api("editMessageText", chat_id=chat_id, message_id=message_id,
-            text=bypass_menu_text(), reply_markup=bypass_menu_markup())
+            text=with_account(bypass_menu_text()), reply_markup=bypass_menu_markup())
     elif data.startswith("bypass-toggle:"):
         target = data[len("bypass-toggle:"):]
         BYPASS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1053,10 +1480,10 @@ def handle_callback(cb):
                 else:
                     flag.touch()
         api("editMessageText", chat_id=chat_id, message_id=message_id,
-            text=bypass_menu_text(), reply_markup=bypass_menu_markup())
+            text=with_account(bypass_menu_text()), reply_markup=bypass_menu_markup())
     elif data == "nudge:menu":
         api("editMessageText", chat_id=chat_id, message_id=message_id,
-            text=nudge_menu_text(), reply_markup=nudge_menu_markup())
+            text=with_account(nudge_menu_text()), reply_markup=nudge_menu_markup())
     elif data.startswith("nudge:s:"):
         name = data[len("nudge:s:"):]
         on, remain, susp = nudge_state(name)
@@ -1089,7 +1516,7 @@ def handle_callback(cb):
         else:
             note = f"🟢 {name} {hours}시간 넛지 시작."
         api("editMessageText", chat_id=chat_id, message_id=message_id,
-            text=nudge_menu_text(note), reply_markup=nudge_menu_markup())
+            text=with_account(nudge_menu_text(note)), reply_markup=nudge_menu_markup())
     elif data.startswith("nudge:offc:"):
         name = data[len("nudge:offc:"):]
         api("editMessageText", chat_id=chat_id, message_id=message_id,
@@ -1102,7 +1529,7 @@ def handle_callback(cb):
         rc, out = run_nudge("--stop", name)
         note = f"⚪ {name} 넛지 중지." if rc == 0 else f"⚠️ {name} 끄기 실패 rc={rc}\n{out}"
         api("editMessageText", chat_id=chat_id, message_id=message_id,
-            text=nudge_menu_text(note), reply_markup=nudge_menu_markup())
+            text=with_account(nudge_menu_text(note)), reply_markup=nudge_menu_markup())
     elif data.startswith("recent:"):
         name = data[len("recent:"):]
         out = read_recent(name)
@@ -1190,9 +1617,15 @@ def handle_message(msg):
     elif text == "/resources":
         out = read_resources()
         send_result_and_menu(chat_id, out)
+    elif text == "/usage":
+        api("sendMessage", chat_id=chat_id, text="계정 사용량을 재는 중…")
+        # 고정폭으로 감싸지 않는다. 저쪽이 막대 없는 글을 보내므로 맞출 칸이
+        # 없고, 텔레그램 고정폭 글꼴은 한글 폭이 라틴의 정확히 두 배가 아니라
+        # 감쌀수록 줄이 어긋나 보인다(운영자 지시).
+        send_result_and_menu(chat_id, read_usage())
     elif text == "/list":
         out = run_cs("list")
-        send_result_and_menu(chat_id, f"```\n{out}\n```")
+        send_result_and_menu(chat_id, out, mono=True)
     elif text == "/restart_all":
         out = run_cs("restart-all", timeout=60)
         send_result_and_menu(chat_id, f"restart-all:\n{out}")
@@ -1222,9 +1655,66 @@ def setup_commands():
     api("setMyCommands", commands=commands)
 
 
+_WORK_BUSY = threading.Event()
+
+
+def _message_label(msg):
+    """메시지에 붙일 짧은 이름. 본문을 그대로 쓰지 않는다 —
+    재로그인 코드가 이 통로로 들어오므로 글자를 되비치면 채팅에 남는다."""
+    text = (msg.get("text") or "").strip()
+    return text.split()[0][:32] if text.startswith("/") else "입력"
+
+
+def worker(q):
+    """버튼·메시지를 하나씩 처리한다. 받는 쪽(getUpdates)과 나뉘어 있어서
+    여기서 몇 분이 걸려도 새 버튼에 대한 답은 제때 나간다."""
+    while True:
+        item = q.get()
+        if item is None:
+            return
+        kind, payload = item
+        chat_id = None
+        _WORK_BUSY.set()
+        # 받은 것과 끝낸 것을 따로 적는다. 둘을 맞대야 "결과가 안 왔다" 와 "결과가
+        # 늦게 왔다" 가 갈린다 — 끝 줄이 없으면 그 누름은 처리 중에 사라진 것이다.
+        _started = time.time()
+        _what = (payload.get("data", "") if kind == "cb"
+                 else (payload.get("text") or "")[:40])
+        try:
+            if kind == "cb":
+                chat_id = (payload.get("message") or {}).get("chat", {}).get("id")
+                prog = Progress(chat_id, action_label(payload.get("data", "")))
+            else:
+                chat_id = (payload.get("chat") or {}).get("id")
+                prog = Progress(chat_id, _message_label(payload))
+            prog.start()
+            try:
+                if kind == "cb":
+                    handle_callback(payload)
+                else:
+                    handle_message(payload)
+            finally:
+                prog.stop()
+        except Exception as e:
+            # 조용히 죽으면 운영자 화면에서는 "안 눌린 것" 과 구분이 안 된다.
+            log(f"[worker] {e}")
+            if chat_id:
+                try:
+                    send_result_and_menu(chat_id, f"⚠️ 처리 중 오류: {e}")
+                except Exception as e2:
+                    log(f"[worker-report] {e2}")
+        finally:
+            log(f"[처리끝] {kind} {_what} {time.time() - _started:.1f}초")
+            _WORK_BUSY.clear()
+            q.task_done()
+
+
 def main():
-    print(f"[control-bot] start. allowed_user={ALLOWED_USER}", flush=True)
+    log(f"[control-bot] start. allowed_user={ALLOWED_USER}")
     setup_commands()
+
+    q = queue.Queue()
+    threading.Thread(target=worker, args=(q,), daemon=True).start()
 
     offset = 0
     while True:
@@ -1236,13 +1726,16 @@ def main():
             for upd in r.get("result", []):
                 offset = upd["update_id"] + 1
                 if "callback_query" in upd:
-                    handle_callback(upd["callback_query"])
+                    cb = upd["callback_query"]
+                    waiting = q.qsize() + (1 if _WORK_BUSY.is_set() else 0)
+                    if ack_press(cb, waiting):
+                        q.put(("cb", cb))
                 elif "message" in upd:
-                    handle_message(upd["message"])
+                    q.put(("msg", upd["message"]))
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"[loop] {e}", flush=True)
+            log(f"[loop] {e}")
             time.sleep(5)
 
 

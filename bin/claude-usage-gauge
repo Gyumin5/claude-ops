@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""계정별 사용량 글줄을 터미널 막대로 바꾼다.
+
+들어오는 것은 `claude-accounts-usage` 가 내는 글줄이고 나가는 것은 계정마다 세 줄이다 —
+이름 한 줄, 다섯 시간 한 줄, 7일 한 줄. 알아보지 못한 줄은 손대지 않고 그대로 내보낸다.
+
+보는 자리는 둘이고 모양이 갈린다. 서버에 붙은 사람의 터미널은 막대를 보고, 컨트롤봇이
+텔레그램으로 옮기는 쪽은 `--no-bar` 로 막대와 칸 맞춤을 같이 뺀 글을 본다 — 텔레그램
+고정폭 글꼴은 한글과 막대 기호의 폭이 라틴 글자의 정확히 두 배가 아니라, 칸을 맞출수록
+줄마다 어긋나 보인다(운영자 지시). 색은 터미널에서만 넣는다(`--color` 또는 화면).
+막대 쪽 라벨만 두 칸짜리 줄임말(5h·1w)이고, 막대 없는 쪽은 "5시간"·"7일" 로 적는다.
+
+텔레그램으로 가는 글은 이 한 자리에서만 만든다. 공용 계정 넷을 재는 저 기계도 같은
+도구를 쓰지만, 컨트롤봇은 저쪽에서 손대지 않은 글줄(raw)을 받아 여기서 그린다 — 양쪽이
+각자 그리면 저 기계의 사본 판본이 뒤처진 날 윗줄과 아랫줄의 서식이 갈린다(운영자 8754).
+
+막대 열 칸, 예순 미만은 초록·여든다섯 미만은 노랑·그 위는 빨강, 남은 시간은 한국 시간으로
+잰다. 7일 한도를 다 쓴 계정은 두 줄 다 가득 찬 것으로 그리고 윗줄에 "한도 소진" 을 적는다 —
+그 계정은 다섯 시간 값이 아예 안 오기 때문이고, 실제 다섯 시간 사용량이 백이라는 뜻이 아니다.
+"""
+
+import argparse
+import os
+import re
+import sys
+import unicodedata
+from datetime import datetime, timedelta, timezone
+
+# 막대 열 칸, 계정 이름은 윗줄로. 텔레그램은 이 글줄을 고정폭 블록으로 그리는데
+# 폰 화면에 들어가는 칸이 마흔 안팎이라, 스무 칸짜리 막대에 이름까지 한 줄에 두면
+# 거기서 접힌다. 접힌 줄은 막대가 두 토막 나서 아예 못 읽는다.
+BAR_WIDTH = 10
+REMAINING_WIDTH = 11
+# 막대 쪽 라벨은 둘 다 두 칸이라 줄이 저절로 맞는다. 한글 라벨("5시간"·"7일")은
+# 글자마다 두 칸을 먹어 줄이 길어지고, 텔레그램 고정폭 글꼴에서 그 폭이 라틴 글자의
+# 정확히 두 배가 아니라 막대가 줄마다 어긋나 보인다(운영자 지적 8475).
+LABEL5, LABEL7 = "5h", "1w"
+# 막대를 안 그리는 쪽은 맞출 칸이 없으므로 줄임말을 쓸 이유도 없다. 운영자가 읽는 글에
+# 임의로 만든 영어 약자를 안 쓴다는 규칙이 여기서 그대로 산다.
+PLAIN5, PLAIN7 = "5시간", "7일"
+# 지금 그 기계가 쓰고 있는 계정의 줄에 붙는 표식. 막대 쪽에서는 수치 뒤에 묻혀 있는데,
+# 이름 줄로 올려 두면 계정 목록에서 바로 보인다.
+MARK = "(지금 이 계정)"
+FILLED, EMPTY = "▰", "▱"
+KST = timezone(timedelta(hours=9))
+
+LINE_PATTERN = re.compile(
+    # 괄호 안에 또 괄호가 있다 — "(11-07(토) 04:00 초기화)". 그래서 닫는 괄호를 막는
+    # 글자꼴(`[^)]`)로는 못 읽고, "초기화)" 까지 게으르게 끌어야 한다.
+    r"^\s*(?P<name>\S+)\s+5시간\s+(?P<h5>\d+)%\s*\((?P<r5>.+?)\s*초기화\)"
+    r"\s+7일\s+(?P<h7>\d+)%\s*\((?P<r7>.+?)\s*초기화\)"
+)
+FULL_PATTERN = re.compile(
+    r"^\s*(?P<name>\S+)\s+7일 한도를 다 썼다\s*[—-]\s*(?P<r7>.+?)\s*풀림\s*$"
+)
+# 7일가 거의 다 찬 계정은 다섯 시간 창이 안 열려서 그 칸이 아예 안 온다. 그런 줄은
+# 7일 하나만 그린다 — 없는 칸을 백으로 채우면 쓰지도 않은 양을 쓴 것처럼 보인다.
+ONLY7_PATTERN = re.compile(
+    r"^\s*(?P<name>\S+)\s+7일\s+(?P<h7>\d+)%\s*\((?P<r7>.+?)\s*초기화\)"
+)
+HIDDEN = (re.compile(r"^계정별 사용량"), re.compile(r"^방금 쟀다\s*$"))
+# 수치가 없는 계정의 줄("로그인 안 함"·"수치 없음 — …"·"읽기 실패 — …")도 같은 모양으로
+# 접는다 — 이름 한 줄, 까닭 한 줄. 안 접으면 수치가 있는 계정만 두 줄이고 없는 계정은
+# 긴 한 줄이라, 한 화면 안에서 두 가지 서식이 섞인다. 칸 맞춤으로 벌어진 두 칸 이상의
+# 사이를 가르는 자리로 쓴다 — 에러 글귀는 그런 사이가 없어서 안 걸린다.
+STATE_PATTERN = re.compile(r"^\s*(?P<name>\S+)\s{2,}(?P<rest>\S.*?)\s*$")
+# 그 수치를 언제 쟀나. 방금 잰 것은 안 적고 묵은 것만 이름 줄에 올린다 — 재기가 실패한
+# 회차는 옛 값이 그대로 나오는데, 아무 표시가 없으면 지금 값으로 읽힌다.
+AGE_PATTERN = re.compile(r"(?:^|\s)(?P<age>방금|\d+분 전|\d+시간 \d+분 전|갱신 시각 없음) 값")
+RESET_PATTERN = re.compile(
+    r"^(?:(?P<mon>\d{1,2})-(?P<day>\d{1,2})(?:\([^)]*\))?\s+)?(?P<hh>\d{1,2}):(?P<mm>\d{2})$"
+)
+
+
+def width(text):
+    """터미널에서 차지하는 칸 수. 한글·한자는 두 칸이다."""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def rpad(text, cells):
+    """오른쪽에 붙이되 칸 수로 센다. 글자 수로 세면 한글이 섞인 줄이 어긋난다."""
+    return " " * max(0, cells - width(text)) + text
+
+
+def level_color(pct):
+    """예순 미만 초록, 여든다섯 미만 노랑, 그 위 빨강."""
+    if pct < 60:
+        return "46;160;67"
+    if pct < 85:
+        return "210;153;34"
+    return "203;36;49"
+
+
+def bar(pct, color=True):
+    # 반 칸은 올린다. 파이썬 round 는 반올림 자리에서 짝수로 붙어서, 열 칸에서는
+    # 45% 가 넉 칸이고 55% 가 여섯 칸이 된다 — 보는 사람에게는 같은 반인데 다르게 보인다.
+    filled = max(0, min(BAR_WIDTH, int(pct * BAR_WIDTH / 100 + 0.5)))
+    body = FILLED * filled + EMPTY * (BAR_WIDTH - filled)
+    if not color:
+        return body
+    return "\033[38;2;{}m{}\033[0m".format(level_color(pct), body)
+
+
+def parse_reset(text, now):
+    """초기화 시각 글귀를 앞날의 시각으로 읽는다. 못 읽으면 None."""
+    m = RESET_PATTERN.match(text.strip())
+    if not m:
+        return None
+    hh, mm = int(m.group("hh")), int(m.group("mm"))
+    if m.group("mon"):
+        mon, day = int(m.group("mon")), int(m.group("day"))
+        for year in (now.year, now.year + 1):
+            try:
+                when = datetime(year, mon, day, hh, mm, tzinfo=KST)
+            except ValueError:
+                return None
+            if when >= now:
+                return when
+        return None
+    when = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if when < now:
+        when += timedelta(days=1)
+    return when
+
+
+def remaining(when, now):
+    """남은 시간을 사람이 읽는 말로. 하루가 넘으면 날과 시간, 아니면 시간과 분."""
+    if when is None:
+        return "시각 모름"
+    left = when - now
+    total = int(left.total_seconds())
+    if total <= 0:
+        return "곧"
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return "{}일 {}시간".format(days, hours) if hours else "{}일".format(days)
+    if hours:
+        return "{}시간 {}분".format(hours, minutes) if minutes else "{}시간".format(hours)
+    return "{}분".format(minutes) if minutes else "곧"
+
+
+def row(label, pct, tail, color=True):
+    return " {} {:>3}% {}  {}".format(label, pct, bar(pct, color), tail)
+
+
+def plain_row(label, pct, tail):
+    """막대 없는 한 줄. 칸을 안 맞추므로 비례 글꼴에서도 그대로 읽힌다."""
+    return "{} {}% · {}".format(label, pct, tail)
+
+
+def name_line(name, line):
+    """계정 이름 줄. 지금 쓰는 계정인지와 묵은 값인지를 같이 올린다."""
+    notes = []
+    age = AGE_PATTERN.search(line)
+    if age and age.group("age") != "방금":
+        notes.append("({} 값)".format(age.group("age")))
+    if MARK in line:
+        notes.append(MARK)
+    return " ".join([name] + notes)
+
+
+def render(text, now=None, color=True, bars=True):
+    """글줄 덩어리를 막대로 바꾼다. 알아보지 못한 줄은 그대로 돌려준다.
+
+    `bars=False` 는 막대와 칸 맞춤을 같이 뺀다. 둘은 한 벌이다 — 막대를 그리려면
+    줄머리를 칸 단위로 맞춰야 하고, 맞춘 줄은 비례 글꼴에서 오히려 어긋나 보인다.
+    텔레그램으로 가는 쪽이 이 갈래를 쓴다(운영자 지시).
+    """
+    now = now or datetime.now(KST)
+    out, first = [], True
+    for line in text.splitlines():
+        if any(p.match(line) for p in HIDDEN):
+            continue
+        m = LINE_PATTERN.match(line)
+        full = None if m else FULL_PATTERN.match(line)
+        only7 = None if (m or full) else ONLY7_PATTERN.match(line)
+        state = None if (m or full or only7) else STATE_PATTERN.match(line)
+        if not m and not full and not only7 and not state:
+            if line.strip():
+                out.append(line)
+            continue
+        if not first:
+            out.append("")
+        first = False
+        if state:
+            # 막대 쪽은 손대지 않는다 — 거기서는 칸 맞춤이 그 줄을 세우는 장치다.
+            if bars:
+                out.append(line.rstrip())
+            else:
+                out.append(name_line(state.group("name"), line))
+                rest = state.group("rest")
+                if MARK in rest:
+                    rest = rest.replace(MARK, "").rstrip()
+                out.append(rest)
+        elif only7:
+            left7 = remaining(parse_reset(only7.group("r7"), now), now)
+            h7 = int(only7.group("h7"))
+            out.append(name_line(only7.group("name"), line))
+            tail = rpad(left7, REMAINING_WIDTH) + " 뒤"
+            out.append(row(LABEL7, h7, tail, color) if bars
+                       else plain_row(PLAIN7, h7, left7 + " 뒤"))
+        elif m:
+            h5, h7 = int(m.group("h5")), int(m.group("h7"))
+            left5 = remaining(parse_reset(m.group("r5"), now), now)
+            left7 = remaining(parse_reset(m.group("r7"), now), now)
+            out.append(name_line(m.group("name"), line))
+            if bars:
+                out.append(row(LABEL5, h5, rpad(left5, REMAINING_WIDTH) + " 뒤", color))
+                out.append(row(LABEL7, h7, rpad(left7, REMAINING_WIDTH) + " 뒤", color))
+            else:
+                out.append(plain_row(PLAIN5, h5, left5 + " 뒤"))
+                out.append(plain_row(PLAIN7, h7, left7 + " 뒤"))
+        else:
+            left7 = remaining(parse_reset(full.group("r7"), now), now)
+            out.append(name_line(full.group("name"), line))
+            if bars:
+                out.append(row(LABEL5, 100, rpad("한도 소진", REMAINING_WIDTH) + "   ", color))
+                out.append(row(LABEL7, 100, rpad(left7, REMAINING_WIDTH) + " 뒤", color))
+            else:
+                # 다섯 시간 줄을 아예 안 낸다 — 그 계정은 그 값이 안 오고, 막대 쪽에서
+                # 백으로 그리는 것은 두 줄을 나란히 세우려는 그림일 뿐이다.
+                out.append("{} 한도 소진 · {} 뒤 풀림".format(PLAIN7, left7))
+    return "\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="계정별 사용량 글줄을 터미널 막대로 바꾼다.")
+    ap.add_argument("--no-color", action="store_true", help="색을 넣지 않는다")
+    ap.add_argument("--color", action="store_true", help="화면이 아니어도 색을 넣는다")
+    ap.add_argument("--no-bar", action="store_true",
+                    help="막대와 칸 맞춤을 빼고 글로만 낸다 (텔레그램 쪽)")
+    args = ap.parse_args()
+    # 막대는 어디서나 그리고 색만 가린다. 컨트롤봇은 이 글줄을 텔레그램으로 그대로
+    # 옮기는데 거기엔 색 제어문자를 그릴 자리가 없어서, 화면이 아니면 글자만 보낸다.
+    color = (not args.no_color and os.environ.get("NO_COLOR") is None
+             and (args.color or sys.stdout.isatty()))
+    text = sys.stdin.read()
+    if not text.strip():
+        return 1
+    print(render(text, color=color, bars=not args.no_bar))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

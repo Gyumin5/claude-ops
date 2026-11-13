@@ -1,0 +1,8 @@
+[Unit]
+Description=home infra watch (codex version floor, todo-rearm timer liveness)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/home-infra-watch
+# codex-ask --which 는 codex 를 한 번 띄우고(로컬 40s 상한), 둘째 기계 ssh 조회가 하나 더 붙는다.
+TimeoutStartSec=180

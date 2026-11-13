@@ -5,12 +5,19 @@
 # 실행: systemd timer (3/6/9/12월) 또는 수동. 출력: ~/.claude/state/config-review/YYYY-MM-DD.md
 
 set -uo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/operator_chat.sh"   # 방 번호 단일 출처
 
 OUTDIR="$HOME/.claude/state/config-review"
 mkdir -p "$OUTDIR"
 TODAY=$(date '+%Y-%m-%d')
 OUT="$OUTDIR/${TODAY}.md"
 HOST=$(hostname -s)
+
+# 훅 목록 대조용 임시 파일. /tmp 에 고정 이름을 쓰면 같은 기계의 다른 사용자와
+# 부딪히므로 mktemp 로 잡고 끝날 때 지운다.
+TMP_HOOKS_HERE="$(mktemp "${TMPDIR:-/tmp}/ccr-here-XXXXXX")"
+TMP_HOOKS_PEER="$(mktemp "${TMPDIR:-/tmp}/ccr-peer-XXXXXX")"
+trap 'rm -f "$TMP_HOOKS_HERE" "$TMP_HOOKS_PEER"' EXIT
 
 {
 echo "# 설정 리뷰 리포트 ${TODAY} (${HOST})"
@@ -92,14 +99,32 @@ else
 fi
 echo
 
-echo "## 5. 머신 간 훅 drift (home vs peer, best-effort)"
-if ssh -o BatchMode=yes -o ConnectTimeout=6 peer 'ls -1 ~/.claude/hooks/*.sh 2>/dev/null | xargs -n1 basename' > /tmp/peer-hooks.txt 2>/dev/null; then
-    ls -1 "$HOME/.claude/hooks/"*.sh 2>/dev/null | xargs -n1 basename > /tmp/home-hooks.txt
-    d=$(diff /tmp/home-hooks.txt /tmp/peer-hooks.txt 2>/dev/null)
-    if [ -z "$d" ]; then echo "- 동일 (drift 없음)"; else echo "- 차이 발견:"; echo "$d" | sed 's/^/  /'; fi
-    rm -f /tmp/peer-hooks.txt /tmp/home-hooks.txt
+# 맞출 상대 기계는 설정에서 읽는다. 이름을 코드에 박으면 그 이름이 없는 기계에서
+# 이 칸이 매번 "접속 불가" 로 뜨고, 사람이 그걸 고장으로 읽는다. 한 줄에 하나씩,
+# ssh 로 닿는 이름(설정의 Host 별칭이어도 된다)을 적는다.
+#   printf '%s\n' other-machine > ~/.config/claude-peers
+PEERS_FILE="${CLAUDE_PEERS_FILE:-$HOME/.config/claude-peers}"
+echo "## 5. 머신 간 훅 drift (best-effort)"
+if [ ! -s "$PEERS_FILE" ]; then
+    echo "- 맞출 상대가 없다 ($PEERS_FILE 가 비어 있다 — 한 대만 쓰면 정상)"
 else
-    echo "- peer 접속 불가 (스킵)"
+    ls -1 "$HOME/.claude/hooks/"*.sh 2>/dev/null | xargs -n1 basename > "$TMP_HOOKS_HERE"
+    while IFS= read -r peer; do
+        [ -z "$peer" ] && continue
+        case "$peer" in \#*) continue ;; esac
+        if ssh -o BatchMode=yes -o ConnectTimeout=6 "$peer" \
+               'ls -1 ~/.claude/hooks/*.sh 2>/dev/null | xargs -n1 basename' \
+               > "$TMP_HOOKS_PEER" 2>/dev/null; then
+            d=$(diff "$TMP_HOOKS_HERE" "$TMP_HOOKS_PEER" 2>/dev/null)
+            if [ -z "$d" ]; then
+                echo "- $peer: 동일 (drift 없음)"
+            else
+                echo "- $peer: 차이 발견:"; echo "$d" | sed 's/^/  /'
+            fi
+        else
+            echo "- $peer: 접속 불가 (스킵)"
+        fi
+    done < "$PEERS_FILE"
 fi
 echo
 
@@ -156,10 +181,11 @@ echo "리포트 생성: $OUT ($(wc -l < "$OUT")줄)"
 ENV_FILE="$HOME/dotfiles/.claude/telegram/.env"
 if [ -f "$ENV_FILE" ] && [ "${CONFIG_REVIEW_NO_NOTIFY:-0}" != "1" ]; then
     . "$ENV_FILE"
-    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+    CHAT_ID="$(operator_chat_id)" || CHAT_ID=""
+    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "$CHAT_ID" ]; then
         head60=$(head -c 3000 "$OUT")
         curl -s -m 10 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID:-}" \
+            --data-urlencode "chat_id=$CHAT_ID" \
             --data-urlencode "text=[분기 설정 리뷰] ${TODAY} (${HOST}) 리포트 생성됨.
 경로: ${OUT}
 요약(앞부분):

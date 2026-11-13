@@ -1,7 +1,7 @@
 #!/bin/bash
 # progress-backup: PostToolUse 훅. progress.md / handoff.md 의 권위 사본을 저장소 밖에 둔다.
 #
-# 계기 (2026-08-07 proj-b-wt/lidar 실사고):
+# 계기 (2026-08-07 raise-wt/lidar 실사고):
 #   progress.md 가 lidar 브랜치에선 .gitignore 대상인데 fusion 브랜치에선 추적 파일이었다.
 #   git 은 추적 안 되는 파일은 checkout 때 덮어쓰기를 거부하지만 ★무시된 파일은 조용히 덮어쓴다.
 #   `git checkout -b <새브랜치> <fusion커밋>` 한 방에 progress.md 가 사라졌다. rc 0, 경고 없음,

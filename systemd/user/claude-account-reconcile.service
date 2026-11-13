@@ -1,0 +1,13 @@
+[Unit]
+Description=Claude 계정 구간 맞추기 (지금이 밤인가 낮인가, 지금 계정이 맞나)
+
+[Service]
+Type=oneshot
+Environment="PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=%h/dotfiles/bin/claude-account-timed-switch now
+# 건강한 회차는 1초 아래다 — 표식과 수치 파일만 읽는다. 어긋난 회차만 계정을 띄워
+# 재는데(최대 240초) 저쪽에 두 번 묻고(각 40초) 갈아 끼우기가 두 번까지(각 120초)
+# 붙을 수 있다. 그 최악보다 넉넉히 둔다.
+TimeoutStartSec=700
+StandardOutput=append:%h/.claude/logs/account-timed-switch.log
+StandardError=append:%h/.claude/logs/account-timed-switch.log

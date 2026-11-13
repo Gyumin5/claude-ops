@@ -1,0 +1,10 @@
+[Unit]
+Description=Claude Nudge Audit Timer (30분마다)
+
+[Timer]
+OnBootSec=12min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

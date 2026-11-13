@@ -1,0 +1,833 @@
+#!/usr/bin/env python3
+"""밤에 쓸 공용 계정을 그 자리에서 재서 고른다.
+
+왜 미리 박아 두지 않나: 공용 계정은 우리 말고도 쓰는 사람이 있어 밤 사이 얼마가 남을지를
+어제 알 수 없다. 그래서 고르는 시점에 재고, 남은 것 중 여유가 가장 많은 것을 쓴다.
+
+왜 캐시를 안 쓰나: 계정 자리의 수치 파일은 그 계정으로 세션이 돌 때만 갱신된다. 안 쓰는
+계정은 며칠 전 값을 들고 있어서(11-09 실측 64~66시간) 그대로 고르면 이미 다 쓴 계정을
+여유 있다고 읽는다. 그래서 claude-accounts --usage-json 으로 그 자리에서 띄워 잰다.
+
+왜 저쪽 기계가 쓰는 계정을 빼나: 두 기계가 각자 재서 고르면 같은 계정을 집을 수 있고,
+그러면 한쪽이 한도를 치는 순간 둘이 같이 막힌다.
+
+  claude-account-night-switch --now --apply   # 지금 시각으로 판정해 어긋난 것만 고친다
+  claude-account-night-switch                 # 밤 후보를 재서 고르기만 하고 안 바꾼다
+  claude-account-night-switch --apply         # 골라서 갈아 끼운다
+  claude-account-night-switch --day --apply   # 아침 복귀 (개인이 막혀 있으면 안 간다)
+  claude-account-night-switch --json          # 결과와 근거를 기계가 읽는 꼴로
+
+평소에 부르는 것은 맨 위 하나다. 10분마다 불러도 값이 안 든다 — 건강한 회차는 계정을
+안 띄우고 표식과 수치 파일만 읽는다. 띄워 재는 것은 밤인데 공용이 아니거나, 지금
+공용이 다 찼거나, 낮인데 개인이 아니거나, 저쪽과 같은 계정일 때뿐이다(재는 간격 제한은
+11-13 운영자 지시로 없앴다). 구간을 회차마다 다시 판정하므로 타이머를 놓쳤든 절전에서 깨어났든 같은
+자리로 수렴한다.
+
+공용 후보가 다 막히면 운영자 개인 계정(fallback 줄)을 그때 재서 여유가 가장 많은 것으로
+간다. 공용이 풀리면 다음 회차가 다시 공용으로 옮긴다. 20시 전환·밤중 자동 전환·컨트롤봇
+자동 고르기가 모두 이 고르기를 거치므로 셋에 같이 걸린다.
+
+나는 값(종료코드):
+  0 정상        2 공용 후보도 개인 대체 계정도 다 막혔다 (안 바꿨다)
+  1 설정·실행   3 저쪽과 겹쳤는데 갈 자리가 없다
+  4 갈아 끼우다 실패 — 지금 자격이 불분명하다   7 아침인데 개인이 막혀 복귀를 미뤘다
+
+설정은 ~/.config/claude-usage/night-accounts 다. 한 줄에 하나:
+
+  candidate acct-a     밤에 쓸 후보(공용). 여러 줄.
+  day <개인 계정>      아침에 돌아올 개인 계정. 한 줄.
+  peer 둘째 기계           저쪽 기계의 ssh 대상. 없으면 빼기를 안 한다.
+  yield yes            겹쳤을 때 물러서는 쪽인가. 두 기계 중 한쪽만 yes.
+  fallback <개인 계정> 공용이 다 막혔을 때만 재서 쓰는 개인 계정. 여러 줄.
+
+메인 기계는 없다. 두 기계가 같은 것을 각자 돌리고, 겹쳤을 때만 yes 쪽이 비킨다.
+한쪽이 꺼져 있으면 묻기가 실패하고 켜진 쪽이 혼자 고른다 — 겹칠 상대가 없으니 그게 맞다.
+
+저쪽 세션에는 아무것도 안 넣는다. 주입은 그 세션을 깨우는 일인데 깨우지 않는 것이 이
+일의 전제이고, 한도에 막힌 세션에는 어차피 안 닿는다. 저쪽은 자기 회차에서 ssh 로
+이쪽 계정을 읽어 같은 사실을 안다. 사람에게는 세션을 안 거치는 통로로 알린다
+(claude-operator-alert) — 상태가 바뀔 때만 한 번이다.
+
+이 명령은 타이머를 깔지 않는다. 언제 부를지는 부르는 쪽이 정한다.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONF = Path(os.environ.get("CLAUDE_NIGHT_CONF",
+                           str(Path.home() / ".config" / "claude-usage" / "night-accounts")))
+ACCOUNTS_BIN = os.environ.get("CLAUDE_ACCOUNTS_BIN", "")
+PEER_TIMEOUT = 40
+MEASURE_TIMEOUT = 240
+APPLY_TIMEOUT = 120
+
+# 밤 구간은 20시부터 다음 날 8시까지다. 회차마다 지금이 어느 구간인지를 다시 판정하므로
+# 타이머를 놓쳤든 절전에서 깨어났든 같은 자리로 수렴한다.
+NIGHT_FROM, NIGHT_TO = 20, 8
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    raise SystemExit(code)
+
+
+def accounts_bin():
+    """갈아 끼우는 도구의 자리. 옆에 있는 것을 먼저 본다 — PATH 는 타이머가 안 읽는다."""
+    if ACCOUNTS_BIN:
+        return ACCOUNTS_BIN
+    here = Path(__file__).resolve().parent / "claude-accounts"
+    if here.exists():
+        return str(here)
+    return "claude-accounts"
+
+
+def read_conf(path=None):
+    """설정을 읽어 (후보들, 개인 계정, 저쪽 대상, 양보 여부, 대체 계정들) 을 낸다.
+
+    없는 항목은 빈 값이다. yield 는 겹쳤을 때 물러서는 쪽인지다 — 두 기계 중 한쪽만
+    yes 여야 한다. 양쪽이 다 물러서면 둘 다 자리를 비우고, 양쪽이 다 안 물러서면
+    겹친 채로 남는다. fallback 은 공용 후보가 다 막혔을 때만 재는 운영자 개인 계정이다.
+    """
+    p = Path(path) if path else CONF
+    cands, day, peer, yield_peer, fallbacks = [], "", "", False, []
+    if not p.exists():
+        return cands, day, peer, yield_peer, fallbacks
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        key, val = parts[0].lower(), parts[1]
+        if key == "candidate":
+            if val not in cands:
+                cands.append(val)
+        elif key == "day":
+            day = val
+        elif key == "peer":
+            peer = val
+        elif key == "yield":
+            yield_peer = val.lower() in ("yes", "true", "1")
+        elif key == "fallback":
+            if val not in fallbacks:
+                fallbacks.append(val)
+    # 공용 후보로도 적힌 이름은 대체 목록에서 뺀다. 같은 계정을 두 번 재면 값이 두 번 든다.
+    fallbacks = [n for n in fallbacks if n not in cands]
+    return cands, day, peer, yield_peer, fallbacks
+
+
+def peer_account(peer, timeout=PEER_TIMEOUT):
+    """저쪽 기계가 지금 쓰는 계정 이름. 못 물으면 빈 문자열과 사유를 같이 낸다."""
+    if not peer:
+        return "", "저쪽 대상이 설정에 없다 — 빼기를 안 한다"
+    # ssh 는 뒤에 오는 인자들을 공백으로 이어 붙여 저쪽 셸에 넘긴다. 그래서 명령을
+    # 조각으로 넘기면 `bash -lc <경로> --which` 가 되어 --which 가 $0 자리로 가고
+    # 도구가 인자 없이 떠서 대화형 메뉴를 찍는다(2026-11-09 실측: "고르기:" 가 왔다).
+    # 따옴표까지 포함한 한 덩어리로 넘긴다.
+    cmd = ["ssh", peer, "bash -lc '~/dotfiles/bin/claude-accounts --which'"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "", "저쪽에 묻다가 {}초를 넘겼다 — 빼기를 안 한다".format(timeout)
+    except OSError as exc:
+        return "", "저쪽에 못 물었다({}) — 빼기를 안 한다".format(type(exc).__name__)
+    if out.returncode != 0:
+        return "", "저쪽이 거절했다(rc={}) — 빼기를 안 한다".format(out.returncode)
+    name = (out.stdout or "").strip().splitlines()
+    name = name[-1].strip() if name else ""
+    if not name or name == "모름":
+        return "", "저쪽이 쓰는 계정을 모른다 — 빼기를 안 한다"
+    # 계정 이름 모양이 아니면 그대로 쓰지 않는다. 저쪽이 메뉴나 오류를 찍으면 그 글이
+    # 계정 이름 자리로 들어와, 아무 후보도 안 빠지거나 엉뚱한 줄이 화면에 남는다.
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+        return "", "저쪽 답이 계정 이름 모양이 아니다 — 빼기를 안 한다"
+    return name, ""
+
+
+def measure(only=None, timeout=MEASURE_TIMEOUT):
+    """계정마다 한도를 그 자리에서 재서 낸다. 재는 일 자체는 claude-accounts 가 한다.
+
+    only 를 꼭 넘긴다. 안 넘기면 등록한 계정을 전부 띄워 재는데, 재는 것은 그 계정으로
+    세션을 잠깐 띄워 한 번 묻는 것이라 값이 들고 남의 기계가 쓰는 자격까지 흔든다.
+    밤에는 공용 후보만, 아침에는 개인 계정만 재면 된다.
+    """
+    cmd = [sys.executable, accounts_bin(), "--usage-json"]
+    if only is not None:
+        # 빈 목록도 그대로 넘긴다. "안 넘겼다" 와 "아무것도 띄우지 마라" 는 다른 뜻이고,
+        # 둘을 같은 값으로 두면 지금 계정만 보면 되는 회차가 넷을 다 띄운다.
+        cmd += ["--only", ",".join(only)]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        die("재는 데 {}초를 넘겼다 — 아무것도 안 바꿨다.".format(timeout))
+    except OSError as exc:
+        die("재는 명령을 못 돌렸다: {}".format(exc))
+    if out.returncode != 0:
+        die("재는 명령이 거절했다(rc={}): {}".format(out.returncode,
+                                                (out.stderr or "").strip()[:300]))
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        die("재는 명령의 답을 못 읽었다 — 앞 200자: {}".format((out.stdout or "")[:200]))
+
+
+def headroom(row, now):
+    """그 계정에 남은 여유(퍼센트)와 못 쓰는 사유. 못 쓰면 (None, 사유).
+
+    두 창 중 더 많이 쓴 쪽이 그 계정의 벽이다. 풀릴 시각이 지난 창은 이미 0 으로
+    초기화됐으므로 지금 수치로 안 쓴다 — 그대로 더하면 다 쓴 계정으로 읽힌다.
+    """
+    used = []
+    for pct_k, rs_k, guard in (("five_hour", "five_hour_reset", GUARD_FIVE_HOUR),
+                               ("seven_day", "seven_day_reset", GUARD_SEVEN_DAY)):
+        pct, rs = row.get(pct_k), row.get(rs_k)
+        if pct is None:
+            continue
+        if rs is not None and rs <= now:
+            continue          # 지난 창 — 0 으로 풀렸다
+        if pct >= guard:
+            # 세션의 한도 가드 훅이 이 문턱부터 도구를 막는다 — 남은 퍼센트가 있어도 못 쓴다.
+            return None, "{} {}% 라 세션 가드({}%)에 막힌다".format(
+                "5시간" if pct_k == "five_hour" else "7일", pct, guard)
+        used.append(pct)
+    if not used:
+        return None, "쓸 수 있는 수치가 없다 ({})".format(row.get("state") or "사유 모름")
+    return 100 - max(used), ""
+
+
+# 계정이 "여유 있다" 의 기준 (운영자 9124·9127·9128). 100 퍼센트가 되어야 막힌 것으로
+# 보면 7일 99 퍼센트인 공용도 골라져서 밤 사이에 다시 막힌다. 두 창을 다 보고 둘 다
+# 넉넉할 때만 여유로 친다. 기준을 넘은 공용은 어떤 경우에도 안 고른다(운영자 최우선
+# 조건 9279) — 통과하는 계정이 하나도 없으면 개인 중 다 쓰지 않은 것에서 여유가 큰 쪽으로.
+FIVE_HOUR_MAX = 50          # 5시간 창 사용이 이 이하
+SEVEN_DAY_MAX = 85          # 7일 창 사용이 이 이하
+RETURN_FIVE_HOUR_MAX = 40   # 개인에서 공용으로 돌아갈 때는 한 단계 엄하게 — 왕복 방지
+RETURN_SEVEN_DAY_MAX = 80
+FALLBACK_DAILY_RESERVE = 20  # 개인: 7일 남은 양 >= 초기화까지 남은 날 x 20 (낮 몫)
+# 세션 한도 가드 훅(claude/hooks/rate-limit-guard.sh)이 도구를 막는 문턱. 여기 이상이면
+# 그 계정은 남은 퍼센트가 있어도 못 쓰는 계정이다.
+GUARD_FIVE_HOUR = 90
+GUARD_SEVEN_DAY = 99
+NORMAL = (FIVE_HOUR_MAX, SEVEN_DAY_MAX, 0)
+RETURNING = (RETURN_FIVE_HOUR_MAX, RETURN_SEVEN_DAY_MAX, 0)
+PERSONAL = (FIVE_HOUR_MAX, SEVEN_DAY_MAX, FALLBACK_DAILY_RESERVE)
+
+
+def comfortable(row, now, limits):
+    """두 창이 다 기준 안인가. (되나, 사유).
+
+    5시간 수치가 없으면 그 창이 아직 안 열린 것이라 0 으로 본다. 7일 수치가 없으면
+    판정하지 않는다 — 가장 큰 벽을 모른 채 여유로 칠 수 없다. 곧 초기화될 창도 지금
+    수치 그대로 본다 — 초기화 시각이 실제로 지난 창만 0 이다(초기화 20분 전 99% 공용이
+    골라지던 것을 막는다, 11-13 토론).
+    """
+    five_max, seven_max, reserve = limits
+    five, five_rs = row.get("five_hour"), row.get("five_hour_reset")
+    week, week_rs = row.get("seven_day"), row.get("seven_day_reset")
+    if five is None or (five_rs is not None and five_rs <= now):
+        five = 0
+    if week is None:
+        return False, "7일 수치가 없다"
+    if week_rs is not None and week_rs <= now:
+        week = 0
+    if five > five_max:
+        return False, "5시간 {}% 가 기준 {}% 를 넘는다".format(five, five_max)
+    if week > seven_max:
+        return False, "7일 {}% 가 기준 {}% 를 넘는다".format(week, seven_max)
+    if reserve:
+        days = max(0.0, (week_rs - now) / 86400.0) if week_rs is not None else 7.0
+        # 갓 초기화된 주면 남은 날 × 몫이 100 을 넘어 어떤 계정도 못 통과한다. 오늘 밤
+        # 쓸 하루치 하나는 빼고 남겨야 할 몫을 그 아래로 자른다.
+        need = min(days * reserve, 100 - reserve)
+        if 100 - week < need:
+            return False, "7일 남은 {}% 가 낮에 쓸 몫 {:.0f}% 보다 적다".format(100 - week, need)
+    return True, ""
+
+
+def choose(data, cands, exclude, now=None, limits=None):
+    """후보 중 여유가 가장 많은 것을 고른다. (고른 이름, 줄들). 못 고르면 이름이 빈 값.
+
+    limits 를 주면 두 창 기준(comfortable)을 통과한 것만 고른다. 기준에 걸린 계정은
+    줄에 여유와 사유를 같이 남긴다 — 고르지는 않지만 왜 안 골랐는지가 보여야 한다.
+    """
+    now = clock() if now is None else now
+    rows = {r.get("name"): r for r in data.get("accounts") or []}
+    scored, notes = [], []
+    for name in cands:
+        # 빼는 것을 먼저 본다. 저쪽이 쓰는 계정은 띄우지도 않아서 줄 자체가 없는데,
+        # 자리 없음을 먼저 보면 그게 "다 막혔다" 로 세어져서 사람에게 가는 글이 바뀐다
+        # (후보가 하나뿐인데 저쪽이 쓰고 있으면 2 가 아니라 3 이다).
+        if name == exclude:
+            notes.append((name, None, "저쪽 기계가 쓰고 있다"))
+            continue
+        row = rows.get(name)
+        if row is None:
+            notes.append((name, None, "계정 자리가 없다"))
+            continue
+        room, why = headroom(row, now)
+        # 여유가 0 이면 그 계정은 지금 다 쓴 것이다. 수치가 있다는 이유로 후보에
+        # 남기면 "다 막힌 밤에는 멈춘다" 가 깨진다 — 넷이 다 100 퍼센트여도 하나를
+        # 골라 갈아 끼우고, 그 기계는 밤새 못 쓰는 계정을 들고 선다.
+        if room is not None and room <= 0:
+            why = "여유가 없다 (다 썼다)"
+            room = None
+        ok = room is not None
+        if ok and limits is not None:
+            ok, why = comfortable(row, now, limits)
+        notes.append((name, room, why))
+        if ok:
+            scored.append((room, -(row.get("seven_day") or 0), name))
+    if not scored:
+        return "", notes
+    scored.sort(reverse=True)
+    return scored[0][2], notes
+
+
+AUTO_SWITCH = Path(os.environ.get(
+    "CLAUDE_AUTO_SWITCH_MARK",
+    str(Path.home() / ".claude" / "state" / "rate-limit-auto-switch")))
+
+
+def mark_auto_switch():
+    """이번 교체가 자동이라고 미리 적어 둔다.
+
+    rate-limit-recovery 는 계정이 바뀐 것을 보면 살아 있는 세션을 전부 깨운다 — 사람이
+    손으로 갈아 끼운 뒤 이어가라는 신호라서다. 자동 교체는 사람이 아무것도 안 한 회차라,
+    그대로 두면 새벽 22시마다 열몇 세션이 같이 깬다. 바꾸기 전에 적는 이유는 복구기가
+    교체를 먼저 볼 수도 있기 때문이다 — 나중에 적으면 그 회차를 놓친다. 복구기가 읽고
+    지우므로 다음 교체로 안 샌다.
+    """
+    try:
+        AUTO_SWITCH.parent.mkdir(parents=True, exist_ok=True)
+        AUTO_SWITCH.write_text(str(int(time.time())) + "\n", encoding="utf-8")
+    except OSError as exc:
+        # 못 적어도 교체는 한다. 대가는 그 회차에 세션들이 깨는 것 하나다.
+        sys.stderr.write("자동 교체 표식을 못 적었다({}) — 세션들이 깰 수 있다.\n"
+                         .format(type(exc).__name__))
+
+
+def apply_account(name, wake=False):
+    """갈아 끼운다. (rc, 사유). 0 이면 됐다.
+
+    wake 가 거짓이면 이번 교체를 자동이라고 미리 적어 세션을 안 깨운다 — 밤낮 경계처럼
+    사람이 아무것도 안 한 회차가 그렇다. 참이면 안 적는다. 한도에 막혀 멈춘 세션을 다른
+    계정으로 옮기는 회차라, 깨워야 그 세션이 이어간다.
+
+    실패하면 4 를 내고 다음 후보로 이어 붙이지 않는다. 자격 파일을 쓰는 도중에 끊겼으면
+    지금 무엇이 깔려 있는지가 불분명한데, 그 위에 또 쓰면 어느 계정 자리에 어느 자격이
+    들어갔는지를 잃는다. 성공 판정은 이 명령의 반환값으로 한다 — 뒤에 계정 이름을 다시
+    읽는 것은 증거가 못 된다. 그 이름은 방금 이 명령이 적은 표식을 되읽는 것이다.
+    """
+    if not wake:
+        mark_auto_switch()
+    cmd = [sys.executable, accounts_bin(), "--use", name]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=APPLY_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 4, ("갈아 끼우다가 {}초를 넘겼다 — 지금 자격이 무엇인지 불분명하다"
+                   .format(APPLY_TIMEOUT))
+    except OSError as exc:
+        return 4, "갈아 끼우는 명령을 못 돌렸다({})".format(type(exc).__name__)
+    sys.stdout.write(out.stdout)
+    if out.returncode != 0:
+        return 4, "갈아 끼우지 못했다(rc={}): {}".format(
+            out.returncode, (out.stderr or "").strip()[:200])
+    kick_recovery()
+    return 0, ""
+
+
+RECOVERY_UNIT = "claude-rate-limit-recovery.service"
+
+
+def kick_recovery():
+    """갈아 끼운 직후 복구기를 한 번 부른다.
+
+    복구기는 10분 타이머라, 부르지 않으면 계정이 바뀐 것을 알아채는 데 최대 10분이
+    걸린다. 그 동안 한도에 막혀 큐가 쌓인 세션은 쓸 수 있는 계정을 두고도 조용하다.
+    타이머는 그대로 두고 한 번 더 부르기만 하므로 동작이 안 바뀐다 — 복구기 자신이
+    교체를 보고 판정하는 쪽은 손대지 않는다.
+
+    막지 않는다(--no-block). 복구기 한 회차가 세션을 흩느라 몇십 초를 쉴 수 있는데,
+    갈아 끼우는 쪽이 그걸 기다릴 이유가 없다. 실패해도 교체는 성공이다 — 타이머가
+    다음 회차에 같은 일을 한다.
+    """
+    try:
+        subprocess.run(["systemctl", "--user", "start", "--no-block", RECOVERY_UNIT],
+                       capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write("복구기를 못 불렀다({}) — 다음 타이머 회차가 대신한다.\n"
+                         .format(type(exc).__name__))
+
+
+def alert_bin():
+    """사람에게 알리는 도구의 자리. 옆에 있는 것을 먼저 본다."""
+    here = Path(__file__).resolve().parent / "claude-operator-alert"
+    return str(here) if here.exists() else "claude-operator-alert"
+
+
+def alert(rc, res, host=None, timeout=30):
+    """사람이 봐야 하는 회차만 알린다. (상태, 보냈나).
+
+    저쪽 기계의 세션에는 안 넣는다. 세션 주입은 그 세션을 깨우는 일이고, 깨우지 않는
+    것이 이 일의 전제다 — 저쪽은 자기 회차에서 ssh 로 이쪽 계정을 읽어 같은 사실을
+    안다. 그리고 한도에 막힌 세션에는 주입이 어차피 안 닿는다. 사람에게 가는 길만
+    세션을 안 거치는 통로로 둔다.
+
+    상태가 직전과 같으면 보내는 쪽이 알아서 거른다 — 5분마다 도는 자리라 그게 없으면
+    같은 글이 쌓인다. 정상·개인 계정 대체는 보내지 않고 상태만 적는다.
+    """
+    host = host or os.uname().nodename
+    cur = res.get("current") or res.get("pick") or "?"
+    rows = "\n".join("  {} {}".format(c.get("name"),
+                                      c.get("note") or "여유 {}%".format(c.get("headroom")))
+                     for c in res.get("candidates") or [])
+    if rc == 0 and res.get("fallback"):
+        # 개인 계정으로 간 것은 정상이지만 사람이 알아야 한다 — 그 계정의 한도를 쓴다.
+        # 계정 이름을 열쇠에 넣어 같은 계정에 머무는 회차는 다시 안 알린다.
+        key = "fallback-{}".format(res.get("pick"))
+        text = ("[계정] {} 공용이 다 기준(5시간 50%·7일 85%)을 넘어 개인 계정 {} 로 왔다. 공용이 풀리면 다음 회차가 "
+                "다시 공용으로 옮긴다.\n{}".format(host, res.get("pick"), rows))
+    elif rc == 0:
+        key = "ok"
+        text = "[계정] {} 정상 — {}".format(host, res.get("action") or res.get("pick") or "")
+    elif rc == 2:
+        key = "blocked"
+        text = ("[계정] {} 밤인데 공용도 개인 대체 계정도 다 막혔다. 계정을 안 바꿨다 — "
+                "지금은 {} 그대로다.\n{}".format(host, cur, rows))
+    elif rc == 3:
+        key = "clash-{}".format(res.get("clash") or cur)
+        text = ("[계정] {} 저쪽 기계와 같은 공용({})을 쓰는데 옮길 자리가 없다. 그대로 뒀다."
+                .format(host, res.get("clash") or cur))
+    elif rc == 4:
+        key = "apply-fail"
+        text = ("[계정] {} 갈아 끼우다 실패했다 — 지금 자격이 무엇인지 불분명하다. "
+                "다음 후보로 안 넘어갔다.\n  {}".format(host, res.get("apply_note") or ""))
+    elif rc == 7:
+        key = "day-deferred"
+        text = ("[계정] {} 아침인데 개인 계정이 막혀 있어 안 돌아갔다 — 지금은 {} 그대로다.\n  {}"
+                .format(host, cur, res.get("note") or ""))
+    else:
+        key = "error"
+        text = "[계정] {} 설정이나 실행이 어긋났다 (rc={}).\n  {}".format(
+            host, rc, res.get("action") or res.get("note") or "")
+    # 정상과 개인 계정 대체는 사람이 손댈 것이 없어 알리지 않고 상태만 적는다(운영자 지시
+    # 2026-11-11). 둘 다 알리던 때는 30분마다 재는 회차가 "개인 계정으로 왔다", 그 사이
+    # 회차가 "정상" 으로 상태 이름을 번갈아 적어서, 같은 자리에 머무는데도 30분마다 알림이
+    # 두 통씩 나갔다. 상태는 계속 적으므로 그 뒤에 오는 막힘·실패는 한 번 간다.
+    quiet = key == "ok" or key.startswith("fallback-")
+    cmd = [sys.executable, alert_bin()] + (["--quiet"] if quiet else []) + ["account", key, text]
+    try:
+        out = subprocess.run(cmd,
+                             capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return key, False
+    return key, out.returncode == 0
+
+
+def clock():
+    """지금 시각. 시험에서 가짜 시계를 끼울 수 있게 한 자리로 모았다 — 밤낮 경계는
+    하루 두 번만 지나가서, 실제로 그 시각을 기다려 보는 것으로는 검사가 안 선다."""
+    try:
+        return float(os.environ["CLAUDE_NIGHT_NOW"])
+    except (KeyError, ValueError):
+        return time.time()
+
+
+def is_night(now=None):
+    """지금이 밤 구간인가. 회차마다 다시 판정한다 — 예약된 과거 동작을 재생하지 않는다."""
+    hour = time.localtime(now if now is not None else clock()).tm_hour
+    return hour >= NIGHT_FROM or hour < NIGHT_TO
+
+
+def current_account():
+    """이 기계가 지금 쓰는 계정. 못 읽으면 빈 문자열.
+
+    띄우지 않고 표식만 읽으므로 값이 안 든다.
+    """
+    cmd = [sys.executable, accounts_bin(), "--which"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    if out.returncode != 0:
+        return ""
+    lines = [ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()]
+    name = lines[-1] if lines else ""
+    if name == "모름" or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name or ""):
+        return ""
+    return name
+
+
+def current_state(name, now=None):
+    """지금 쓰는 계정이 아직 쓸 만한가. (여유, 사유).
+
+    띄우지 않는다 — 돌고 있는 세션이 적어 둔 수치를 읽는다. 그 수치가 갈아 끼우기
+    전에 적힌 것이면 claude-accounts 쪽이 걸러서 안 준다.
+    """
+    data = measure(only=[], timeout=60)
+    rows = {r.get("name"): r for r in data.get("accounts") or []}
+    row = rows.get(name)
+    if row is None:
+        return None, "지금 계정 줄이 없다"
+    return headroom(row, clock() if now is None else now)
+
+
+def current_ok(name, now=None):
+    """지금 쓰는 공용이 두 창 기준 안인가. (되나, 사유). 띄우지 않는다."""
+    data = measure(only=[], timeout=60)
+    rows = {r.get("name"): r for r in data.get("accounts") or []}
+    row = rows.get(name)
+    if row is None:
+        return True, ""        # 판정할 줄이 없으면 옮기지 않는다 — 여유 판정이 이미 본다
+    return comfortable(row, clock() if now is None else now, NORMAL)
+
+
+def night_pick(cands, peer, yield_peer, apply, wake, now=None, fallbacks=(), cur=""):
+    """공용 하나를 골라 (필요하면) 갈아 끼운다. 공용이 다 막혔으면 개인 대체 계정에서
+    고른다. (rc, 결과)."""
+    res = {"mode": "night", "pick": "", "excluded": "", "peer_note": "",
+           "clash": "", "clash_note": "", "yield": yield_peer, "yielded_to": "",
+           "wake": wake, "apply_note": "", "candidates": [],
+           "fallback": False, "fallback_tried": False}
+    # 재기 전에 한 번, 고르기 직전에 한 번 묻는다. 두 번 묻는 이유가 서로 다르다.
+    # 앞의 것은 저쪽이 쓰고 있는 계정을 띄우지 않으려는 것이다 — 같은 자격을 두 자리에서
+    # 쓰면 토큰이 갱신되는 쪽이 갈려서 저쪽 세션이 옛 토큰을 내밀 수 있다. 뒤의 것은
+    # 재는 동안(최대 240초) 저쪽이 갈아 끼웠을 수 있어서다. 앞의 것만 쓰면 고를 때
+    # 낡고, 뒤의 것만 쓰면 재는 동안 저쪽 자격을 건드린다.
+    busy, _ = peer_account(peer)
+    probe = [n for n in cands if n != busy]
+    data = measure(only=probe)
+    exclude, peer_why = peer_account(peer)
+    # 개인 계정에 와 있으면 공용으로 돌아가는 문턱을 한 단계 높인다 — 문턱이 같으면
+    # 기준 근처에서 30분마다 왔다 갔다 한다.
+    shared_limits = RETURNING if cur and cur in fallbacks else NORMAL
+    pick, notes = choose(data, cands, exclude, now=now, limits=shared_limits)
+    res["excluded"], res["peer_note"] = exclude, peer_why
+    res["candidates"] = [{"name": n, "headroom": r, "note": w} for n, r, w in notes]
+    res["pick"] = pick
+    pool, limits = cands, shared_limits
+
+    if not pick and fallbacks:
+        # 기준을 넘지 않는 공용이 없다 — 운영자 개인 계정을 그때 잰다. 공용이 여유
+        # 있는 회차에는 개인 계정을 띄우지 않는다. 재기 전후로 저쪽을 다시 묻는 이유는
+        # 공용과 같다. 개인은 낮에 쓸 몫까지 남아 있어야 고른다.
+        busy, _ = peer_account(peer)
+        fb_data = measure(only=[n for n in fallbacks if n != busy])
+        data = {"accounts": (data.get("accounts") or []) + (fb_data.get("accounts") or [])}
+        exclude, peer_why = peer_account(peer)
+        fb_pick, fb_notes = choose(data, fallbacks, exclude, now=now, limits=PERSONAL)
+        # 이미 와 있는 개인 계정이 아직 기준 안이면 그대로 둔다 — 개인끼리 옮기지 않는다.
+        if fb_pick and cur in fallbacks and any(n == cur and r is not None and not w
+                                                for n, r, w in fb_notes):
+            fb_pick = cur
+        res["excluded"], res["peer_note"] = exclude, peer_why
+        res["fallback_tried"] = True
+        res["candidates"] += [{"name": n, "headroom": r, "note": w, "fallback": True}
+                              for n, r, w in fb_notes]
+        notes = notes + fb_notes
+        if fb_pick:
+            pick = fb_pick
+            res["pick"], res["fallback"] = pick, True
+            pool, limits = fallbacks, PERSONAL
+
+    if not pick and shared_limits is not NORMAL:
+        # 개인이 낮 몫을 못 남긴다 — 왕복 방지용 엄한 문턱(40/80)은 접고 기본 문턱(50/85)으로
+        # 공용을 다시 본다. 엄한 문턱 때문에 지친 개인에 갇히지 않게 한다.
+        pick, notes_n = choose(data, cands, exclude, now=now, limits=NORMAL)
+        if pick:
+            res["pick"], res["fallback"] = pick, False
+            res["candidates"] = [{"name": n, "headroom": r, "note": w} for n, r, w in notes_n]
+            pool, limits = cands, NORMAL
+
+    if not pick and fallbacks:
+        # 기준을 통과한 계정이 없다. 기준(5시간 50·7일 85)을 넘은 공용은 어떤 경우에도
+        # 안 고른다 — 운영자 최우선 조건(9279). 개인 중 다 쓰지 않은 것에서 여유가 가장
+        # 큰 쪽으로 가고, 이미 개인에 와 있고 그 계정이 아직 안 찼으면 거기 머문다.
+        pick, _ = choose(data, fallbacks, exclude, now=now)
+        if pick and cur in fallbacks and any(n == cur and r is not None for n, r, w in notes):
+            pick = cur
+        res["pick"], res["below_bar"] = pick, bool(pick)
+        res["fallback"] = bool(pick)
+        pool, limits = fallbacks, None
+
+    if not pick:
+        # 공용도 개인도 다 막힌 것은 사람이 정할 일이다.
+        # 상대가 쓰고 있어서 뺀 것이 있으면 "다 썼다" 가 아니라 "자리가 없다" 다.
+        return (3 if any("저쪽" in w for n, r, w in notes) else 2), res
+    if not apply:
+        return 0, res
+    if cur and pick == cur:
+        # 이미 그 계정이다. 다시 갈아 끼우면 복구기가 깨서 세션을 흔들기만 한다.
+        res["apply_note"] = "이미 {} 다 — 안 바꿨다".format(cur)
+        return 0, res
+
+    rc, why = apply_account(pick, wake=wake)
+    res["apply_note"] = why
+    if rc:
+        return rc, res
+
+    # 갈아 끼운 뒤 한 번 더 읽는다. 이 사이에 저쪽도 같은 것을 잡았으면 여기서 드러난다 —
+    # 미리 가르지 않는 대신 겹친 뒤에 대응한다.
+    seen, res["clash_note"] = peer_account(peer)
+    if seen and seen == pick:
+        res["clash"] = pick
+        if yield_peer:
+            # 물러서는 쪽만 다시 고른다. 양쪽이 다 물러서면 둘 다 자리를 비운다.
+            again, notes2 = choose(data, pool, pick, now=now, limits=limits)
+            if not again:
+                return 3, res          # 겹쳤는데 갈 자리가 없다 — 사람이 봐야 한다
+            rc, why = apply_account(again, wake=wake)
+            res["apply_note"] = why
+            if rc:
+                return rc, res
+            res["pick"] = again
+            res["candidates"] = [{"name": n, "headroom": r, "note": w}
+                                 for n, r, w in notes2]
+            if res["fallback"]:
+                for c in res["candidates"]:
+                    c["fallback"] = True
+            # 물러선 자리가 또 겹쳤는지 본다. 한 회차에서 후보를 계속 순회하지 않는다 —
+            # 다음 회차가 같은 판정을 다시 한다.
+            seen2, _ = peer_account(peer)
+            if seen2 and seen2 == again:
+                res["clash"] = again
+                return 3, res
+            res["yielded_to"] = again
+    return 0, res
+
+
+def reconcile(cands, day, peer, yield_peer, apply, now=None, fallbacks=()):
+    """지금 시각으로 판정해서 어긋난 것만 고친다. (rc, 결과).
+
+    5분마다 불린다. 건강한 회차는 계정을 안 띄운다 — 표식 한 번과 수치 파일 한 번만
+    읽으므로 값이 안 든다. 띄워 재는 것은 넷 중 하나일 때뿐이다:
+      · 밤인데 공용이 아니다 (구간이 막 바뀌었거나 타이머를 놓쳤다)
+      · 밤인데 지금 공용이 다 찼다 (밤중 소진 — 이때는 세션을 깨운다)
+      · 밤인데 지금 공용이 두 창 기준을 넘었다 (안 깨운다)
+      · 낮인데 개인이 아니다 (아침 복귀, 또는 복귀가 유예됐다가 푸는 회차)
+      · 밤인데 저쪽과 같은 계정이다 (저쪽이 늦게 켜져 이제야 드러난 겹침)
+
+    구간 판정을 회차마다 다시 하므로 놓친 타이머·절전 복귀가 따로 다룰 일이 아니다.
+    """
+    now = clock() if now is None else now
+    night = is_night(now)
+    cur = current_account()
+    res = {"mode": "now", "night": night, "current": cur, "action": "",
+           "pick": "", "candidates": [], "apply_note": "", "note": ""}
+
+    if not cur:
+        res["action"] = "지금 계정을 모른다 — 아무것도 안 바꾼다"
+        return 1, res
+
+    if not night:
+        if not day:
+            res["action"] = "낮이고 설정에 개인 계정이 없다 — 아무것도 안 한다"
+            return 1, res
+        if cur == day:
+            res["action"] = "낮이고 개인 계정이다 — 그대로 둔다"
+            return 0, res
+        rc, sub = day_return(day, apply, now, peer=peer)
+        sub["mode"] = "now"
+        sub["night"], sub["current"] = night, cur
+        sub["action"] = ("개인 계정으로 돌아간다: {}".format(day) if rc == 0
+                         else "개인 복귀를 미룬다 — {}".format(sub.get("note") or "사유 모름"))
+        return rc, sub
+
+    if not cands:
+        res["action"] = "밤이고 설정에 후보가 없다 — 아무것도 안 한다"
+        return 1, res
+
+    reason = ""
+    if cur in fallbacks and cur != day:
+        # 공용이 다 막혀 개인 계정으로 와 있다. 회차마다 공용이 풀렸는지 다시 잰다.
+        reason = "밤인데 공용이 막혀 개인 {} 로 와 있다".format(cur)
+    elif cur not in cands:
+        reason = "밤인데 공용이 아니다"
+    else:
+        room, why = current_state(cur, now)
+        res["note"] = why
+        if room is None or room <= 0:
+            reason = "밤인데 지금 공용이 다 찼다 ({})".format(why or "여유 없음")
+        else:
+            res["note"] = "여유 {}%".format(room)
+            seen, peer_why = peer_account(peer)
+            res["peer_note"] = peer_why
+            fine, fine_why = current_ok(cur, now)
+            if not fine:
+                # 아직 안 찼지만 두 창 기준을 넘었다 — 더 여유 있는 계정이 있으면 옮긴다.
+                # 막힌 세션이 없으므로 깨우지 않는다(사유에 "다 찼다" 가 안 들어간다).
+                reason = "밤인데 지금 공용 {} 가 기준을 넘었다 ({})".format(cur, fine_why)
+            elif seen and seen == cur:
+                reason = "저쪽도 {} 를 쓰고 있다".format(cur)
+                if not yield_peer:
+                    res["clash"] = cur
+                    res["action"] = "겹쳤지만 이쪽은 안 물러선다 — 그대로 둔다"
+                    return 3, res
+            else:
+                res["action"] = "밤이고 공용 {} 가 아직 여유 {}% — 그대로 둔다".format(cur, room)
+                return 0, res
+
+    # 한도에 막혀 멈춘 세션을 옮기는 회차만 깨운다. 구간이 바뀌어 옮기는 회차는 사람이
+    # 아무것도 안 한 때라 깨우지 않는다.
+    wake = "다 찼다" in reason
+    rc, sub = night_pick(cands, peer, yield_peer, apply, wake=wake, now=now,
+                         fallbacks=fallbacks, cur=cur)
+    sub["mode"] = "now"
+    sub["night"], sub["current"] = night, cur
+    pick = sub.get("pick")
+    if not pick:
+        where = "갈 공용도 개인 계정도 없다" if sub.get("fallback_tried") else "갈 공용이 없다"
+    elif pick == cur and sub.get("fallback"):
+        where = "공용이 아직 기준을 넘어 개인 {} 에 그대로 있다".format(cur)
+    elif pick == cur:
+        where = "기준을 통과한 더 나은 계정이 없어 {} 에 그대로 있다".format(cur)
+    elif sub.get("fallback"):
+        where = "공용이 다 기준을 넘어 개인 {} 로 간다".format(pick)
+    elif sub.get("below_bar"):
+        where = "기준을 통과한 계정이 없어 개인 중 덜 쓴 {} 로 간다".format(pick)
+    else:
+        where = "{} 로 간다".format(pick)
+    sub["action"] = "{} — {}".format(reason, where)
+    return rc, sub
+
+
+def day_return(day, apply, now=None, peer="", cur=""):
+    """아침 복귀. 개인 계정이 막혀 있으면 안 돌아간다. (rc, 결과).
+
+    막힌 계정으로 돌아가면 그 기계가 아침 내내 아무 요청도 못 한다. 그래서 돌아가기
+    전에 개인 계정을 한 번 재고, 막혀 있으면 지금 쓰는 공용을 그대로 두고 7 을 낸다 —
+    실패가 아니라 유예다. 다음 회차가 다시 재서 풀렸으면 그때 돌아간다.
+
+    저쪽 기계가 밤에 공용이 막혀 이쪽 개인 계정을 빌려 쓰고 있으면 재지도 않고 미룬다.
+    같은 자격을 두 곳에서 띄우면 토큰 갱신이 갈려 한쪽이 끊긴다. 저쪽도 아침에 자기
+    개인 계정으로 돌아가므로 다음 회차에 풀린다.
+    """
+    res = {"mode": "day", "pick": day, "headroom": None, "note": "",
+           "apply_note": "", "deferred": False}
+    busy, _ = peer_account(peer)
+    if busy and busy == day:
+        res["note"] = "저쪽 기계가 아직 {} 를 쓰고 있다".format(day)
+        res["deferred"] = True
+        return 7, res
+    data = measure(only=[day])
+    rows = {r.get("name"): r for r in data.get("accounts") or []}
+    row = rows.get(day)
+    if row is None:
+        res["note"] = "개인 계정 자리가 없다 — 설정의 day 줄을 본다"
+        return 1, res
+    room, why = headroom(row, clock() if now is None else now)
+    res["headroom"], res["note"] = room, why
+    if room is None or room <= 0:
+        res["note"] = why or "여유가 없다 (다 썼다)"
+        res["deferred"] = res["exhausted"] = True
+        return 7, res
+    if not apply:
+        return 0, res
+    if cur and cur == day:
+        # 이미 개인이고 쓸 만하다 — 다시 갈아 끼우면 복구기가 깨서 세션만 흔든다.
+        res["apply_note"] = "이미 {} 다 — 안 바꿨다".format(day)
+        return 0, res
+    rc, res["apply_note"] = apply_account(day, wake=False)
+    return rc, res
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true", help="고른 계정으로 실제로 갈아 끼운다")
+    ap.add_argument("--day", action="store_true", help="아침 복귀 — 설정의 개인 계정으로")
+    ap.add_argument("--now", action="store_true", dest="now_mode",
+                    help="지금 시각으로 판정해서 필요한 것만 한다 (5분마다 부르는 자리)")
+    ap.add_argument("--json", action="store_true", dest="as_json",
+                    help="고른 결과와 근거를 기계가 읽는 꼴로")
+    ap.add_argument("--conf", default="", help="설정 파일 자리(시험용)")
+    ap.add_argument("--no-alert", action="store_true", dest="no_alert",
+                    help="사람에게 안 알린다 (시험용)")
+    args = ap.parse_args(argv)
+
+    cands, day, peer, yield_peer, fallbacks = read_conf(args.conf or None)
+
+    if args.now_mode:
+        rc, res = reconcile(cands, day, peer, yield_peer, args.apply, fallbacks=fallbacks)
+    elif args.day:
+        if not day:
+            die("설정에 day 줄이 없다 — 아침에 돌아갈 계정을 적어라: {}"
+                .format(args.conf or CONF))
+        rc, res = day_return(day, args.apply, peer=peer)
+    else:
+        if not cands:
+            die("설정에 candidate 줄이 없다 — 밤에 쓸 후보를 적어라: {}"
+                .format(args.conf or CONF))
+        cur = current_account()
+        if day and not is_night(clock()):
+            # 낮에 누른 자동 고르기는 개인이 먼저다 — 지금 개인이어도 쓸 만한지 재고, 쓸 만하면
+            # 그대로 둔다(11-13 09:28 낮에 자동 버튼이 밤 규칙으로 공용을 골라 낮 내내 머물렀다).
+            # 개인이 다 찼다고 확인된 때만 고르기로 간다. 설정·측정·적용 실패(1·4)와 저쪽이
+            # 개인을 쓰는 유예는 그대로 낸다 — 그 위에 또 갈아 끼우면 첫 오류가 묻힌다.
+            rc, res = day_return(day, args.apply, peer=peer, cur=cur)
+            if rc == 7 and res.get("exhausted"):
+                rc, res = night_pick(cands, peer, yield_peer, args.apply, wake=False,
+                                     fallbacks=fallbacks, cur=cur)
+        else:
+            rc, res = night_pick(cands, peer, yield_peer, args.apply, wake=False,
+                                 fallbacks=fallbacks, cur=cur)
+
+    if args.apply and not args.no_alert:
+        res["alert"], res["alert_sent"] = alert(rc, res)
+
+    if args.as_json:
+        res["rc"] = rc
+        print(json.dumps(res, ensure_ascii=False))
+    else:
+        report(rc, res)
+    return rc
+
+
+def report(rc, res):
+    """사람이 읽는 꼴로 낸다. 한 줄로 무엇이 됐는지가 서야 한다."""
+    if res.get("peer_note"):
+        print("저쪽 계정: {}".format(res["peer_note"]))
+    elif res.get("excluded"):
+        print("저쪽 기계가 {} 를 쓰고 있어 뺐다.".format(res["excluded"]))
+    for c in res.get("candidates") or []:
+        room = c.get("headroom")
+        print("  {:8s} {}{}".format(
+            c.get("name") or "?",
+            "여유 {}%".format(room) if room is not None else c.get("note") or "",
+            " (개인 대체)" if c.get("fallback") else ""))
+    if res.get("candidates"):
+        print()
+    if res.get("mode") == "day":
+        if res.get("deferred"):
+            print("개인 계정으로 안 돌아간다 — {}".format(res.get("note") or "사유 모름"))
+        else:
+            print(res.get("pick") or "")
+    elif res.get("mode") == "now":
+        print(res.get("action") or "")
+    else:
+        print(res.get("pick") or "고를 계정이 없다 — 후보가 다 막혔다.")
+    if res.get("clash"):
+        if res.get("yielded_to"):
+            print("겹쳤다: 저쪽도 {} 를 잡아서 {} 로 물러섰다."
+                  .format(res["clash"], res["yielded_to"]))
+        elif rc == 3:
+            print("겹쳤다: 저쪽도 {} 를 잡았는데 갈 자리가 없다 — 그대로 둔다."
+                  .format(res["clash"]))
+        else:
+            print("겹쳤다: 저쪽도 {} 를 잡았다 — 이쪽은 안 물러선다.".format(res["clash"]))
+    for key in ("clash_note", "apply_note", "note"):
+        if res.get(key) and not (key == "note" and res.get("mode") == "day"):
+            print(res[key])
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

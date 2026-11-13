@@ -2,7 +2,7 @@
 """토론 결손 표시 계약 검사.
 
 고정하는 것: 참가자가 빠진 채 나온 결론이 정상 결론처럼 읽히면 안 된다. 3의견인 줄
-알고 읽는 판정문이 사실 2의견이었다는 사고가 실제로 있었다(2026-08-18 session-p, codex 0건).
+알고 읽는 판정문이 사실 2의견이었다는 사고가 실제로 있었다(2026-08-18 bias, codex 0건).
 숫자는 이미 찍히고 있었고 사람이 안 읽었을 뿐이라, 결손은 맨 앞 한 줄로 세운다.
 
   1. 결손이 없으면 빈 문자열이다. 정상 실행에 노이즈를 얹지 않는다.
@@ -151,6 +151,58 @@ with tempfile.TemporaryDirectory() as tmp:
           "정리자" in r.stderr and "복구" in r.stderr, r.stderr[-300:])
     check("착수 전 중단은 유료 호출을 0회 쓴다", not log.exists(),
           log.read_text(encoding="utf-8")[:200] if log.exists() else "")
+
+with tempfile.TemporaryDirectory() as tmp:
+    # 9) 정리자 단독 실행(--arbiter-only)도 결손을 표시한다.
+    #    이 경로는 --deep 플래그 없이 불리므로 풀을 meta.json 에서 되살리지 않으면
+    #    깊은 회차의 늘어난 자리가 빠진 것을 못 본다.
+    run_dir = Path(tmp) / "run-20261015T000000Z"
+    run_dir.mkdir()
+    (run_dir / "task.txt").write_text("질문", encoding="utf-8")
+    (run_dir / "meta.json").write_text(json.dumps({
+        "pool": ["codex", "gemini", "claude-opus", "claude-fable"], "deep": True,
+    }), encoding="utf-8")
+    # 제미나이 자리가 통째로 빠진 라운드 하나.
+    r1 = [out("codex", 1), out("claude-opus", 1), out("claude-fable", 1),
+          out("gemini", 1, err="gemini 모델 미인식 — agy models 목록·구글 계정 등급 확인")]
+    (run_dir / "r1.outputs.json").write_text(json.dumps(r1, ensure_ascii=False),
+                                             encoding="utf-8")
+    shim = Path(tmp) / "shim2"
+    shim.mkdir()
+    arb = {"final_decision": "그대로 간다", "rationale": "근거", "action_steps": ["하나"],
+           "verification_plan": "검사", "dissent": "없음"}
+    for name in ("codex-ask", "agy", "claude", "codex"):
+        f = shim / name
+        f.write_text("#!/bin/bash\ncat <<'JSON'\n%s\nJSON\n" % json.dumps(arb, ensure_ascii=False),
+                     encoding="utf-8")
+        f.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = str(shim) + os.pathsep + env.get("PATH", "")
+    r = subprocess.run([sys.executable, str(REPO / "bin" / "ai-debate"),
+                        "--arbiter-only", str(run_dir)],
+                       capture_output=True, text=True, env=env, timeout=180)
+    final = {}
+    fp = run_dir / "final_result.json"
+    if fp.exists():
+        final = json.loads(fp.read_text(encoding="utf-8"))
+    check("단독 정리도 결손을 화면에 적는다",
+          "gemini" in (r.stdout + r.stderr), (r.stderr or "")[-300:])
+    check("단독 정리의 결손이 final_result.json 에도 같이 남는다",
+          isinstance(final.get("deficit"), str) and "gemini" in final.get("deficit", ""),
+          str(final.get("deficit"))[:200])
+    _d = final.get("deficit", "")
+    _missing = _d.split("빠진 참가자 ", 1)[-1].split(" —", 1)[0]
+    check("깊은 회차의 늘어난 자리를 풀로 되살린다",
+          "예정 4명" in _d and _missing == "gemini",
+          "되살리지 못하면 예정 인원이 3명으로 줄어 그 자리의 결손이 안 보인다: %s"
+          % str(_d)[:200])
+
+# 10) 결손이 있으면 캐시에 안 남긴다. 캐시 키에 참가자도 모델도 안 들어가서,
+#     자리 하나가 빈 결론이 24시간 동안 멀쩡한 회차의 답인 척 돌아온다.
+SRC = (REPO / "bin" / "ai-debate").read_text(encoding="utf-8")
+check("결손 회차는 캐시 저장 조건에서 빠진다",
+      "not _fb_model and not _deficit" in SRC,
+      "저장 조건에 결손이 안 들어가면 빈 자리 결론이 캐시로 되돌아온다")
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
